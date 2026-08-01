@@ -237,6 +237,7 @@ impl TabManager {
         );
         self.order.borrow_mut().push(id);
         self.active = Some(id);
+        self.sync_visibility();
         Ok(id)
     }
 
@@ -256,6 +257,7 @@ impl TabManager {
                 .and_then(|idx| order.get(idx.saturating_sub(1)))
                 .copied();
         }
+        self.sync_visibility();
         true
     }
 
@@ -269,6 +271,13 @@ impl TabManager {
         self.tabs.clear();
         self.order.borrow_mut().clear();
         self.active = None;
+    }
+
+    fn sync_visibility(&self) {
+        let active = self.active;
+        for (id, tab) in &self.tabs {
+            tab.backend.set_visible(Some(*id) == active);
+        }
     }
 
     pub fn select(&mut self, id: u64) -> bool {
@@ -339,6 +348,7 @@ impl TabManager {
             bytes.push(b'\r');
         }
         tab.backend.process_command(BackendCommand::Write(bytes));
+        self.sync_visibility();
         true
     }
 

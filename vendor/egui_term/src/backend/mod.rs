@@ -136,6 +136,8 @@ impl From<TerminalSize> for WindowSize {
 pub struct TerminalBackend {
     id: u64,
     pty_id: u32,
+    /// terra patch: whether this tab is currently rendered (see set_visible).
+    visible: Arc<std::sync::atomic::AtomicBool>,
     url_regex: RegexSearch,
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
@@ -187,6 +189,11 @@ impl TerminalBackend {
         let pty_notifier = Notifier(pty_event_loop.channel());
         let url_regex = RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap();
         let _pty_event_loop_thread = pty_event_loop.spawn();
+        // terra patch: a background tab's output must not repaint the app —
+        // otherwise one busy tab (an animation, a compiler) makes every tab
+        // switch janky. The flag is flipped by TerminalBackend::set_visible.
+        let visible = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let visible_in_thread = visible.clone();
         let _pty_event_subscription = std::thread::Builder::new()
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
@@ -196,7 +203,11 @@ impl TerminalBackend {
                         .unwrap_or_else(|_| {
                             panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
                         });
-                    app_context.clone().request_repaint();
+                    if visible_in_thread.load(std::sync::atomic::Ordering::Relaxed)
+                        || matches!(event, Event::Exit | Event::Title(_))
+                    {
+                        app_context.clone().request_repaint();
+                    }
                     match event {
                         Event::Exit => break,
                         Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
@@ -212,6 +223,7 @@ impl TerminalBackend {
             term: term.clone(),
             size: terminal_size,
             notifier,
+            visible,
             last_content: initial_content,
         })
     }
@@ -296,6 +308,13 @@ impl TerminalBackend {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// terra patch: mark whether this tab is on screen. Output from hidden
+    /// tabs still updates the grid but no longer wakes the UI.
+    pub fn set_visible(&self, visible: bool) {
+        self.visible
+            .store(visible, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn pty_id(&self) -> u32 {
