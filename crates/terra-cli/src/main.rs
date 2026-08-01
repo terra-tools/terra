@@ -59,7 +59,7 @@ fn learn_text() -> String {
          {commands}\n\
          A typical agent workflow\n\
          ------------------------\n\
-         \x20 id=$(terra new --title \"tests\" -- bash)\n\
+         \x20 id=$(terra new --title \"tests\" -- cargo test)\n\
          \x20 terra send \"$id\" \"cargo test\" --enter\n\
          \x20 sleep 5; terra capture \"$id\"\n\
          \x20 terra kill \"$id\"\n\n\
@@ -107,7 +107,8 @@ enum Command {
     /// Print a structured self-teaching prompt (for agents)
     Learn,
 
-    /// Create a new tab; prints its id
+    /// Create a new tab; prints its id. A trailing command runs via your
+    /// default shell and the tab stays open in that shell afterwards
     New {
         /// Initial tab title
         #[arg(long)]

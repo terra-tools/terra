@@ -14,6 +14,19 @@ use terra_protocol::TabInfo;
 /// Fallback when `$SHELL` is not set.
 const FALLBACK_SHELL: &str = "/bin/zsh";
 
+/// Quote one argument for POSIX shells: safe single-quote wrapping.
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+,".contains(c))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| FALLBACK_SHELL.to_string())
 }
@@ -184,9 +197,27 @@ impl TabManager {
         cwd: Option<&str>,
         title: Option<String>,
     ) -> anyhow::Result<u64> {
-        let (shell, args) = match command.split_first() {
-            Some((program, rest)) => (program.clone(), rest.to_vec()),
-            None => (default_shell(), Vec::new()),
+        // A command runs *through* the user's default shell (PATH, aliases,
+        // rc files all apply) and the tab falls back into that shell when it
+        // finishes — so `terra new -- cargo test` behaves like typing the
+        // command into a fresh tab, and the output stays readable.
+        let (shell, args) = if command.is_empty() {
+            (default_shell(), Vec::new())
+        } else {
+            let sh = default_shell();
+            let joined = command
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (
+                sh.clone(),
+                vec![
+                    "-i".to_string(),
+                    "-c".to_string(),
+                    format!("{joined}; exec {sh} -i"),
+                ],
+            )
         };
 
         let id = self.next_id;
