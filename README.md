@@ -20,6 +20,7 @@ terra capture "$id"                        # read its screen
 
 ## Docs
 
+- [docs/AGENTS.md](docs/AGENTS.md) — copy-paste block for your CLAUDE.md / AGENTS.md so agents run their commands in visible terra tabs
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — design, crate layout, wire protocol, CLI contract
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — building, tasks, packaging, project conventions
 
