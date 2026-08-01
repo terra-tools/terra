@@ -1,3 +1,6 @@
+// terra: vendored code keeps upstream style; silence pedantic lints.
+#![allow(clippy::too_many_arguments, clippy::manual_is_multiple_of)]
+
 mod backend;
 mod bindings;
 mod font;

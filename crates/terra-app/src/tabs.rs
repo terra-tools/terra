@@ -197,31 +197,13 @@ impl TabManager {
         cwd: Option<&str>,
         title: Option<String>,
     ) -> anyhow::Result<u64> {
-        // A command runs *through* the user's default shell (PATH, aliases,
-        // rc files all apply) and the tab falls back into that shell when it
-        // finishes — so `terra new -- cargo test` behaves like typing the
-        // command into a fresh tab, and the output stays readable.
-        let (shell, args) = if command.is_empty() {
-            (default_shell(), Vec::new())
-        } else {
-            let sh = default_shell();
-            let joined = command
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" ");
-            (
-                sh.clone(),
-                vec![
-                    "-i".to_string(),
-                    "-c".to_string(),
-                    format!("{joined}; exec {sh} -i"),
-                ],
-            )
-        };
+        // A command tab is just a default-shell tab with the command typed
+        // into it (tmux send-keys style): the user's real prompt renders,
+        // the command line is visible, and the shell survives after it.
+        let (shell, args) = (default_shell(), Vec::new());
 
         let id = self.next_id;
-        let backend = TerminalBackend::new(
+        let mut backend = TerminalBackend::new(
             id,
             self.ctx.clone(),
             self.pty_events.clone(),
@@ -231,6 +213,16 @@ impl TabManager {
                 working_directory: cwd.map(PathBuf::from),
             },
         )?;
+        if !command.is_empty() {
+            let typed = command
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            backend.process_command(egui_term::BackendCommand::Write(
+                format!("{typed}\r").into_bytes(),
+            ));
+        }
         self.next_id += 1;
 
         self.tabs.insert(

@@ -68,6 +68,25 @@ pub fn set_represented_path(frame: &eframe::Frame, path: Option<&std::path::Path
 #[cfg(not(target_os = "macos"))]
 pub fn set_represented_path(_frame: &eframe::Frame, _path: Option<&std::path::Path>) {}
 
+/// Bring terra to the front, even though another app is active. Used by
+/// `terra select` so a CLI call (or an agent) can summon the window.
+///
+/// Uses `NSRunningApplication`, which is documented thread-safe — so this is
+/// callable from the IPC thread. (Calling `NSApplication` activation from
+/// inside the frame callback breaks winit's event-loop waker; do not.)
+#[cfg(target_os = "macos")]
+pub fn activate_app() {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    let app = NSRunningApplication::currentApplication();
+    // Deprecated (no-op on macOS 14+) but harmless; plain activation is what
+    // actually runs on modern systems.
+    #[allow(deprecated)]
+    app.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn activate_app() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,22 +112,3 @@ mod tests {
         assert_eq!(title_path("/no/such/terra/dir"), None);
     }
 }
-
-/// Bring terra to the front, even though another app is active. Used by
-/// `terra select` so a CLI call (or an agent) can summon the window.
-///
-/// Uses `NSRunningApplication`, which is documented thread-safe — so this is
-/// callable from the IPC thread. (Calling `NSApplication` activation from
-/// inside the frame callback breaks winit's event-loop waker; do not.)
-#[cfg(target_os = "macos")]
-pub fn activate_app() {
-    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
-    let app = NSRunningApplication::currentApplication();
-    // Deprecated (no-op on macOS 14+) but harmless; plain activation is what
-    // actually runs on modern systems.
-    #[allow(deprecated)]
-    app.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn activate_app() {}

@@ -2,7 +2,7 @@
 //!
 //! - `tabs.rs`  — `TabManager`: create/kill/rename/select/capture/send
 //! - `ui.rs`    — pill-style tab bar + keybindings
-//! - `ipc.rs`   — unix-socket server thread wired to the UI via channels
+//! - `ipc.rs`   — unix-socket server; its threads drive the tabs directly
 //! - palette integration (terra-palette)
 
 mod fonts;
@@ -14,17 +14,27 @@ mod tabs;
 mod ui;
 
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use egui_term::{PtyEvent, TerminalView};
 use terra_palette::{Palette, PaletteAction, PaletteEvent};
-use terra_protocol::{Request, Response};
 
-use crate::ipc::{IpcRequest, IpcServer};
+use crate::ipc::IpcServer;
 use crate::scrollbar::ScrollbarState;
 use crate::tabs::TabManager;
 use crate::ui::AppAction;
 
 const RENAME_PROMPT_ID: &str = "rename";
+
+/// Take the tab lock, ignoring poisoning: a panic on an IPC thread must not
+/// take the window down with it (`ipc.rs` locks the same way).
+///
+/// Every caller keeps its guard to the smallest possible scope, and never
+/// acquires a second one while holding the first — the UI thread is one thread,
+/// so a nested lock would simply deadlock against itself.
+fn lock(tabs: &Mutex<TabManager>) -> MutexGuard<'_, TabManager> {
+    tabs.lock().unwrap_or_else(|err| err.into_inner())
+}
 
 /// Ghostty-like readability: bright foreground on a soft dark background
 /// (egui_term's defaults are dimmer and smaller than a real terminal).
@@ -74,9 +84,12 @@ fn main() -> eframe::Result {
 struct App {
     pty_events: Receiver<(u64, PtyEvent)>,
     pty_sender: Sender<(u64, PtyEvent)>,
-    tabs: Option<TabManager>,
+    /// Shared with the IPC threads, which run `terra` CLI requests against it
+    /// themselves — the UI thread does not get a frame at all while the window
+    /// is occluded, so it cannot be the one executing them.
+    tabs: Option<Arc<Mutex<TabManager>>>,
     palette: Palette,
-    ipc: Option<(IpcServer, Receiver<IpcRequest>)>,
+    ipc: Option<IpcServer>,
     scrollbar: ScrollbarState,
     quitting: bool,
     last_window_title: String,
@@ -113,11 +126,12 @@ impl App {
             log::error!("terra: cannot spawn the initial shell: {err}");
             self.quitting = true;
         }
-        self.tabs = Some(tabs);
+        let tabs = Arc::new(Mutex::new(tabs));
+        self.tabs = Some(Arc::clone(&tabs));
 
-        match ipc::start(ctx.clone()) {
+        match ipc::start(ctx.clone(), tabs) {
             Ok(server) => {
-                log::info!("terra: listening on {}", server.0.socket_path().display());
+                log::info!("terra: listening on {}", server.socket_path().display());
                 self.ipc = Some(server);
             }
             Err(err) => log::error!("terra: ipc server unavailable: {err}"),
@@ -130,7 +144,7 @@ impl App {
         let title = self
             .tabs
             .as_ref()
-            .and_then(|t| t.infos().into_iter().find(|i| i.active))
+            .and_then(|tabs| lock(tabs).infos().into_iter().find(|i| i.active))
             .map(|i| i.title)
             .unwrap_or_else(|| "terra".to_string());
         if title == self.last_window_title {
@@ -148,10 +162,16 @@ impl App {
         }
     }
 
+    /// PTY titles and exits are handled here, on the UI thread, not on the IPC
+    /// threads: nothing a client can ask for depends on them. The cost is that
+    /// while the window is occluded titles go stale and a tab whose shell has
+    /// exited stays in `terra ls` until the window is drawn again — both catch
+    /// up on the next frame, and neither can strand a request.
     fn drain_pty_events(&mut self) {
-        let Some(tabs) = self.tabs.as_mut() else {
+        let Some(arc) = self.tabs.clone() else {
             return;
         };
+        let mut tabs = lock(&arc);
         while let Ok((id, event)) = self.pty_events.try_recv() {
             match event {
                 PtyEvent::Title(title) => tabs.set_shell_title(id, title),
@@ -159,76 +179,6 @@ impl App {
                     tabs.close(id);
                 }
                 _ => {}
-            }
-        }
-    }
-
-    fn drain_ipc(&mut self, ctx: &egui::Context) {
-        let Some((_, requests)) = self.ipc.as_ref() else {
-            return;
-        };
-        let mut pending = Vec::new();
-        while let Ok(msg) = requests.try_recv() {
-            pending.push(msg);
-        }
-        if pending.is_empty() {
-            return;
-        }
-        for msg in pending {
-            let response = self.handle_request(ctx, msg.request);
-            let _ = msg.reply.send(response);
-        }
-        // New/renamed/selected tabs must show up right away.
-        ctx.request_repaint();
-    }
-
-    fn handle_request(&mut self, _ctx: &egui::Context, request: Request) -> Response {
-        let Some(tabs) = self.tabs.as_mut() else {
-            return Response::err("terra is still starting up");
-        };
-        let no_tab = |id: u64| Response::err(format!("no such tab: {id}"));
-
-        match request {
-            Request::List => Response::ok_tabs(tabs.infos()),
-            Request::New {
-                title,
-                command,
-                cwd,
-            } => match tabs.open(&command, cwd.as_deref(), title) {
-                Ok(id) => Response::ok_tab(id),
-                Err(err) => Response::err(err),
-            },
-            Request::Kill { tab } => {
-                if tabs.close(tab) {
-                    Response::ok()
-                } else {
-                    no_tab(tab)
-                }
-            }
-            Request::Send { tab, text, enter } => {
-                if tabs.send(tab, &text, enter) {
-                    Response::ok()
-                } else {
-                    no_tab(tab)
-                }
-            }
-            Request::Capture { tab, scrollback } => match tabs.capture(tab, scrollback) {
-                Some(text) => Response::ok_text(text),
-                None => no_tab(tab),
-            },
-            Request::Rename { tab, title } => {
-                if tabs.set_custom_title(tab, title) {
-                    Response::ok()
-                } else {
-                    no_tab(tab)
-                }
-            }
-            Request::Select { tab } => {
-                if tabs.select(tab) {
-                    Response::ok()
-                } else {
-                    no_tab(tab)
-                }
             }
         }
     }
@@ -241,7 +191,7 @@ impl App {
             PaletteAction::new("tab.next", "Next Tab", Some("⇧⌘]")),
             PaletteAction::new("tab.prev", "Previous Tab", Some("⇧⌘[")),
         ];
-        if let Some(tabs) = self.tabs.as_ref() {
+        if let Some(tabs) = self.tabs.as_ref().map(|t| lock(t)) {
             for id in tabs.ids() {
                 let title = tabs.title(id).unwrap_or("shell");
                 actions.push(PaletteAction::new(
@@ -281,7 +231,8 @@ impl App {
             PaletteEvent::PromptSubmitted { id, text } => {
                 self.palette.close();
                 if id == RENAME_PROMPT_ID {
-                    if let Some(tabs) = self.tabs.as_mut() {
+                    if let Some(arc) = self.tabs.clone() {
+                        let mut tabs = lock(&arc);
                         if let Some(active) = tabs.active_id() {
                             tabs.set_custom_title(active, text);
                         }
@@ -292,41 +243,45 @@ impl App {
         }
     }
 
+    /// Every arm takes the lock for exactly as long as it needs it — never
+    /// across a call that would want it again (`palette_actions`).
     fn apply(&mut self, action: AppAction) {
-        let Some(tabs) = self.tabs.as_mut() else {
+        let Some(arc) = self.tabs.clone() else {
             return;
         };
         match action {
             AppAction::NewTab => {
-                if let Err(err) = tabs.open(&[], None, None) {
+                if let Err(err) = lock(&arc).open(&[], None, None) {
                     log::error!("terra: cannot spawn a shell: {err}");
                 }
             }
-            AppAction::CloseActive => tabs.close_active(),
+            AppAction::CloseActive => lock(&arc).close_active(),
             AppAction::CloseTab(id) => {
-                tabs.close(id);
+                lock(&arc).close(id);
             }
             AppAction::SelectTab(id) => {
-                tabs.select(id);
+                lock(&arc).select(id);
             }
-            AppAction::SelectNth(n) => tabs.select_nth(n),
-            AppAction::NextTab => tabs.select_next(),
-            AppAction::PrevTab => tabs.select_prev(),
+            AppAction::SelectNth(n) => lock(&arc).select_nth(n),
+            AppAction::NextTab => lock(&arc).select_next(),
+            AppAction::PrevTab => lock(&arc).select_prev(),
             AppAction::OpenPalette => {
                 let actions = self.palette_actions();
                 self.palette.open(actions);
             }
             AppAction::RenameActive => {
-                let prefill = tabs
-                    .active_id()
-                    .and_then(|id| tabs.title(id))
-                    .unwrap_or("")
-                    .to_string();
+                let prefill = {
+                    let tabs = lock(&arc);
+                    tabs.active_id()
+                        .and_then(|id| tabs.title(id))
+                        .unwrap_or("")
+                        .to_string()
+                };
                 self.palette
                     .open_prompt("Rename tab", prefill, RENAME_PROMPT_ID);
             }
             AppAction::Quit => {
-                tabs.clear();
+                lock(&arc).clear();
                 self.quitting = true;
             }
         }
@@ -339,15 +294,14 @@ impl eframe::App for App {
         self.ensure_started(&ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            if let Some(tabs) = self.tabs.as_mut() {
-                tabs.clear();
+            if let Some(arc) = self.tabs.clone() {
+                lock(&arc).clear();
             }
             self.ipc = None;
             return;
         }
 
         self.drain_pty_events();
-        self.drain_ipc(&ctx);
         self.sync_window_title(&ctx, frame);
 
         let mut actions: Vec<AppAction> = Vec::new();
@@ -360,14 +314,17 @@ impl eframe::App for App {
             self.apply(action);
         }
 
-        if let Some(tabs) = self.tabs.as_ref() {
-            ui::tab_bar(ui, tabs, &mut actions);
+        if let Some(arc) = self.tabs.clone() {
+            let tabs = lock(&arc);
+            ui::tab_bar(ui, &tabs, &mut actions);
         }
         for action in std::mem::take(&mut actions) {
             self.apply(action);
         }
 
         let palette_open = self.palette.is_open();
+        let tabs_arc = self.tabs.clone();
+        let scrollbar = &mut self.scrollbar;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
@@ -380,9 +337,14 @@ impl eframe::App for App {
                     }),
             )
             .show(ui, |ui| {
-                let active_id = self.tabs.as_ref().and_then(TabManager::active_id);
-                if let Some(tab) = self.tabs.as_mut().and_then(TabManager::active_mut) {
-                    let _ = active_id; // content switches instantly, like Ghostty
+                let Some(arc) = tabs_arc else {
+                    return;
+                };
+                // One guard for the whole active-tab render: `TerminalView`
+                // wants a `&mut Tab` that lives inside the manager, and nothing
+                // in here reaches for the lock a second time.
+                let mut tabs = lock(&arc);
+                if let Some(tab) = tabs.active_mut() {
                     let view = TerminalView::new(ui, &mut tab.backend)
                         .set_focus(!palette_open)
                         .set_theme(terminal_theme())
@@ -390,12 +352,12 @@ impl eframe::App for App {
                         .set_size(ui.available_size());
                     let rect = ui.add(view).rect;
                     // After the terminal, so the thumb wins the hit test.
-                    scrollbar::show(ui, rect, &mut tab.backend, &mut self.scrollbar);
+                    scrollbar::show(ui, rect, &mut tab.backend, scrollbar);
                 }
             });
 
         // Last tab gone (or Quit chosen) -> the app is done.
-        let empty = self.tabs.as_ref().is_some_and(TabManager::is_empty);
+        let empty = self.tabs.as_ref().is_some_and(|tabs| lock(tabs).is_empty());
         if self.quitting || empty {
             self.ipc = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

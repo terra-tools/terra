@@ -1,29 +1,26 @@
 //! Unix-socket control server.
 //!
 //! A background thread accepts connections on [`terra_protocol::socket_path`]
-//! and reads newline-delimited JSON [`Request`]s. Each request is forwarded to
-//! the UI thread together with a one-shot reply channel; the connection thread
-//! then blocks (bounded by [`REPLY_TIMEOUT`]) for the [`Response`] and writes it
-//! back as a single JSON line.
+//! and reads newline-delimited JSON [`Request`]s. Each connection thread runs
+//! the request itself, against the [`TabManager`] shared with the UI thread
+//! behind a `Mutex`, and writes the [`Response`] back as a single JSON line.
+//!
+//! Executing here rather than on the UI thread is deliberate: eframe skips
+//! running the app entirely while the window is occluded (another Space,
+//! minimised, fully covered), so anything that waits for a frame to happen
+//! would simply never be answered. Requests only ever wait for the lock, which
+//! the UI thread holds for a few short stretches per frame.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use terra_protocol::{Request, Response};
 
-/// How long a connection waits for the UI thread to answer.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// A request from a client plus the channel its response must go back on.
-pub struct IpcRequest {
-    pub request: Request,
-    pub reply: Sender<Response>,
-}
+use crate::tabs::TabManager;
 
 /// Owns the listening socket path; unlinks it on drop (best effort).
 pub struct IpcServer {
@@ -42,8 +39,14 @@ impl Drop for IpcServer {
     }
 }
 
+/// Take the tab lock, ignoring poisoning: a panic on one thread must not brick
+/// the other half of the app (the UI locks the same way, see `main.rs`).
+fn lock(tabs: &Mutex<TabManager>) -> MutexGuard<'_, TabManager> {
+    tabs.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 /// Bind the socket and spawn the accept loop.
-pub fn start(ctx: egui::Context) -> anyhow::Result<(IpcServer, Receiver<IpcRequest>)> {
+pub fn start(ctx: egui::Context, tabs: Arc<Mutex<TabManager>>) -> anyhow::Result<IpcServer> {
     let socket_path = terra_protocol::socket_path();
 
     if let Some(parent) = socket_path.parent() {
@@ -54,7 +57,6 @@ pub fn start(ctx: egui::Context) -> anyhow::Result<(IpcServer, Receiver<IpcReque
     let _ = fs::remove_file(&socket_path);
 
     let listener = UnixListener::bind(&socket_path)?;
-    let (tx, rx) = mpsc::channel();
 
     std::thread::Builder::new()
         .name("terra-ipc".into())
@@ -62,11 +64,11 @@ pub fn start(ctx: egui::Context) -> anyhow::Result<(IpcServer, Receiver<IpcReque
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        let tx = tx.clone();
+                        let tabs = Arc::clone(&tabs);
                         let ctx = ctx.clone();
                         let spawned = std::thread::Builder::new()
                             .name("terra-ipc-conn".into())
-                            .spawn(move || serve(stream, &tx, &ctx));
+                            .spawn(move || serve(stream, &tabs, &ctx));
                         if let Err(err) = spawned {
                             log::warn!("terra ipc: cannot spawn connection thread: {err}");
                         }
@@ -79,10 +81,10 @@ pub fn start(ctx: egui::Context) -> anyhow::Result<(IpcServer, Receiver<IpcReque
             }
         })?;
 
-    Ok((IpcServer { socket_path }, rx))
+    Ok(IpcServer { socket_path })
 }
 
-fn serve(stream: UnixStream, tx: &Sender<IpcRequest>, ctx: &egui::Context) {
+fn serve(stream: UnixStream, tabs: &Mutex<TabManager>, ctx: &egui::Context) {
     let Ok(mut out) = stream.try_clone() else {
         return;
     };
@@ -101,7 +103,7 @@ fn serve(stream: UnixStream, tx: &Sender<IpcRequest>, ctx: &egui::Context) {
         }
 
         let response = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(request) => dispatch(request, tx, ctx),
+            Ok(request) => dispatch(request, tabs, ctx),
             Err(err) => Response::err(format!("bad request: {err}")),
         };
 
@@ -115,33 +117,82 @@ fn serve(stream: UnixStream, tx: &Sender<IpcRequest>, ctx: &egui::Context) {
     }
 }
 
-fn dispatch(request: Request, tx: &Sender<IpcRequest>, ctx: &egui::Context) -> Response {
+/// Run one request against the shared tabs and apply its side effects on the
+/// window.
+fn dispatch(request: Request, tabs: &Mutex<TabManager>, ctx: &egui::Context) -> Response {
     let summon = matches!(request, Request::Select { .. });
-    let (reply_tx, reply_rx) = mpsc::channel();
-    if tx
-        .send(IpcRequest {
-            request,
-            reply: reply_tx,
-        })
-        .is_err()
-    {
-        return Response::err("terra ui is gone");
-    }
-    // Wake the UI so it drains the queue even when idle.
-    ctx.request_repaint();
+    // `List` and `Capture` only read; everything else changes what the window
+    // should be showing.
+    let mutating = !matches!(request, Request::List | Request::Capture { .. });
 
-    match reply_rx.recv_timeout(REPLY_TIMEOUT) {
-        Ok(response) => {
-            // `terra select` also summons the window. Done here on the IPC
-            // thread via the thread-safe NSRunningApplication — activating
-            // from inside the frame callback wedges winit's waker.
-            if summon && matches!(response, Response::Ok { .. }) {
-                crate::macos::activate_app();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                ctx.request_repaint();
+    let response = {
+        let mut tabs = lock(tabs);
+        execute(&mut tabs, request)
+    };
+
+    if mutating {
+        // A visible window must show the new/renamed/selected tab right away;
+        // an occluded one simply picks it up whenever it is drawn again.
+        ctx.request_repaint();
+    }
+
+    // `terra select` also summons the window. Done here on the IPC thread via
+    // the thread-safe NSRunningApplication — activating from inside the frame
+    // callback wedges winit's waker.
+    if summon && matches!(response, Response::Ok { .. }) {
+        crate::macos::activate_app();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    response
+}
+
+/// The whole protocol, in terms of [`TabManager`].
+fn execute(tabs: &mut TabManager, request: Request) -> Response {
+    let no_tab = |id: u64| Response::err(format!("no such tab: {id}"));
+
+    match request {
+        Request::List => Response::ok_tabs(tabs.infos()),
+        Request::New {
+            title,
+            command,
+            cwd,
+        } => match tabs.open(&command, cwd.as_deref(), title) {
+            Ok(id) => Response::ok_tab(id),
+            Err(err) => Response::err(err),
+        },
+        Request::Kill { tab } => {
+            if tabs.close(tab) {
+                Response::ok()
+            } else {
+                no_tab(tab)
             }
-            response
         }
-        Err(_) => Response::err("timed out waiting for the terra ui"),
+        Request::Send { tab, text, enter } => {
+            if tabs.send(tab, &text, enter) {
+                Response::ok()
+            } else {
+                no_tab(tab)
+            }
+        }
+        Request::Capture { tab, scrollback } => match tabs.capture(tab, scrollback) {
+            Some(text) => Response::ok_text(text),
+            None => no_tab(tab),
+        },
+        Request::Rename { tab, title } => {
+            if tabs.set_custom_title(tab, title) {
+                Response::ok()
+            } else {
+                no_tab(tab)
+            }
+        }
+        Request::Select { tab } => {
+            if tabs.select(tab) {
+                Response::ok()
+            } else {
+                no_tab(tab)
+            }
+        }
     }
 }

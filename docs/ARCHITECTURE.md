@@ -36,11 +36,11 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   open tab, label = title), `app.quit`.
 - IPC server (`ipc.rs`): thread with `UnixListener` on `terra_protocol::socket_path()`
   (create parent dir 0700; remove stale socket on startup; remove on exit).
-  Per connection: read JSON lines -> `Request`; forward
-  `(Request, mpsc::Sender<Response>)` to the UI thread over an
-  `mpsc::Sender<IpcMsg>`; call `egui::Context::request_repaint()` so the UI
-  wakes; block (with ~2s timeout) for the Response; write JSON line back.
-  UI thread drains requests in `update()` and executes them on TabManager.
+  Connection threads execute requests directly against the shared
+  `Arc<Mutex<TabManager>>` — never via the UI thread, which eframe parks
+  entirely while the window is occluded. Repaint is requested after mutating
+  requests; `Select` also summons the window (thread-safe NSRunningApplication;
+  never activate from inside the frame callback — it wedges winit's waker).
 - Capture: `backend.sync()` then walk `last_content().grid.display_iter()`,
   build lines for the visible screen; include up to `scrollback` lines above
   via grid indexing if feasible, else visible-only is acceptable for v1.
