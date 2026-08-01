@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+egui = "0.35"
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+] }
+egui_term = { path = "vendor/egui_term" }
+alacritty_terminal = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+# macOS titlebar proxy icon (see crates/terra-app/src/macos.rs). Versions match
+# what winit/eframe already pull in, so this costs no extra build.
+raw-window-handle = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSApplication",
+    "NSRunningApplication",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+] }
+
+terra-protocol = { path = "crates/terra-protocol" }
+terra-palette = { path = "crates/terra-palette" }
+
+[profile.release]
+opt-level = 2

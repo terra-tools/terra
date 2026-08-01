@@ -1,0 +1,43 @@
+[package]
+name = "terra-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "terra-app"
+path = "src/main.rs"
+
+[dependencies]
+egui = { workspace = true }
+eframe = { workspace = true }
+egui_term = { workspace = true }
+alacritty_terminal = { workspace = true }
+terra-protocol = { workspace = true }
+terra-palette = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+raw-window-handle = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { workspace = true }
+objc2-foundation = { workspace = true }
+
+# `cargo packager -p terra-app --release` — cross-platform bundles
+# (.app/.dmg on macOS, nsis/msi on Windows, deb/appimage on Linux).
+[package.metadata.packager]
+product-name = "terra"
+identifier = "dev.terra.app"
+version = "0.1.0"
+category = "DeveloperTool"
+icons = [
+  "assets/icon/terra.icns",
+  "assets/icon/terra-256.png",
+  "assets/icon/terra-512.png",
+]
+formats = ["app", "dmg"]
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
