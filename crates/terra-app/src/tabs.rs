@@ -193,6 +193,9 @@ impl TabManager {
     /// index-based half of the reorder API, used by the tests and by any caller
     /// that thinks in slots rather than tabs.
     #[cfg(test)]
+    // Only the Unix-gated PTY tests reach this today — the tab-drag UI in
+    // `ui.rs` does not call it yet, which is worth fixing separately.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn reorder(&self, from_idx: usize, to_idx: usize) -> bool {
         let id = match self.order.borrow().get(from_idx) {
             Some(id) => *id,
@@ -690,6 +693,9 @@ mod tests {
     }
 
     /// The same two rules, exercised through `TabManager` with a real PTY.
+    // Spawns a real PTY running `/bin/cat`, so it is Unix-only. The
+    // manager logic under test is portable; only the fixture is not.
+    #[cfg(unix)]
     #[test]
     fn tab_manager_title_sync() {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -756,6 +762,9 @@ mod tests {
 
     /// Tabs live in an explicit order: new ones land at the end, and `ids`,
     /// `infos` and `⌘n` all read that order rather than the id order.
+    // Spawns a real PTY running `/bin/cat`, so it is Unix-only. The
+    // manager logic under test is portable; only the fixture is not.
+    #[cfg(unix)]
     #[test]
     fn tabs_keep_an_explicit_visual_order() {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -793,6 +802,9 @@ mod tests {
 
     /// Reordering is total and stable: no id is lost or duplicated, out-of-range
     /// targets clamp, and unknown ids or no-op moves report `false`.
+    // Spawns a real PTY running `/bin/cat`, so it is Unix-only. The
+    // manager logic under test is portable; only the fixture is not.
+    #[cfg(unix)]
     #[test]
     fn reordering_preserves_every_tab() {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -822,6 +834,9 @@ mod tests {
 
     /// Closing keeps the order intact and hands focus to the left neighbour in
     /// *visual* order — after a drag that is not the neighbour by id.
+    // Spawns a real PTY running `/bin/cat`, so it is Unix-only. The
+    // manager logic under test is portable; only the fixture is not.
+    #[cfg(unix)]
     #[test]
     fn closing_a_tab_removes_it_from_the_order() {
         let (tx, _rx) = std::sync::mpsc::channel();
