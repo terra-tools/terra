@@ -120,6 +120,7 @@ pub fn activate_app() {}
 // drop-down.
 
 /// Fade/grow in. A touch under Ghostty's 0.2s: nothing travels far.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const OPEN_DURATION: f64 = 0.18;
 /// Fade/shrink out. Quicker than the way in — a dismissal should not be
 /// something you wait for.
@@ -129,14 +130,17 @@ pub const CLOSE_DURATION: f64 = 0.13;
 const CLOSE_GRACE: f64 = 0.03;
 
 /// How small the window starts on the way in…
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const OPEN_SCALE: f64 = 0.98;
 /// …and ends on the way out. Smaller travel: the fade carries the exit.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const CLOSE_SCALE: f64 = 0.985;
 
 /// A rect scaled about its own centre — the geometry half of the transition,
 /// kept free of AppKit so it can be tested anywhere.
 ///
 /// Takes and returns `(x, y, width, height)`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn scaled_about_center(rect: (f64, f64, f64, f64), scale: f64) -> (f64, f64, f64, f64) {
     let (x, y, w, h) = rect;
     let (sw, sh) = (w * scale, h * scale);
