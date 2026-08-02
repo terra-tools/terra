@@ -58,47 +58,73 @@ const MAX_DEPTH: usize = 32;
 ///
 /// `None` when it cannot be determined, which callers must treat as "no
 /// opinion" rather than an error.
+pub fn foreground_command(shell_pid: u32) -> Option<String> {
+    foreground_commands(&[shell_pid]).pop()?
+}
+
+/// [`foreground_command`] for several shells at once, answering in the order
+/// asked and always with exactly `shell_pids.len()` entries.
+///
+/// The batch form exists because the expensive part is the *snapshot*, not the
+/// lookup: one `sysctl` (or one ToolHelp snapshot, or one sweep of `/proc`)
+/// hands back the whole machine, and the tab bar wants an answer for every open
+/// tab at once. Asking per tab would multiply the only costly step by the
+/// number of tabs to re-derive the same table each time.
+///
+/// Answering from one snapshot is also the more correct thing to do: every
+/// tab's answer then describes the same instant, rather than a row of tabs each
+/// describing a slightly different one.
+pub fn foreground_commands(shell_pids: &[u32]) -> Vec<Option<String>> {
+    let Some(rows) = snapshot() else {
+        return vec![None; shell_pids.len()];
+    };
+    let edges: Vec<(u32, u32)> = rows.iter().map(|(pid, ppid, _)| (*pid, *ppid)).collect();
+    shell_pids
+        .iter()
+        .map(|shell_pid| {
+            let target = innermost_pid(&edges, *shell_pid)?;
+            let (_, _, name) = rows.iter().find(|(pid, _, _)| *pid == target)?;
+            command_name(name)
+        })
+        .collect()
+}
+
+/// `(pid, ppid, raw name)` for every process on the machine, from one kernel
+/// snapshot.
+///
+/// The only `cfg`-gated step. Each platform's `process_table` already produces
+/// a consistent snapshot in its own shape; this flattens the three shapes into
+/// the one the tree walk and [`command_name`] consume, so everything downstream
+/// of here is a single implementation tested everywhere.
 #[cfg(target_os = "macos")]
-pub fn foreground_command(shell_pid: u32) -> Option<String> {
+fn snapshot() -> Option<Vec<(u32, u32, Vec<u8>)>> {
     let table = process_table()?;
-
-    // A negative pid is not a pid; it means we are looking at a slot the kernel
-    // did not fill, so drop the row rather than reasoning about it.
-    let edges: Vec<(u32, u32)> = table
-        .iter()
-        .filter(|p| p.p_pid >= 0 && p.e_ppid >= 0)
-        .map(|p| (p.p_pid as u32, p.e_ppid as u32))
-        .collect();
-
-    let target = innermost_pid(&edges, shell_pid)?;
-    let proc = table
-        .iter()
-        .find(|p| p.p_pid >= 0 && p.p_pid as u32 == target)?;
-    command_name(&proc.p_comm)
+    Some(
+        table
+            .iter()
+            // A negative pid is not a pid; it means we are looking at a slot
+            // the kernel did not fill, so drop the row rather than reasoning
+            // about it.
+            .filter(|p| p.p_pid >= 0 && p.e_ppid >= 0)
+            .map(|p| (p.p_pid as u32, p.e_ppid as u32, p.p_comm.to_vec()))
+            .collect(),
+    )
 }
 
-/// See [`foreground_command`] — same contract, Windows enumeration.
-#[cfg(target_os = "windows")]
-pub fn foreground_command(shell_pid: u32) -> Option<String> {
+/// See [`snapshot`] — same contract, ToolHelp enumeration.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn snapshot() -> Option<Vec<(u32, u32, Vec<u8>)>> {
     let table = process_table()?;
-    let edges: Vec<(u32, u32)> = table.iter().map(|row| (row.pid, row.ppid)).collect();
-    let target = innermost_pid(&edges, shell_pid)?;
-    let row = table.iter().find(|row| row.pid == target)?;
-    command_name(row.name.as_bytes())
-}
-
-/// See [`foreground_command`] — same contract, `/proc` enumeration.
-#[cfg(target_os = "linux")]
-pub fn foreground_command(shell_pid: u32) -> Option<String> {
-    let table = process_table()?;
-    let edges: Vec<(u32, u32)> = table.iter().map(|row| (row.pid, row.ppid)).collect();
-    let target = innermost_pid(&edges, shell_pid)?;
-    let row = table.iter().find(|row| row.pid == target)?;
-    command_name(row.name.as_bytes())
+    Some(
+        table
+            .into_iter()
+            .map(|row| (row.pid, row.ppid, row.name.into_bytes()))
+            .collect(),
+    )
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-pub fn foreground_command(_shell_pid: u32) -> Option<String> {
+fn snapshot() -> Option<Vec<(u32, u32, Vec<u8>)>> {
     None
 }
 

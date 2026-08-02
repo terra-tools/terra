@@ -14,7 +14,7 @@ use egui_term::{BackendCommand, BackendSettings, PtyEvent, TerminalBackend};
 use serde::Serialize;
 use terra_protocol::TabInfo;
 
-use crate::config::BidiMode;
+use crate::config::{BidiMode, Profile};
 
 /// Fallback when `$SHELL` is not set. Unix only — Windows never sets `SHELL`
 /// and has no `/bin`, so it takes [`WINDOWS_FALLBACK_SHELL`] instead.
@@ -289,6 +289,16 @@ fn strip_user_host(title: &str) -> &str {
 pub struct Tab {
     pub backend: TerminalBackend,
     pub title: Title,
+    /// The command this tab was opened with, joined by spaces, or empty for a
+    /// plain shell.
+    ///
+    /// Kept only as a hint for the tab-bar icon (see [`crate::tab_icon`]): a
+    /// tab opened as `terra new -- htop` should wear the htop logo from the
+    /// first frame, not from whenever the process walk next runs — and it
+    /// keeps wearing it while `htop` is what the tab is *for*, even during the
+    /// moments the shell is between commands. Not the truth about what is
+    /// running; the process table is.
+    pub spawn: String,
     /// Per-tab override of `[text] bidi`, set from the palette or
     /// `terra bidi`. `None` means "follow the config".
     ///
@@ -305,86 +315,740 @@ impl Tab {
     }
 }
 
+/// One editor group (a "split leaf"): a tab bar plus the terminal of its
+/// active tab.
+///
+/// Groups hold ids only — the tabs themselves stay in [`TabManager::tabs`],
+/// one global map, so the wire protocol keeps addressing tabs by global id.
+#[derive(Debug, Clone)]
+pub struct Group {
+    /// Stable identity of this leaf, minted from [`TabManager::next_leaf`]
+    /// and never reused. It is what focus tracks: DFS indices shift when the
+    /// tree changes shape, the id never does.
+    id: u64,
+    /// The group's tabs in visual (bar) order.
+    tab_ids: Vec<u64>,
+    /// Which of [`Self::tab_ids`] shows its terminal below the bar.
+    active: Option<u64>,
+}
+
+impl Group {
+    fn of(id: u64, tab_id: u64) -> Self {
+        Self {
+            id,
+            tab_ids: vec![tab_id],
+            active: Some(tab_id),
+        }
+    }
+}
+
+/// Which way a split lays its children out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    /// Children sit side by side (a row of columns); `split_right`/`left`
+    /// create these, and the separators between children are vertical lines.
+    Horizontal,
+    /// Children are stacked top to bottom; `split_down`/`up` create these.
+    Vertical,
+}
+
+/// One node of the split tree: a leaf (a [`Group`]) or a run of children
+/// along an [`Axis`]. VS Code's 2D grid, exactly.
+///
+/// Invariants, restored by [`normalized`] after every mutation:
+/// - no leaf is empty (a closed-out leaf folds its weight into a sibling);
+/// - no split has fewer than two children (a lone child replaces its parent);
+/// - no child of a split is a split on the same axis (its children splice in,
+///   scaled so they keep the child's share — VS Code's merge behaviour).
+#[derive(Debug, Clone)]
+struct Node {
+    /// Share of the parent split's extent, relative to the siblings' weights.
+    /// Meaningless (and forced to 1) on the root.
+    weight: f32,
+    kind: NodeKind,
+}
+
+#[derive(Debug, Clone)]
+enum NodeKind {
+    Leaf(Group),
+    Split { axis: Axis, children: Vec<Node> },
+}
+
+/// All leaves under `node`, in DFS order — the order every `group` index in
+/// the public API refers to.
+fn collect_leaves<'a>(node: &'a Node, out: &mut Vec<&'a Group>) {
+    match &node.kind {
+        NodeKind::Leaf(group) => out.push(group),
+        NodeKind::Split { children, .. } => {
+            for child in children {
+                collect_leaves(child, out);
+            }
+        }
+    }
+}
+
+/// The leaf with id `leaf`, mutable.
+fn leaf_mut(node: &mut Node, leaf: u64) -> Option<&mut Group> {
+    match &mut node.kind {
+        NodeKind::Leaf(group) if group.id == leaf => Some(group),
+        NodeKind::Leaf(_) => None,
+        NodeKind::Split { children, .. } => {
+            children.iter_mut().find_map(|child| leaf_mut(child, leaf))
+        }
+    }
+}
+
+/// Restore the tree invariants (see [`Node`]) bottom-up: drop empty leaves
+/// (folding each one's weight into the sibling before it, else the one after),
+/// splice same-axis child splits into their parent, and collapse single-child
+/// splits into the child. `None` means the whole tree emptied out.
+fn normalized(node: Node) -> Option<Node> {
+    let Node { weight, kind } = node;
+    match kind {
+        NodeKind::Leaf(group) if group.tab_ids.is_empty() => None,
+        NodeKind::Leaf(group) => Some(Node {
+            weight,
+            kind: NodeKind::Leaf(group),
+        }),
+        NodeKind::Split { axis, children } => {
+            let mut kids: Vec<Node> = Vec::with_capacity(children.len());
+            // Weight of dropped children that had no left sibling yet; it
+            // falls forward onto the first survivor.
+            let mut orphaned = 0.0;
+            for child in children {
+                let child_weight = child.weight;
+                match normalized(child) {
+                    Some(mut child) => {
+                        child.weight += std::mem::take(&mut orphaned);
+                        match child.kind {
+                            NodeKind::Split {
+                                axis: child_axis,
+                                children: grandchildren,
+                            } if child_axis == axis => {
+                                // Same-axis nesting splices flat, each spliced
+                                // node keeping its share of the child's share.
+                                let total: f32 = grandchildren.iter().map(|n| n.weight).sum();
+                                let scale = if total > 0.0 {
+                                    child.weight / total
+                                } else {
+                                    child.weight / grandchildren.len().max(1) as f32
+                                };
+                                for mut grandchild in grandchildren {
+                                    grandchild.weight *= scale;
+                                    kids.push(grandchild);
+                                }
+                            }
+                            _ => kids.push(child),
+                        }
+                    }
+                    None => match kids.last_mut() {
+                        Some(previous) => previous.weight += child_weight,
+                        None => orphaned += child_weight,
+                    },
+                }
+            }
+            if orphaned > 0.0 {
+                if let Some(first) = kids.first_mut() {
+                    first.weight += orphaned;
+                }
+            }
+            match kids.len() {
+                0 => None,
+                1 => {
+                    // A split of one is no split: the child takes its place —
+                    // and its share of the parent.
+                    let mut only = kids.pop().expect("len checked");
+                    only.weight = weight;
+                    Some(only)
+                }
+                _ => Some(Node {
+                    weight,
+                    kind: NodeKind::Split {
+                        axis,
+                        children: kids,
+                    },
+                }),
+            }
+        }
+    }
+}
+
+/// Replace leaf `leaf` with a two-child split on `axis`: the old leaf and
+/// `group` (taken out of the option), the new leaf after or before it. The
+/// pair start with equal weights inside a split that keeps the old leaf's
+/// share; when the parent already runs on `axis`, [`normalized`] then splices
+/// the pair in — which is exactly "the two halves share what the one had".
+fn wrap_leaf(
+    node: &mut Node,
+    leaf: u64,
+    group: &mut Option<Group>,
+    axis: Axis,
+    after: bool,
+) -> bool {
+    match &mut node.kind {
+        NodeKind::Leaf(existing) if existing.id == leaf => {
+            let Some(new_group) = group.take() else {
+                return false;
+            };
+            let old_kind = std::mem::replace(
+                &mut node.kind,
+                NodeKind::Split {
+                    axis,
+                    children: Vec::new(),
+                },
+            );
+            let old = Node {
+                weight: 1.0,
+                kind: old_kind,
+            };
+            let new = Node {
+                weight: 1.0,
+                kind: NodeKind::Leaf(new_group),
+            };
+            let children = if after {
+                vec![old, new]
+            } else {
+                vec![new, old]
+            };
+            node.kind = NodeKind::Split { axis, children };
+            true
+        }
+        NodeKind::Leaf(_) => false,
+        NodeKind::Split { children, .. } => children
+            .iter_mut()
+            .any(|child| wrap_leaf(child, leaf, group, axis, after)),
+    }
+}
+
+/// Each leaf's share of the whole window (the product of its ancestors'
+/// normalised weights), pushed in DFS order. The shares sum to 1.
+// Only [`TabManager::group_weights`] calls this — see there for why it stays.
+#[allow(dead_code)]
+fn leaf_fractions(node: &Node, factor: f32, out: &mut Vec<f32>) {
+    match &node.kind {
+        NodeKind::Leaf(_) => out.push(factor),
+        NodeKind::Split { children, .. } => {
+            let total: f32 = children.iter().map(|c| c.weight).sum();
+            for child in children {
+                let share = if total > 0.0 {
+                    child.weight / total
+                } else {
+                    1.0 / children.len().max(1) as f32
+                };
+                leaf_fractions(child, factor * share, out);
+            }
+        }
+    }
+}
+
+/// The split node at `path` (child indices from the root; `[]` is the root).
+fn node_at<'a>(node: &'a Node, path: &[usize]) -> Option<&'a Node> {
+    match path.split_first() {
+        None => Some(node),
+        Some((first, rest)) => match &node.kind {
+            NodeKind::Leaf(_) => None,
+            NodeKind::Split { children, .. } => node_at(children.get(*first)?, rest),
+        },
+    }
+}
+
+fn node_at_mut<'a>(node: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
+    match path.split_first() {
+        None => Some(node),
+        Some((first, rest)) => match &mut node.kind {
+            NodeKind::Leaf(_) => None,
+            NodeKind::Split { children, .. } => node_at_mut(children.get_mut(*first)?, rest),
+        },
+    }
+}
+
+/// Give `group` a new active tab after the one at `removed_idx` left:
+/// the nearest tab to the left, else the first remaining one.
+fn reactivate(group: &mut Group, removed_idx: usize) {
+    group.active = group.tab_ids.get(removed_idx.saturating_sub(1)).copied();
+}
+
+/// The split tree with every leaf reduced to its DFS index and every split's
+/// weights normalised — all the renderer needs to lay the window out, and
+/// what the tree-shape tests assert on. `Leaf(i)`'s `i` is the same `group`
+/// index the rest of the API takes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayoutNode {
+    Leaf(usize),
+    Split {
+        axis: Axis,
+        /// One fraction per child, summing to 1.
+        weights: Vec<f32>,
+        children: Vec<LayoutNode>,
+    },
+}
+
+fn build_layout(node: &Node, next_leaf: &mut usize) -> LayoutNode {
+    match &node.kind {
+        NodeKind::Leaf(_) => {
+            let index = *next_leaf;
+            *next_leaf += 1;
+            LayoutNode::Leaf(index)
+        }
+        NodeKind::Split { axis, children } => {
+            let total: f32 = children.iter().map(|c| c.weight).sum();
+            let weights = children
+                .iter()
+                .map(|c| {
+                    if total > 0.0 {
+                        c.weight / total
+                    } else {
+                        1.0 / children.len().max(1) as f32
+                    }
+                })
+                .collect();
+            LayoutNode::Split {
+                axis: *axis,
+                weights,
+                children: children
+                    .iter()
+                    .map(|child| build_layout(child, next_leaf))
+                    .collect(),
+            }
+        }
+    }
+}
+
+/// `h([0,2] v([1] [3]))`-style rendering of the tree, leaves as their tab
+/// ids — one line the tree tests can assert whole shapes with.
+#[cfg(test)]
+fn shape_of(node: &Node) -> String {
+    match &node.kind {
+        NodeKind::Leaf(group) => format!(
+            "[{}]",
+            group
+                .tab_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        NodeKind::Split { axis, children } => {
+            let tag = match axis {
+                Axis::Horizontal => "h",
+                Axis::Vertical => "v",
+            };
+            let inner = children.iter().map(shape_of).collect::<Vec<_>>().join(" ");
+            format!("{tag}({inner})")
+        }
+    }
+}
+
 pub struct TabManager {
     tabs: BTreeMap<u64, Tab>,
-    /// Visual left-to-right order of [`Self::tabs`]; the single source of truth
-    /// for the bar, `⌘1..9` and next/prev. Ids are appended on open and removed
-    /// on close, so it always holds exactly the keys of `tabs`.
+    /// The split tree; the single source of truth for the bars, `⌘1..9` and
+    /// next/prev. `None` while no tab is open. Invariants, restored by every
+    /// mutation: every open tab appears in exactly one leaf, a leaf's
+    /// `active` names one of its own tabs, and the [`Node`] shape invariants
+    /// (no empty leaf, no single-child split, no same-axis nesting).
     ///
-    /// Behind a `RefCell` because the tab bar reorders it while holding only a
-    /// `&TabManager` (the bar is drawn from an immutable borrow, mid-frame,
+    /// Behind a `RefCell` because the tab bar reorders tabs while holding only
+    /// a `&TabManager` (the bar is drawn from an immutable borrow, mid-frame,
     /// while a tab is dragged). Nothing else in the manager is shared, so the
-    /// borrows are short and strictly local to the ordering methods.
-    order: RefCell<Vec<u64>>,
-    active: Option<u64>,
+    /// borrows are short and strictly local to the group methods.
+    tree: RefCell<Option<Node>>,
+    /// Leaf *id* (see [`Group::id`]) of the focused group. The focused
+    /// group's active tab is the *globally* active tab: keyboard input goes
+    /// there and `terra ls` marks it. Ids are stable across tree reshapes;
+    /// when the focused leaf itself collapses, focus falls to the leaf now at
+    /// its old DFS index (clamped).
+    focused: std::cell::Cell<u64>,
+    /// Next [`Group::id`] to mint. Never reused, like tab ids.
+    next_leaf: std::cell::Cell<u64>,
     next_id: u64,
     ctx: egui::Context,
     pty_events: Sender<(u64, PtyEvent)>,
+    /// The named ways to open a tab, mirrored here from the config.
+    ///
+    /// They live on the manager rather than being read from the `ConfigStore`
+    /// because both things that need them are off the UI thread's happy path:
+    /// an IPC connection thread resolving `terra new --profile`, and the tab
+    /// bar, which is drawn from a `&TabManager` and nothing else. The store
+    /// stays the owner — `main.rs` pushes a fresh copy on load and on reload.
+    profiles: BTreeMap<String, Profile>,
 }
 
 impl TabManager {
     pub fn new(ctx: egui::Context, pty_events: Sender<(u64, PtyEvent)>) -> Self {
         Self {
             tabs: BTreeMap::new(),
-            order: RefCell::new(Vec::new()),
-            active: None,
+            tree: RefCell::new(None),
+            focused: std::cell::Cell::new(0),
+            next_leaf: std::cell::Cell::new(0),
             next_id: 0,
             ctx,
             pty_events,
+            profiles: BTreeMap::new(),
         }
+    }
+
+    /// A snapshot of every leaf in DFS order — the order all `group` indices
+    /// in this API refer to. Cloned so no borrow of the tree escapes.
+    fn leaves(&self) -> Vec<Group> {
+        let tree = self.tree.borrow();
+        let mut refs = Vec::new();
+        if let Some(root) = tree.as_ref() {
+            collect_leaves(root, &mut refs);
+        }
+        refs.into_iter().cloned().collect()
+    }
+
+    /// Restore the tree invariants after a mutation, then make sure focus
+    /// still points at a live leaf: if the focused leaf collapsed, the leaf
+    /// now at its old DFS index (`old_focus`, clamped) takes over — "stay in
+    /// place" from the user's point of view.
+    fn normalize(&self, old_focus: usize) {
+        {
+            let mut tree = self.tree.borrow_mut();
+            if let Some(root) = tree.take() {
+                *tree = normalized(root);
+            }
+            if let Some(root) = tree.as_mut() {
+                root.weight = 1.0;
+            }
+        }
+        let leaves = self.leaves();
+        if leaves.is_empty() {
+            return;
+        }
+        if !leaves.iter().any(|g| g.id == self.focused.get()) {
+            self.focused.set(leaves[old_focus.min(leaves.len() - 1)].id);
+        }
+    }
+
+    /// Replace the profile table. Called with the config's own copy at startup
+    /// and after every reload, so the menu and `--profile` never disagree with
+    /// the file.
+    pub fn set_profiles(&mut self, profiles: BTreeMap<String, Profile>) {
+        self.profiles = profiles;
+    }
+
+    /// The profile table, alphabetical by name.
+    pub fn profiles(&self) -> &BTreeMap<String, Profile> {
+        &self.profiles
     }
 
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
 
-    /// All tab ids in visual order.
+    /// All tab ids in visual order: the leaves in DFS order, each group's
+    /// tabs in bar order.
     pub fn ids(&self) -> Vec<u64> {
-        self.order.borrow().clone()
+        self.leaves()
+            .iter()
+            .flat_map(|g| g.tab_ids.iter().copied())
+            .collect()
     }
 
-    /// Position of `id` in the visual order.
+    /// Position of `id` in the global visual order (see [`Self::ids`]).
+    // The drag path is group-scoped now ([`Self::group_of`]); kept because the
+    // PTY tests and the cross-group drag feature address slots globally.
+    #[allow(dead_code)]
     pub fn index_of(&self, id: u64) -> Option<usize> {
-        self.order.borrow().iter().position(|i| *i == id)
+        self.ids().iter().position(|i| *i == id)
     }
 
-    /// Move a tab to `new_idx` in the visual order, shifting the rest along.
-    /// Indices past the end clamp to the last slot. Returns whether anything moved.
-    pub fn move_tab(&self, id: u64, new_idx: usize) -> bool {
-        let mut order = self.order.borrow_mut();
-        let Some(from) = order.iter().position(|i| *i == id) else {
+    // -- groups --------------------------------------------------------------
+
+    /// How many groups (leaves) the window currently shows.
+    pub fn group_count(&self) -> usize {
+        self.leaves().len()
+    }
+
+    /// DFS index of the focused group. Its active tab is the globally active
+    /// tab.
+    pub fn focused_group(&self) -> usize {
+        let focused = self.focused.get();
+        self.leaves()
+            .iter()
+            .position(|g| g.id == focused)
+            .unwrap_or(0)
+    }
+
+    /// The group `id` lives in, if it is open.
+    pub fn group_of(&self, id: u64) -> Option<usize> {
+        self.leaves().iter().position(|g| g.tab_ids.contains(&id))
+    }
+
+    /// The tab ids of group `group` in bar order (empty for an unknown group).
+    pub fn group_tabs(&self, group: usize) -> Vec<u64> {
+        self.leaves()
+            .get(group)
+            .map(|g| g.tab_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// The active tab of group `group`.
+    pub fn group_active(&self, group: usize) -> Option<u64> {
+        self.leaves().get(group).and_then(|g| g.active)
+    }
+
+    /// Each group's share of the window area, in DFS order, summing to 1
+    /// (empty when there are no groups). For a single row of columns these
+    /// are the column widths; in a nested tree, the product of the
+    /// normalised weights down the leaf's path.
+    // The renderer reads per-split weights now ([`Self::split_weights`]);
+    // this stays for the invariant tests, which assert every leaf's share.
+    #[allow(dead_code)]
+    pub fn group_weights(&self) -> Vec<f32> {
+        let tree = self.tree.borrow();
+        let mut out = Vec::new();
+        if let Some(root) = tree.as_ref() {
+            leaf_fractions(root, 1.0, &mut out);
+        }
+        out
+    }
+
+    /// The split tree for rendering: leaves as DFS indices, weights
+    /// normalised per split. `None` while no tab is open. A lone group comes
+    /// back as `Leaf(0)` — the renderer needs no special case.
+    pub fn layout(&self) -> Option<LayoutNode> {
+        let tree = self.tree.borrow();
+        let mut next = 0usize;
+        tree.as_ref().map(|root| build_layout(root, &mut next))
+    }
+
+    /// The tree as a string — `h([0,2] v([1] [3]))`, leaves as tab ids — for
+    /// the shape tests.
+    #[cfg(test)]
+    pub fn shape(&self) -> String {
+        match self.tree.borrow().as_ref() {
+            Some(root) => shape_of(root),
+            None => "-".to_string(),
+        }
+    }
+
+    /// The normalised child weights of the split node at `path` (child
+    /// indices from the root, `[]` = root). Empty unless `path` names a
+    /// split.
+    pub fn split_weights(&self, path: &[usize]) -> Vec<f32> {
+        let tree = self.tree.borrow();
+        let Some(NodeKind::Split { children, .. }) = tree
+            .as_ref()
+            .and_then(|root| node_at(root, path))
+            .map(|n| &n.kind)
+        else {
+            return Vec::new();
+        };
+        let total: f32 = children.iter().map(|c| c.weight).sum();
+        children
+            .iter()
+            .map(|c| {
+                if total > 0.0 {
+                    c.weight / total
+                } else {
+                    1.0 / children.len().max(1) as f32
+                }
+            })
+            .collect()
+    }
+
+    /// Replace the child weights of the split at `path` (the separator
+    /// resize drag in `main.rs` writes them back). Rejected unless `path`
+    /// names a split and there is one strictly positive weight per child.
+    pub fn set_split_weights(&self, path: &[usize], weights: &[f32]) -> bool {
+        let mut tree = self.tree.borrow_mut();
+        let Some(NodeKind::Split { children, .. }) = tree
+            .as_mut()
+            .and_then(|root| node_at_mut(root, path))
+            .map(|n| &mut n.kind)
+        else {
             return false;
         };
-        let to = new_idx.min(order.len() - 1);
-        if from == to {
+        if weights.len() != children.len() || weights.iter().any(|w| !w.is_finite() || *w <= 0.0) {
             return false;
         }
-        order.remove(from);
-        order.insert(to, id);
+        for (child, weight) in children.iter_mut().zip(weights) {
+            child.weight = *weight;
+        }
         true
     }
 
-    /// [`Self::move_tab`] addressed by current position instead of id — the
-    /// index-based half of the reorder API, used by the tests and by any caller
-    /// that thinks in slots rather than tabs.
+    /// Focus group `idx` (DFS order); its active tab becomes the globally
+    /// active tab.
+    pub fn focus_group(&mut self, idx: usize) -> bool {
+        let Some(leaf) = self.leaves().get(idx).map(|g| g.id) else {
+            return false;
+        };
+        self.focused.set(leaf);
+        self.sync_visibility();
+        true
+    }
+
+    /// Focus the next group in DFS order (wrapping).
+    pub fn next_group(&mut self) {
+        self.step_group(1);
+    }
+
+    /// Focus the previous group in DFS order (wrapping).
+    pub fn prev_group(&mut self) {
+        self.step_group(-1);
+    }
+
+    fn step_group(&mut self, delta: isize) {
+        let leaves = self.leaves();
+        if leaves.is_empty() {
+            return;
+        }
+        let len = leaves.len() as isize;
+        let current = self.focused_group() as isize;
+        let next = (current + delta).rem_euclid(len) as usize;
+        self.focused.set(leaves[next].id);
+    }
+
+    /// Move `id` out of its group into a *new* group immediately to the right
+    /// of it; the moved tab is the new group's active tab and the new group
+    /// takes focus. A tab that is alone in its group has nothing to split away
+    /// from, so that is a `false` no-op — as is an unknown id.
+    pub fn split_right(&mut self, id: u64) -> bool {
+        self.split(id, Axis::Horizontal, true)
+    }
+
+    /// [`Self::split_right`], but the new group lands on the left.
+    pub fn split_left(&mut self, id: u64) -> bool {
+        self.split(id, Axis::Horizontal, false)
+    }
+
+    /// [`Self::split_right`] turned 90°: the new group opens *below* the
+    /// tab's old one.
+    pub fn split_down(&mut self, id: u64) -> bool {
+        self.split(id, Axis::Vertical, true)
+    }
+
+    /// [`Self::split_down`], but the new group lands on top.
+    pub fn split_up(&mut self, id: u64) -> bool {
+        self.split(id, Axis::Vertical, false)
+    }
+
+    fn split(&mut self, id: u64, axis: Axis, after: bool) -> bool {
+        let old_focus = self.focused_group();
+        let new_leaf = self.next_leaf.get();
+        {
+            let mut tree = self.tree.borrow_mut();
+            let Some(root) = tree.as_mut() else {
+                return false;
+            };
+            let src_leaf = {
+                let mut refs = Vec::new();
+                collect_leaves(root, &mut refs);
+                match refs.iter().find(|g| g.tab_ids.contains(&id)) {
+                    // Splitting a lone tab would collapse its old group and
+                    // put the new one in the same slot: pure churn, so refuse.
+                    Some(src) if src.tab_ids.len() >= 2 => src.id,
+                    _ => return false,
+                }
+            };
+            let src = leaf_mut(root, src_leaf).expect("leaf just seen");
+            src.tab_ids.retain(|i| *i != id);
+            if src.active == Some(id) {
+                src.active = src.tab_ids.first().copied();
+            }
+            let mut group = Some(Group::of(new_leaf, id));
+            let wrapped = wrap_leaf(root, src_leaf, &mut group, axis, after);
+            debug_assert!(wrapped, "the source leaf cannot have vanished");
+        }
+        self.next_leaf.set(new_leaf + 1);
+        // The wrap may have nested a split inside a same-axis parent;
+        // normalize splices it in (and the halved weights come out right).
+        self.normalize(old_focus);
+        self.focused.set(new_leaf);
+        self.sync_visibility();
+        true
+    }
+
+    /// Move a tab to slot `index` of group `target_group` (its own or another),
+    /// shifting the rest along. `index` past the end clamps to the last slot;
+    /// the moved tab becomes its new group's active tab; a source group left
+    /// empty collapses (its weight folds into a sibling). Unknown ids/groups
+    /// and no-op moves return `false`.
+    ///
+    /// `&self` on purpose: the bar reorders mid-drag while holding only an
+    /// immutable borrow (see [`Self::tree`]). Focus does *not* follow the
+    /// tab — use [`Self::select`] for that.
+    pub fn move_tab(&self, id: u64, target_group: usize, index: usize) -> bool {
+        let old_focus = self.focused_group();
+        {
+            let mut tree = self.tree.borrow_mut();
+            let Some(root) = tree.as_mut() else {
+                return false;
+            };
+            let (src_leaf, target_leaf, from, to) = {
+                let mut refs = Vec::new();
+                collect_leaves(root, &mut refs);
+                let Some(target) = refs.get(target_group) else {
+                    return false;
+                };
+                let Some(src) = refs.iter().find(|g| g.tab_ids.contains(&id)) else {
+                    return false;
+                };
+                let from = src.tab_ids.iter().position(|i| *i == id).unwrap();
+                let to = if src.id == target.id {
+                    index.min(src.tab_ids.len() - 1)
+                } else {
+                    index.min(target.tab_ids.len())
+                };
+                if src.id == target.id && from == to {
+                    return false;
+                }
+                (src.id, target.id, from, to)
+            };
+            let src = leaf_mut(root, src_leaf).expect("leaf just seen");
+            src.tab_ids.remove(from);
+            if src.active == Some(id) && src_leaf != target_leaf {
+                reactivate(src, from);
+            }
+            let target = leaf_mut(root, target_leaf).expect("leaf just seen");
+            target.tab_ids.insert(to, id);
+            target.active = Some(id);
+        }
+        self.normalize(old_focus);
+        self.sync_visibility();
+        true
+    }
+
+    /// [`Self::move_tab`] within the focused group, addressed by current
+    /// position instead of id — the index-based half of the reorder API, used
+    /// by the tests and by any caller that thinks in slots rather than tabs.
     #[cfg(test)]
     // Only the Unix-gated PTY tests reach this today — the tab-drag UI in
     // `ui.rs` does not call it yet, which is worth fixing separately.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn reorder(&self, from_idx: usize, to_idx: usize) -> bool {
-        let id = match self.order.borrow().get(from_idx) {
+        let group = self.focused_group();
+        let id = match self.group_tabs(group).get(from_idx) {
             Some(id) => *id,
             None => return false,
         };
-        self.move_tab(id, to_idx)
+        self.move_tab(id, group, to_idx)
     }
 
+    // -- the active tab ------------------------------------------------------
+
+    /// The globally active tab: the focused group's active tab.
     pub fn active_id(&self) -> Option<u64> {
-        self.active
+        let focused = self.focused.get();
+        self.leaves()
+            .iter()
+            .find(|g| g.id == focused)
+            .and_then(|g| g.active)
     }
 
+    // The render path now walks groups, but this stays the natural spelling
+    // for "the tab the keyboard talks to".
+    #[allow(dead_code)]
     pub fn active_mut(&mut self) -> Option<&mut Tab> {
-        let id = self.active?;
+        let id = self.active_id()?;
+        self.tabs.get_mut(&id)
+    }
+
+    /// The tab itself, for rendering a group's active terminal.
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut Tab> {
         self.tabs.get_mut(&id)
     }
 
@@ -392,17 +1056,18 @@ impl TabManager {
         self.tabs.get(&id).map(|t| t.effective_title())
     }
 
-    /// Tab descriptions in visual order.
+    /// Tab descriptions in global visual order. `active` marks the globally
+    /// active tab — the focused group's active one — exactly one per window.
     pub fn infos(&self) -> Vec<TabInfo> {
-        self.order
-            .borrow()
+        let active = self.active_id();
+        self.ids()
             .iter()
             .filter_map(|id| {
                 let tab = self.tabs.get(id)?;
                 Some(TabInfo {
                     id: *id,
                     title: tab.effective_title().to_string(),
-                    active: Some(*id) == self.active,
+                    active: Some(*id) == active,
                 })
             })
             .collect()
@@ -456,70 +1121,149 @@ impl TabManager {
             Tab {
                 backend,
                 bidi: None,
+                spawn: command.join(" "),
                 title: Title {
                     shell: format!("terra {id}"),
                     custom: title,
                 },
             },
         );
-        self.order.borrow_mut().push(id);
-        self.active = Some(id);
+        {
+            // New tabs land in the focused group, right after its active tab,
+            // and become that group's — and thus the globally — active tab.
+            let mut tree = self.tree.borrow_mut();
+            match tree.as_mut() {
+                Some(root) => {
+                    // The focused id always names a live leaf (`normalize`
+                    // guarantees it); the first-leaf fallback only covers a bug.
+                    let target = {
+                        let mut refs = Vec::new();
+                        collect_leaves(root, &mut refs);
+                        let focused = self.focused.get();
+                        refs.iter()
+                            .find(|g| g.id == focused)
+                            .or(refs.first())
+                            .map(|g| g.id)
+                            .expect("a tree has leaves")
+                    };
+                    let group = leaf_mut(root, target).expect("leaf just seen");
+                    let at = group
+                        .active
+                        .and_then(|a| group.tab_ids.iter().position(|i| *i == a))
+                        .map(|i| i + 1)
+                        .unwrap_or(group.tab_ids.len());
+                    group.tab_ids.insert(at, id);
+                    group.active = Some(id);
+                    self.focused.set(group.id);
+                }
+                None => {
+                    // First tab: a fresh root leaf.
+                    let leaf = self.next_leaf.get();
+                    self.next_leaf.set(leaf + 1);
+                    *tree = Some(Node {
+                        weight: 1.0,
+                        kind: NodeKind::Leaf(Group::of(leaf, id)),
+                    });
+                    self.focused.set(leaf);
+                }
+            }
+        }
         self.sync_visibility();
         Ok(id)
     }
 
-    /// Remove a tab (dropping its backend shuts the PTY down).
+    /// Spawn a tab from a named profile — the chevron menu and the palette's
+    /// `tab.new.<name>` entries. Unknown names error, naming the known ones,
+    /// so a stale menu entry says so instead of opening a bare shell.
+    pub fn open_profile(&mut self, name: &str) -> anyhow::Result<u64> {
+        let profile = crate::config::resolve_profile(&self.profiles, name)
+            .map_err(anyhow::Error::msg)?
+            .clone();
+        self.open(&profile.command, profile.cwd.as_deref(), profile.title)
+    }
+
+    /// Remove a tab (dropping its backend shuts the PTY down). A group whose
+    /// last tab closes collapses with it; the app quits when no tab is left
+    /// (`is_empty`, checked by the frame loop).
     pub fn close(&mut self, id: u64) -> bool {
         if self.tabs.remove(&id).is_none() {
             return false;
         }
-        let mut order = self.order.borrow_mut();
-        let removed = order.iter().position(|i| *i == id);
-        if let Some(idx) = removed {
-            order.remove(idx);
+        let old_focus = self.focused_group();
+        {
+            let mut tree = self.tree.borrow_mut();
+            if let Some(root) = tree.as_mut() {
+                let src_leaf = {
+                    let mut refs = Vec::new();
+                    collect_leaves(root, &mut refs);
+                    refs.iter().find(|g| g.tab_ids.contains(&id)).map(|g| g.id)
+                };
+                if let Some(src_leaf) = src_leaf {
+                    let group = leaf_mut(root, src_leaf).expect("leaf just seen");
+                    let idx = group.tab_ids.iter().position(|i| *i == id).unwrap();
+                    group.tab_ids.remove(idx);
+                    if group.active == Some(id) {
+                        // Prefer the nearest tab to the left, else the first.
+                        reactivate(group, idx);
+                    }
+                }
+            }
         }
-        if self.active == Some(id) {
-            // Prefer the nearest tab to the left, else the first remaining one.
-            self.active = removed
-                .and_then(|idx| order.get(idx.saturating_sub(1)))
-                .copied();
-        }
+        self.normalize(old_focus);
         self.sync_visibility();
         true
     }
 
     pub fn close_active(&mut self) {
-        if let Some(id) = self.active {
+        if let Some(id) = self.active_id() {
             self.close(id);
         }
     }
 
     pub fn clear(&mut self) {
         self.tabs.clear();
-        self.order.borrow_mut().clear();
-        self.active = None;
+        *self.tree.borrow_mut() = None;
+        self.focused.set(0);
     }
 
+    /// Every group's active tab is on screen, so all of them stay "visible"
+    /// to their backends; only the hidden tabs coast.
     fn sync_visibility(&self) {
-        let active = self.active;
+        let shown: Vec<u64> = self.leaves().iter().filter_map(|g| g.active).collect();
         for (id, tab) in &self.tabs {
-            tab.backend.set_visible(Some(*id) == active);
+            tab.backend.set_visible(shown.contains(id));
         }
     }
 
+    /// Make `id` its group's active tab *and* focus that group, so `id`
+    /// becomes the globally active tab (keyboard input, the IPC active flag).
     pub fn select(&mut self, id: u64) -> bool {
-        if self.tabs.contains_key(&id) {
-            self.active = Some(id);
-            true
-        } else {
-            false
-        }
+        let leaf = {
+            let mut tree = self.tree.borrow_mut();
+            let Some(root) = tree.as_mut() else {
+                return false;
+            };
+            let src_leaf = {
+                let mut refs = Vec::new();
+                collect_leaves(root, &mut refs);
+                refs.iter().find(|g| g.tab_ids.contains(&id)).map(|g| g.id)
+            };
+            let Some(src_leaf) = src_leaf else {
+                return false;
+            };
+            let group = leaf_mut(root, src_leaf).expect("leaf just seen");
+            group.active = Some(id);
+            group.id
+        };
+        self.focused.set(leaf);
+        self.sync_visibility();
+        true
     }
 
-    /// Select the nth tab (0-based) in bar order.
+    /// Select the nth tab (0-based) in the focused group's bar order.
     pub fn select_nth(&mut self, n: usize) {
-        if let Some(id) = self.order.borrow().get(n).copied() {
-            self.active = Some(id);
+        if let Some(id) = self.group_tabs(self.focused_group()).get(n).copied() {
+            self.select(id);
         }
     }
 
@@ -531,18 +1275,20 @@ impl TabManager {
         self.step(-1);
     }
 
+    /// Cycle within the focused group — each group has its own bar, so its
+    /// bar order is what next/prev walk.
     fn step(&mut self, delta: isize) {
-        if self.tabs.is_empty() {
+        let ids = self.group_tabs(self.focused_group());
+        if ids.is_empty() {
             return;
         }
-        let ids = self.ids();
         let current = self
-            .active
+            .active_id()
             .and_then(|id| ids.iter().position(|i| *i == id))
             .unwrap_or(0) as isize;
         let len = ids.len() as isize;
         let next = (current + delta).rem_euclid(len) as usize;
-        self.active = Some(ids[next]);
+        self.select(ids[next]);
     }
 
     /// Record what the shell reports. Never clobbers a custom title: it only
@@ -574,6 +1320,11 @@ impl TabManager {
     /// The pid of the tab's shell, for looking up what is running in it.
     pub fn shell_pid(&self, id: u64) -> Option<u32> {
         self.tabs.get(&id).map(|t| t.backend.pty_id())
+    }
+
+    /// The command the tab was opened with — see [`Tab::spawn`].
+    pub fn spawn(&self, id: u64) -> Option<&str> {
+        self.tabs.get(&id).map(|t| t.spawn.as_str())
     }
 
     pub fn set_custom_title(&mut self, id: u64, title: String) -> bool {
@@ -952,7 +1703,7 @@ mod tests {
         assert_eq!(tabs.ids(), ids);
 
         // Drag the last tab to the front.
-        assert!(tabs.move_tab(ids[2], 0));
+        assert!(tabs.move_tab(ids[2], 0, 0));
         assert_eq!(tabs.ids(), vec![ids[2], ids[0], ids[1]]);
         assert_eq!(tabs.index_of(ids[2]), Some(0));
         assert_eq!(
@@ -993,10 +1744,10 @@ mod tests {
         assert!(tabs.reorder(0, 3));
         assert_eq!(tabs.ids(), vec![ids[1], ids[2], ids[3], ids[0]]);
         // Past the end clamps to the last slot instead of panicking.
-        assert!(tabs.move_tab(ids[1], 99));
+        assert!(tabs.move_tab(ids[1], 0, 99));
         assert_eq!(tabs.ids(), vec![ids[2], ids[3], ids[0], ids[1]]);
-        assert!(!tabs.move_tab(ids[1], 3));
-        assert!(!tabs.move_tab(u64::MAX, 0));
+        assert!(!tabs.move_tab(ids[1], 0, 3));
+        assert!(!tabs.move_tab(u64::MAX, 0, 0));
         assert!(!tabs.reorder(9, 0));
 
         let mut sorted = tabs.ids();
@@ -1023,7 +1774,7 @@ mod tests {
             .collect();
 
         // Order: [2, 0, 1], active = 2.
-        assert!(tabs.move_tab(ids[2], 0));
+        assert!(tabs.move_tab(ids[2], 0, 0));
         tabs.select(ids[0]);
         assert!(tabs.close(ids[0]));
         assert_eq!(tabs.ids(), vec![ids[2], ids[1]]);
@@ -1039,6 +1790,378 @@ mod tests {
         assert_eq!(tabs.active_id(), None);
         assert!(!tabs.close(ids[1]));
         assert!(tabs.is_empty());
+    }
+
+    /// A manager with `n` `/bin/cat` tabs, all in one group.
+    #[cfg(unix)]
+    fn manager_with(n: usize) -> (TabManager, Vec<u64>) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut tabs = TabManager::new(egui::Context::default(), tx);
+        let ids = (0..n)
+            .map(|_| {
+                tabs.open(&["/bin/cat".to_string()], None, None)
+                    .expect("spawn /bin/cat")
+            })
+            .collect();
+        (tabs, ids)
+    }
+
+    /// Splitting moves the tab into a fresh group beside its old one, focuses
+    /// it, and shares the old column's width between the two.
+    // Spawns real PTYs, so Unix-only; the group logic under test is portable.
+    #[cfg(unix)]
+    #[test]
+    fn split_right_moves_the_tab_into_a_new_focused_group() {
+        let (mut tabs, ids) = manager_with(3);
+        assert_eq!(tabs.group_count(), 1);
+
+        assert!(tabs.split_right(ids[1]));
+        assert_eq!(tabs.group_count(), 2);
+        assert_eq!(tabs.group_tabs(0), vec![ids[0], ids[2]]);
+        assert_eq!(tabs.group_tabs(1), vec![ids[1]]);
+        assert_eq!(tabs.focused_group(), 1);
+        assert_eq!(tabs.group_active(1), Some(ids[1]));
+        // The source group's own selection (the last-opened tab) is untouched
+        // — the split took a different tab — and global active follows focus.
+        assert_eq!(tabs.group_active(0), Some(ids[2]));
+        assert_eq!(tabs.active_id(), Some(ids[1]));
+        // The two columns share what the one had; the weights still sum to 1.
+        let weights = tabs.group_weights();
+        assert_eq!(weights.len(), 2);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!((weights[0] - weights[1]).abs() < 1e-5);
+
+        tabs.clear();
+    }
+
+    /// `split_left` is the mirror image, and a lone tab cannot split at all.
+    #[cfg(unix)]
+    #[test]
+    fn split_left_and_the_lone_tab_no_op() {
+        let (mut tabs, ids) = manager_with(2);
+
+        assert!(tabs.split_left(ids[1]));
+        assert_eq!(tabs.group_tabs(0), vec![ids[1]]);
+        assert_eq!(tabs.group_tabs(1), vec![ids[0]]);
+        assert_eq!(tabs.focused_group(), 0);
+
+        // Both groups now hold one tab each: nothing left to split away from.
+        assert!(!tabs.split_right(ids[0]));
+        assert!(!tabs.split_left(ids[1]));
+        assert!(!tabs.split_right(u64::MAX));
+        assert_eq!(tabs.group_count(), 2);
+
+        tabs.clear();
+    }
+
+    /// Every tab lives in exactly one group; moving across groups keeps that
+    /// true, activates the moved tab in its new group, and collapses a group
+    /// whose last tab left.
+    #[cfg(unix)]
+    #[test]
+    fn moving_a_tab_across_groups_keeps_the_invariants() {
+        let (mut tabs, ids) = manager_with(3);
+        assert!(tabs.split_right(ids[2]));
+        // Groups: [0, 1] | [2], focused = 1.
+
+        assert!(tabs.move_tab(ids[0], 1, 0));
+        assert_eq!(tabs.group_tabs(0), vec![ids[1]]);
+        assert_eq!(tabs.group_tabs(1), vec![ids[0], ids[2]]);
+        assert_eq!(tabs.group_active(1), Some(ids[0]));
+        // `move_tab` does not steal focus; the focused group merely changed
+        // members. `select` is what follows a tab.
+        assert_eq!(tabs.focused_group(), 1);
+
+        // The last tab leaving group 0 collapses it, and the focused index
+        // shifts down with the groups to its left disappearing.
+        assert!(tabs.move_tab(ids[1], 1, 2));
+        assert_eq!(tabs.group_count(), 1);
+        assert_eq!(tabs.focused_group(), 0);
+        assert_eq!(tabs.group_tabs(0), vec![ids[0], ids[2], ids[1]]);
+        let weights = tabs.group_weights();
+        assert!((weights[0] - 1.0).abs() < 1e-5);
+
+        // Unknown target groups and unknown ids are refused.
+        assert!(!tabs.move_tab(ids[0], 5, 0));
+        assert!(!tabs.move_tab(u64::MAX, 0, 0));
+
+        tabs.clear();
+    }
+
+    /// `select` focuses the tab's group; focus_group/next/prev walk columns.
+    #[cfg(unix)]
+    #[test]
+    fn selecting_a_tab_focuses_its_group() {
+        let (mut tabs, ids) = manager_with(3);
+        assert!(tabs.split_right(ids[2]));
+        assert_eq!(tabs.focused_group(), 1);
+
+        // Selecting a tab in the other group moves focus there with it.
+        assert!(tabs.select(ids[0]));
+        assert_eq!(tabs.focused_group(), 0);
+        assert_eq!(tabs.active_id(), Some(ids[0]));
+        // The unfocused group keeps its own active tab.
+        assert_eq!(tabs.group_active(1), Some(ids[2]));
+
+        // Explicit group focus flips the globally active tab without touching
+        // any group's own selection.
+        assert!(tabs.focus_group(1));
+        assert_eq!(tabs.active_id(), Some(ids[2]));
+        assert!(!tabs.focus_group(9));
+        assert_eq!(tabs.focused_group(), 1);
+
+        tabs.next_group();
+        assert_eq!(tabs.focused_group(), 0);
+        tabs.prev_group();
+        assert_eq!(tabs.focused_group(), 1);
+
+        // ⌘n and next/prev act on the focused group's bar.
+        tabs.focus_group(0);
+        tabs.select_nth(1);
+        assert_eq!(tabs.active_id(), Some(ids[1]));
+        tabs.select_next();
+        assert_eq!(tabs.active_id(), Some(ids[0]));
+
+        tabs.clear();
+    }
+
+    /// New tabs open in the focused group, right after its active tab.
+    #[cfg(unix)]
+    #[test]
+    fn new_tabs_open_after_the_focused_groups_active_tab() {
+        let (mut tabs, ids) = manager_with(3);
+        assert!(tabs.split_right(ids[1]));
+        // Groups: [0, 2] | [1], focused = 1.
+
+        let in_split = tabs
+            .open(&["/bin/cat".to_string()], None, None)
+            .expect("spawn /bin/cat");
+        assert_eq!(tabs.group_tabs(1), vec![ids[1], in_split]);
+        assert_eq!(tabs.active_id(), Some(in_split));
+
+        // Back in group 0 with its first tab active: the new tab lands right
+        // after it, not at the end.
+        assert!(tabs.select(ids[0]));
+        let after_first = tabs
+            .open(&["/bin/cat".to_string()], None, None)
+            .expect("spawn /bin/cat");
+        assert_eq!(tabs.group_tabs(0), vec![ids[0], after_first, ids[2]]);
+
+        tabs.clear();
+    }
+
+    /// Closing the last tab of a group collapses the group and hands focus to
+    /// a neighbour; closing the last tab of all empties the manager (the app
+    /// quits on that).
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_groups_last_tab_collapses_the_group() {
+        let (mut tabs, ids) = manager_with(2);
+        assert!(tabs.split_right(ids[1]));
+        assert_eq!(tabs.group_count(), 2);
+
+        assert!(tabs.close(ids[1]));
+        assert_eq!(tabs.group_count(), 1);
+        assert_eq!(tabs.focused_group(), 0);
+        assert_eq!(tabs.active_id(), Some(ids[0]));
+        let weights = tabs.group_weights();
+        assert!((weights[0] - 1.0).abs() < 1e-5);
+
+        assert!(tabs.close(ids[0]));
+        assert!(tabs.is_empty());
+        assert_eq!(tabs.group_count(), 0);
+        assert_eq!(tabs.active_id(), None);
+    }
+
+    /// `split_down` stacks; a second split on the same axis merges into the
+    /// existing run instead of nesting (VS Code behaviour), and the spliced
+    /// pair share what the one leaf had.
+    #[cfg(unix)]
+    #[test]
+    fn same_axis_splits_merge_into_one_run() {
+        let (mut tabs, ids) = manager_with(3);
+
+        assert!(tabs.split_down(ids[1]));
+        assert_eq!(
+            tabs.shape(),
+            format!("v([{},{}] [{}])", ids[0], ids[2], ids[1])
+        );
+
+        // Splitting the top leaf down again wraps it in a nested vertical
+        // split — which normalisation splices into the parent, flat.
+        assert!(tabs.split_down(ids[2]));
+        assert_eq!(
+            tabs.shape(),
+            format!("v([{}] [{}] [{}])", ids[0], ids[2], ids[1])
+        );
+        // The first leaf's share was halved; the untouched leaf kept its.
+        let weights = tabs.split_weights(&[]);
+        assert_eq!(weights.len(), 3);
+        assert!((weights[0] - 0.25).abs() < 1e-5);
+        assert!((weights[1] - 0.25).abs() < 1e-5);
+        assert!((weights[2] - 0.5).abs() < 1e-5);
+
+        tabs.clear();
+    }
+
+    /// Mixed axes nest: a split down inside a column of a split right makes
+    /// a 2D grid, and the DFS order of the leaves is the group order.
+    #[cfg(unix)]
+    #[test]
+    fn mixed_axis_splits_nest_and_dfs_order_is_the_group_order() {
+        let (mut tabs, ids) = manager_with(4);
+
+        assert!(tabs.split_right(ids[1]));
+        assert!(tabs.split_down(ids[3]));
+        // ids[3] split away from the left column, which nests vertically.
+        assert_eq!(
+            tabs.shape(),
+            format!("h(v([{},{}] [{}]) [{}])", ids[0], ids[2], ids[3], ids[1])
+        );
+
+        // DFS order: top-left, bottom-left, right.
+        assert_eq!(tabs.group_count(), 3);
+        assert_eq!(tabs.group_tabs(0), vec![ids[0], ids[2]]);
+        assert_eq!(tabs.group_tabs(1), vec![ids[3]]);
+        assert_eq!(tabs.group_tabs(2), vec![ids[1]]);
+        // ...and it is exactly what next/prev walk, wrapping.
+        assert_eq!(tabs.focused_group(), 1);
+        tabs.next_group();
+        assert_eq!(tabs.focused_group(), 2);
+        tabs.next_group();
+        assert_eq!(tabs.focused_group(), 0);
+        tabs.prev_group();
+        assert_eq!(tabs.focused_group(), 2);
+
+        // The layout tree the renderer gets mirrors the shape.
+        use super::LayoutNode::{Leaf, Split};
+        match tabs.layout() {
+            Some(Split {
+                axis: Axis::Horizontal,
+                children,
+                ..
+            }) => {
+                assert_eq!(children.len(), 2);
+                match &children[0] {
+                    Split {
+                        axis: Axis::Vertical,
+                        children,
+                        ..
+                    } => {
+                        assert_eq!(children, &vec![Leaf(0), Leaf(1)]);
+                    }
+                    other => panic!("left child should be a vertical split, got {other:?}"),
+                }
+                assert_eq!(children[1], Leaf(2));
+            }
+            other => panic!("root should be a horizontal split, got {other:?}"),
+        }
+
+        tabs.clear();
+    }
+
+    /// Removing a leaf folds its weight into a sibling, and a split left with
+    /// one child collapses into that child — all the way to a lone leaf.
+    #[cfg(unix)]
+    #[test]
+    fn closing_folds_weights_and_collapses_single_child_splits() {
+        let (mut tabs, ids) = manager_with(4);
+        assert!(tabs.split_right(ids[1]));
+        assert!(tabs.split_down(ids[3]));
+        // h(v([0,2] [3]) [1]), weights: left column 0.5, right 0.5.
+
+        // Closing the right column's only tab leaves the h-split with one
+        // child: the vertical pair takes over as the root.
+        assert!(tabs.close(ids[1]));
+        assert_eq!(
+            tabs.shape(),
+            format!("v([{},{}] [{}])", ids[0], ids[2], ids[3])
+        );
+        let weights = tabs.split_weights(&[]);
+        assert!((weights[0] - 0.5).abs() < 1e-5);
+        assert!((weights[1] - 0.5).abs() < 1e-5);
+
+        // Growing the top leaf, then closing the bottom one: the survivor
+        // absorbs the closed leaf's share (the root collapses to a leaf, so
+        // the fold shows as the whole window).
+        assert!(tabs.set_split_weights(&[], &[0.7, 0.3]));
+        assert!(tabs.close(ids[3]));
+        assert_eq!(tabs.shape(), format!("[{},{}]", ids[0], ids[2]));
+        assert_eq!(tabs.group_weights(), vec![1.0]);
+        // A leaf root has no split to address.
+        assert!(tabs.split_weights(&[]).is_empty());
+        assert!(!tabs.set_split_weights(&[], &[1.0]));
+
+        tabs.clear();
+    }
+
+    /// Weight folding *within* a surviving split: the sibling before the
+    /// removed leaf inherits its share, and the others keep theirs.
+    #[cfg(unix)]
+    #[test]
+    fn a_removed_leaf_folds_its_weight_into_the_sibling_before_it() {
+        let (mut tabs, ids) = manager_with(4);
+        assert!(tabs.split_right(ids[1]));
+        assert!(tabs.split_right(ids[2]));
+        assert!(tabs.split_right(ids[3]));
+        // h([0] [3] [2] [1]) — every split halved its source's share.
+        assert_eq!(
+            tabs.shape(),
+            format!("h([{}] [{}] [{}] [{}])", ids[0], ids[3], ids[2], ids[1])
+        );
+        assert!(tabs.set_split_weights(&[], &[0.4, 0.3, 0.2, 0.1]));
+
+        assert!(tabs.close(ids[2]));
+        let weights = tabs.split_weights(&[]);
+        assert_eq!(weights.len(), 3);
+        assert!((weights[0] - 0.4).abs() < 1e-5);
+        assert!((weights[1] - 0.5).abs() < 1e-5, "0.3 absorbed 0.2");
+        assert!((weights[2] - 0.1).abs() < 1e-5);
+
+        // The *first* leaf going folds forward instead: nobody sits before it.
+        assert!(tabs.close(ids[0]));
+        let weights = tabs.split_weights(&[]);
+        assert_eq!(weights.len(), 2);
+        assert!((weights[0] - 0.9).abs() < 1e-5);
+        assert!((weights[1] - 0.1).abs() < 1e-5);
+
+        tabs.clear();
+    }
+
+    /// Focus tracks the leaf, not its DFS index: reshaping the tree elsewhere
+    /// leaves the focused group focused, and only the focused leaf itself
+    /// collapsing moves focus (to the leaf now at its old index).
+    #[cfg(unix)]
+    #[test]
+    fn focus_rides_the_leaf_through_tree_reshapes() {
+        let (mut tabs, ids) = manager_with(4);
+        assert!(tabs.split_right(ids[1]));
+        assert!(tabs.select(ids[1])); // focus the rightmost leaf
+        assert_eq!(tabs.focused_group(), 1);
+
+        // A split in the *other* column shifts that leaf's DFS index up by
+        // one; focus stays on the same leaf, at its new index.
+        assert!(tabs.split_down(ids[3]));
+        assert_eq!(tabs.focused_group(), 1); // the new [3] leaf took focus
+        assert!(tabs.select(ids[1]));
+        assert_eq!(tabs.focused_group(), 2);
+        assert!(tabs.split_up(ids[2]));
+        // shape: h(v([2] [0] [3]) [1]) — the focused leaf slid to index 3...
+        assert!(tabs.select(ids[1]));
+        assert_eq!(tabs.focused_group(), 3);
+        assert_eq!(tabs.active_id(), Some(ids[1]));
+
+        // ...and closing tabs before it keeps it focused throughout.
+        assert!(tabs.close(ids[0]));
+        assert_eq!(tabs.active_id(), Some(ids[1]));
+
+        // The focused leaf collapsing hands focus to the leaf at its old
+        // DFS index, clamped: here the last one.
+        assert!(tabs.close(ids[1]));
+        assert_eq!(tabs.focused_group(), tabs.group_count() - 1);
+        assert!(tabs.active_id().is_some());
+
+        tabs.clear();
     }
 
     /// A cell carrying `c` in the default style.

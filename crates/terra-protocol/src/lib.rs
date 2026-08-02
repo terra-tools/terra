@@ -211,6 +211,16 @@ pub enum Request {
         command: Vec<String>,
         #[serde(default)]
         cwd: Option<String>,
+        /// Name of a `[profile.<name>]` in the app's config, supplying the
+        /// command/cwd/title. The app resolves it, because the config is the
+        /// app's — the CLI may be on the far end of an ssh forward and have no
+        /// config file at all.
+        ///
+        /// Additive and defaulted, and skipped when absent, so a request
+        /// written by any older client still parses and a request that names
+        /// no profile is byte-identical to what it always was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
     },
     /// Close a tab (kills its PTY).
     Kill { tab: u64 },
@@ -550,6 +560,101 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("teleport"), "{msg}");
         assert!(msg.contains("unknown variant"), "{msg}");
+    }
+
+    /// `profile` is additive: a `new` request written by any older client
+    /// still parses, and still means "no profile".
+    #[test]
+    fn an_old_new_request_still_deserialises_without_a_profile() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"new"}"#).unwrap();
+        match req {
+            Request::New {
+                title,
+                command,
+                cwd,
+                profile,
+            } => {
+                assert!(title.is_none());
+                assert!(command.is_empty());
+                assert!(cwd.is_none());
+                assert!(profile.is_none());
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"new","title":"build","command":["cargo","test"],"cwd":"/tmp"}"#,
+        )
+        .unwrap();
+        match req {
+            Request::New {
+                title,
+                command,
+                profile,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("build"));
+                assert_eq!(command, vec!["cargo", "test"]);
+                assert!(profile.is_none());
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    /// The compatibility proof in the other direction: a request that names no
+    /// profile serialises byte-identically to what an older terra emitted, so
+    /// an older *server* still understands this client.
+    #[test]
+    fn the_profile_field_is_only_serialised_when_set() {
+        let json = serde_json::to_string(&Request::New {
+            title: None,
+            command: Vec::new(),
+            cwd: None,
+            profile: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"new","title":null,"command":[],"cwd":null}"#
+        );
+
+        let json = serde_json::to_string(&Request::New {
+            title: None,
+            command: Vec::new(),
+            cwd: None,
+            profile: Some("htop".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"new","title":null,"command":[],"cwd":null,"profile":"htop"}"#
+        );
+    }
+
+    /// Round trip: what the CLI writes is what the app reads.
+    #[test]
+    fn a_new_request_with_a_profile_round_trips() {
+        let req = Request::New {
+            title: Some("t".into()),
+            command: Vec::new(),
+            cwd: Some("/tmp".into()),
+            profile: Some("htop".into()),
+        };
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        match back {
+            Request::New {
+                title,
+                cwd,
+                profile,
+                command,
+            } => {
+                assert_eq!(title.as_deref(), Some("t"));
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(profile.as_deref(), Some("htop"));
+                assert!(command.is_empty());
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
     }
 
     // --- addressing -------------------------------------------------------

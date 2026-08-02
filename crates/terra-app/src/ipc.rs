@@ -475,14 +475,39 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
 
     match request {
         Request::List => Response::ok_tabs(tabs.infos()),
+        // A profile supplies the command, cwd and title; anything the client
+        // stated explicitly still wins over it, so `--profile p --title x` is
+        // "p, but called x" rather than an error or a silent ignore. The CLI
+        // refuses `--profile` together with a `-- cmd`, but the wire allows
+        // both and has to mean something, so an explicit command wins too.
         Request::New {
             title,
             command,
             cwd,
-        } => match tabs.open(&command, cwd.as_deref(), title) {
-            Ok(id) => Response::ok_tab(id),
-            Err(err) => Response::err(err),
-        },
+            profile,
+        } => {
+            let (command, cwd, title) = match profile.as_deref() {
+                None => (command, cwd, title),
+                Some(name) => {
+                    // Cloned out so the immutable borrow of `tabs` ends before
+                    // `open` takes a mutable one.
+                    let profile = match crate::config::resolve_profile(tabs.profiles(), name) {
+                        Ok(profile) => profile.clone(),
+                        Err(err) => return Response::err(err),
+                    };
+                    let command = if command.is_empty() {
+                        profile.command
+                    } else {
+                        command
+                    };
+                    (command, cwd.or(profile.cwd), title.or(profile.title))
+                }
+            };
+            match tabs.open(&command, cwd.as_deref(), title) {
+                Ok(id) => Response::ok_tab(id),
+                Err(err) => Response::err(err),
+            }
+        }
         Request::Kill { tab } => {
             if tabs.close(tab) {
                 Response::ok()

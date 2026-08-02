@@ -31,9 +31,11 @@ mod macos;
 mod procinfo;
 mod screenshot;
 mod scrollbar;
+mod tab_icon;
 mod tabs;
 mod ui;
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -47,6 +49,20 @@ use crate::tabs::TabManager;
 use crate::ui::AppAction;
 
 const RENAME_PROMPT_ID: &str = "rename";
+
+/// Width of the hairline between two sibling nodes of the split tree, on
+/// either axis. Its drag hit-area
+/// (`Id::new(("terra_group_separator", split path, boundary))`) is what a
+/// resize drag hangs off — see [`GROUP_SEPARATOR_GRIP`].
+const GROUP_SEPARATOR_WIDTH: f32 = 1.0;
+/// How far either side of the hairline still grabs it: a 1px line is no drag
+/// target, so the hit-area is widened invisibly, VS Code style.
+const GROUP_SEPARATOR_GRIP: f32 = 3.0;
+/// Same tone as the tab bar's underline, so the seams read as one system.
+const GROUP_SEPARATOR_COLOR: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x2a, 0x2e);
+/// No group can be resized below this fraction of the window — a column
+/// narrower than this is unusable, and collapsing-by-drag would be too easy.
+const MIN_GROUP_FRACTION: f32 = 0.15;
 
 /// How often to re-check which program is running in the active tab. Fast
 /// enough that launching an agent takes effect before you can read a line of
@@ -154,7 +170,9 @@ struct App {
     /// the one request they cannot answer alone: the pixels exist only because
     /// this thread drew them (see `screenshot.rs`).
     screenshots: Arc<Screenshots>,
-    scrollbar: ScrollbarState,
+    /// One scrollbar per group column, keyed by group index — each column
+    /// scrolls (and fades its thumb) independently.
+    scrollbars: HashMap<usize, ScrollbarState>,
     config: config::ConfigStore,
     /// `config.generation()` that `cached_font` was built from, so the font
     /// is rebuilt when a setting moves rather than on every frame.
@@ -167,7 +185,17 @@ struct App {
     /// timescales. Polled instead of watched.
     foreground: Option<String>,
     foreground_checked: f64,
+    /// One icon per tab for the tab bar, on its own slower clock — see
+    /// [`tab_icon`].
+    tab_icons: tab_icon::IconCache,
     quitting: bool,
+    /// Picks the frame the window fades in on; runs exactly once. (A `terra
+    /// select` summon is not an opening and never touches it.)
+    opening: macos::OpenAnimation,
+    /// Where the *closing* transition is: a close request is canceled, the
+    /// window fades, and only then is the close let through. See
+    /// `macos::CloseAnimation`.
+    closing: macos::CloseAnimation,
     last_window_title: String,
     /// Directory currently behind the titlebar proxy icon, so we only bother
     /// AppKit when it actually moves.
@@ -176,6 +204,10 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Before anything is drawn: hide the window so the first frame fades
+        // in rather than snapping on. This is the earliest AppKit is reachable
+        // — later than this and there is a flash to see.
+        macos::prime_open(cc);
         fonts::install(&cc.egui_ctx);
         let (pty_sender, pty_events) = mpsc::channel();
         let config = config::ConfigStore::load();
@@ -187,13 +219,16 @@ impl App {
             palette: Palette::default(),
             ipc: None,
             screenshots: Arc::default(),
-            scrollbar: ScrollbarState::default(),
+            scrollbars: HashMap::new(),
             cached_config_generation: config.generation(),
             cached_font,
             foreground: None,
             foreground_checked: f64::NEG_INFINITY,
+            tab_icons: tab_icon::IconCache::default(),
             config,
             quitting: false,
+            opening: macos::OpenAnimation::default(),
+            closing: macos::CloseAnimation::default(),
             last_window_title: String::new(),
             last_represented_path: None,
         }
@@ -229,6 +264,7 @@ impl App {
 
         // Scoped so the guard is dropped before `ensure_started` returns —
         // every other caller takes this lock too.
+        lock(&tabs).set_profiles(self.config.get().profiles.clone());
         let spawned = lock(&tabs).open(&[], None, None);
         if let Err(err) = spawned {
             log::error!("terra: cannot spawn the initial shell: {err}");
@@ -304,25 +340,60 @@ impl App {
             PaletteAction::new("tab.rename", "Rename Tab…", None)
                 .in_section(TABS)
                 .with_icon(PaletteIcon::Pencil),
+            PaletteAction::new("split.right", "Split Tab Right", Some("⌘\\"))
+                .in_section(TABS)
+                .with_icon(PaletteIcon::ArrowRight),
+            PaletteAction::new("split.left", "Split Tab Left", None)
+                .in_section(TABS)
+                .with_icon(PaletteIcon::ArrowLeft),
+            PaletteAction::new("split.down", "Split Tab Down", None)
+                .in_section(TABS)
+                .with_icon(PaletteIcon::Dot),
+            PaletteAction::new("split.up", "Split Tab Up", None)
+                .in_section(TABS)
+                .with_icon(PaletteIcon::Dot),
             PaletteAction::new("tab.next", "Next Tab", Some("⇧⌘]"))
                 .in_section(NAVIGATE)
                 .with_icon(PaletteIcon::ArrowRight),
             PaletteAction::new("tab.prev", "Previous Tab", Some("⇧⌘["))
                 .in_section(NAVIGATE)
                 .with_icon(PaletteIcon::ArrowLeft),
+            PaletteAction::new("group.next", "Focus Next Group", Some("⌥⌘→"))
+                .in_section(NAVIGATE)
+                .with_icon(PaletteIcon::ArrowRight),
+            PaletteAction::new("group.prev", "Focus Previous Group", Some("⌥⌘←"))
+                .in_section(NAVIGATE)
+                .with_icon(PaletteIcon::ArrowLeft),
         ];
         if let Some(tabs) = self.tabs.as_ref().map(|t| lock(t)) {
-            for id in tabs.ids() {
-                let title = tabs.title(id).unwrap_or("shell");
+            // One entry per profile, alphabetical (the table is a BTreeMap) —
+            // the same list every group's ⌄ menu offers. Opening one lands in
+            // the focused group, like every other way of opening a tab.
+            for name in tabs.profiles().keys() {
                 actions.push(
-                    PaletteAction::new(
-                        format!("tab.select.{id}"),
-                        format!("Go to Tab: {title}"),
-                        None,
-                    )
-                    .in_section(NAVIGATE)
-                    .with_icon(PaletteIcon::Terminal),
+                    PaletteAction::new(format!("tab.new.{name}"), format!("New Tab: {name}"), None)
+                        .in_section(TABS)
+                        .with_icon(PaletteIcon::Plus),
                 );
+            }
+            // Every tab across every group, in visual order. With a single
+            // group the label is just the title; with more, the group ordinal
+            // prefixes it ("2: htop") so twins in different columns tell apart.
+            let many = tabs.group_count() > 1;
+            for group in 0..tabs.group_count() {
+                for id in tabs.group_tabs(group) {
+                    let title = tabs.title(id).unwrap_or("shell");
+                    let label = if many {
+                        format!("Go to Tab: {}: {title}", group + 1)
+                    } else {
+                        format!("Go to Tab: {title}")
+                    };
+                    actions.push(
+                        PaletteAction::new(format!("tab.select.{id}"), label, None)
+                            .in_section(NAVIGATE)
+                            .with_icon(PaletteIcon::Terminal),
+                    );
+                }
             }
         }
         // The palette has no checkbox, so the label carries the state — the
@@ -419,6 +490,12 @@ impl App {
                     "tab.rename" => actions.push(AppAction::RenameActive),
                     "tab.next" => actions.push(AppAction::NextTab),
                     "tab.prev" => actions.push(AppAction::PrevTab),
+                    "split.right" => actions.push(AppAction::SplitRight),
+                    "split.left" => actions.push(AppAction::SplitLeft),
+                    "split.down" => actions.push(AppAction::SplitDown),
+                    "split.up" => actions.push(AppAction::SplitUp),
+                    "group.next" => actions.push(AppAction::NextGroup),
+                    "group.prev" => actions.push(AppAction::PrevGroup),
                     "config.toggle_bidi" => actions.push(AppAction::ToggleBidi),
                     "config.cycle_bidi_base" => actions.push(AppAction::CycleBidiBase),
                     "config.font_bigger" => actions.push(AppAction::NudgeFontSize(1)),
@@ -427,12 +504,19 @@ impl App {
                     "config.reload" => actions.push(AppAction::ReloadConfig),
                     "config.warnings" => actions.push(AppAction::ShowConfigWarnings),
                     "app.quit" => actions.push(AppAction::Quit),
-                    other => match other.strip_prefix("tab.select.") {
-                        Some(id) => match id.parse::<u64>() {
-                            Ok(id) => actions.push(AppAction::SelectTab(id)),
-                            Err(_) => log::warn!("terra: bad palette action {other}"),
+                    // `tab.new` (exact) is handled above; `tab.new.<name>` is
+                    // one profile, as `tab.select.<id>` is one tab.
+                    other => match other.strip_prefix("tab.new.") {
+                        Some(name) => {
+                            actions.push(AppAction::NewTabProfile(name.to_owned()));
+                        }
+                        None => match other.strip_prefix("tab.select.") {
+                            Some(id) => match id.parse::<u64>() {
+                                Ok(id) => actions.push(AppAction::SelectTab(id)),
+                                Err(_) => log::warn!("terra: bad palette action {other}"),
+                            },
+                            None => log::warn!("terra: unknown palette action {other}"),
                         },
-                        None => log::warn!("terra: unknown palette action {other}"),
                     },
                 }
             }
@@ -498,6 +582,12 @@ impl App {
             }
             AppAction::ReloadConfig => {
                 self.config.reload();
+                // The tab manager keeps its own copy (see `tabs.rs`), so the
+                // chevron menu and `terra new --profile` must be handed the
+                // reloaded one or they would answer from the old file forever.
+                if let Some(arc) = self.tabs.clone() {
+                    lock(&arc).set_profiles(self.config.get().profiles.clone());
+                }
                 log::info!("terra: reloaded {}", self.config.path().display());
             }
             AppAction::ShowConfigWarnings => {
@@ -559,6 +649,46 @@ impl App {
         )
     }
 
+    /// Refresh the tab bar's per-tab icons.
+    ///
+    /// Done here rather than inside `ui::tab_bar` because it is a syscall on a
+    /// clock, and paint routines should not be the thing deciding when to talk
+    /// to the kernel. One call resolves every tab from a single process-table
+    /// snapshot (see [`procinfo::foreground_commands`]), so the cost does not
+    /// grow with the number of tabs.
+    ///
+    /// With `[tabs] icons = false` the cache is emptied and nothing is polled
+    /// at all — the switch buys back the syscall, not just the pixels.
+    fn sync_tab_icons(&mut self, ctx: &egui::Context, tabs: &TabManager) {
+        if !self.config.get().tabs.icons {
+            self.tab_icons.clear();
+            return;
+        }
+        // The fallback text is the title and the spawn command together, so a
+        // tab opened as `terra new -- htop` is recognisable before its shell
+        // has even echoed the command.
+        let rows: Vec<(u64, Option<u32>, String)> = tabs
+            .ids()
+            .iter()
+            .map(|id| {
+                let title = tabs.title(*id).unwrap_or_default();
+                let spawn = tabs.spawn(*id).unwrap_or_default();
+                (*id, tabs.shell_pid(*id), format!("{title} {spawn}"))
+            })
+            .collect();
+        let facts: Vec<tab_icon::TabFacts<'_>> = rows
+            .iter()
+            .map(|(id, shell_pid, text)| tab_icon::TabFacts {
+                id: *id,
+                shell_pid: *shell_pid,
+                text,
+            })
+            .collect();
+        let now = ctx.input(|i| i.time);
+        self.tab_icons
+            .poll(now, &facts, procinfo::foreground_commands);
+    }
+
     /// Rebuild anything derived from the config, but only when it moved.
     fn sync_config_cache(&mut self) {
         if self.cached_config_generation == self.config.generation() {
@@ -592,6 +722,13 @@ impl App {
                     log::error!("terra: cannot spawn a shell: {err}");
                 }
             }
+            AppAction::NewTabProfile(name) => {
+                if let Err(err) = lock(&arc).open_profile(&name) {
+                    // Covers both "the profile went away under a reload" and a
+                    // shell that would not spawn; either way the log names it.
+                    log::error!("terra: cannot open profile {name:?}: {err}");
+                }
+            }
             AppAction::CloseActive => lock(&arc).close_active(),
             AppAction::CloseTab(id) => {
                 lock(&arc).close(id);
@@ -602,6 +739,54 @@ impl App {
             AppAction::SelectNth(n) => lock(&arc).select_nth(n),
             AppAction::NextTab => lock(&arc).select_next(),
             AppAction::PrevTab => lock(&arc).select_prev(),
+            AppAction::FocusGroup(idx) => {
+                lock(&arc).focus_group(idx);
+            }
+            AppAction::SplitRight
+            | AppAction::SplitLeft
+            | AppAction::SplitDown
+            | AppAction::SplitUp => {
+                // Split the *globally* active tab — the focused group's. A
+                // lone tab in its group has nothing to split from and the
+                // model refuses; silently, as VS Code does.
+                let mut tabs = lock(&arc);
+                if let Some(id) = tabs.active_id() {
+                    match action {
+                        AppAction::SplitRight => tabs.split_right(id),
+                        AppAction::SplitLeft => tabs.split_left(id),
+                        AppAction::SplitDown => tabs.split_down(id),
+                        _ => tabs.split_up(id),
+                    };
+                }
+            }
+            AppAction::NextGroup => lock(&arc).next_group(),
+            AppAction::PrevGroup => lock(&arc).prev_group(),
+            AppAction::MoveTab { id, group, index } => {
+                // A drop on another group's bar. Focus follows the tab, as it
+                // does in VS Code — `select` also makes it the global active.
+                let mut tabs = lock(&arc);
+                if tabs.move_tab(id, group, index) {
+                    tabs.select(id);
+                }
+            }
+            AppAction::SplitTab { id, group, dir } => {
+                // A drop on a terminal half. On the tab's own group this is a
+                // plain split (the model refuses it for a lone tab); on a
+                // foreign group the tab first moves in, which guarantees the
+                // group has the two tabs a split needs. After the move the
+                // tab is addressed by id, so the DFS indices shifting under a
+                // collapsed source group cannot misroute the split.
+                let mut tabs = lock(&arc);
+                if tabs.group_of(id) != Some(group) && !tabs.move_tab(id, group, usize::MAX) {
+                    return;
+                }
+                match dir {
+                    ui::SplitDir::Right => tabs.split_right(id),
+                    ui::SplitDir::Left => tabs.split_left(id),
+                    ui::SplitDir::Down => tabs.split_down(id),
+                    ui::SplitDir::Up => tabs.split_up(id),
+                };
+            }
             AppAction::OpenPalette => {
                 let actions = self.palette_actions();
                 self.palette.open(actions);
@@ -623,9 +808,232 @@ impl App {
             | AppAction::ResetSession
             | AppAction::ReloadConfig
             | AppAction::ShowConfigWarnings => unreachable!("handled above"),
-            AppAction::Quit => {
-                lock(&arc).clear();
-                self.quitting = true;
+            // The tabs are *not* torn down here: the window fades out first,
+            // and an empty window is not what should be fading. Closing them
+            // is the last thing the close path does, once the fade is over.
+            AppAction::Quit => self.quitting = true,
+        }
+    }
+}
+
+/// Everything one frame's split-tree walk reads but does not mutate.
+struct RenderEnv {
+    palette_open: bool,
+    bidi: bool,
+    bidi_base: egui_term::BidiBase,
+    font: egui_term::TerminalFont,
+    /// DFS index of the focused group, read once — the walk itself never
+    /// changes focus.
+    focused_group: usize,
+}
+
+/// The recursive renderer for one frame: the split tree becomes nested rects
+/// (rows within columns within rows…), each leaf its tab bar plus the active
+/// tab's `TerminalView`, with a draggable separator between siblings on both
+/// axes. Leaves are visited in DFS order, so `geoms[i]` is group `i`'s
+/// geometry — what the cross-group drag overlay routes drops with.
+struct TreeFrame<'a> {
+    env: RenderEnv,
+    tabs: &'a mut TabManager,
+    /// App-level, filled once a frame by [`App::sync_tab_icons`]: one process
+    /// snapshot answers every group's bar.
+    icons: &'a tab_icon::IconCache,
+    scrollbars: &'a mut HashMap<usize, ScrollbarState>,
+    geoms: Vec<ui::GroupGeometry>,
+    actions: &'a mut Vec<AppAction>,
+}
+
+impl TreeFrame<'_> {
+    fn node(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &tabs::LayoutNode,
+        path: &mut Vec<usize>,
+        rect: egui::Rect,
+    ) {
+        let (axis, weights, children) = match node {
+            tabs::LayoutNode::Leaf(group) => return self.leaf(ui, *group, rect),
+            tabs::LayoutNode::Split {
+                axis,
+                weights,
+                children,
+            } => (*axis, weights, children),
+        };
+        let count = children.len();
+        let horizontal = axis == tabs::Axis::Horizontal;
+        let extent = if horizontal {
+            rect.width()
+        } else {
+            rect.height()
+        };
+        let usable = extent - GROUP_SEPARATOR_WIDTH * (count as f32 - 1.0);
+        let mut cursor = if horizontal { rect.left() } else { rect.top() };
+        for (i, child) in children.iter().enumerate() {
+            // The last child takes exactly what is left, so rounding never
+            // opens a gap at the far edge.
+            let end = if i + 1 == count {
+                if horizontal {
+                    rect.right()
+                } else {
+                    rect.bottom()
+                }
+            } else {
+                cursor + (usable * weights[i]).max(0.0)
+            };
+            let child_rect = if horizontal {
+                egui::Rect::from_min_max(
+                    egui::pos2(cursor, rect.top()),
+                    egui::pos2(end, rect.bottom()),
+                )
+            } else {
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), cursor),
+                    egui::pos2(rect.right(), end),
+                )
+            };
+            path.push(i);
+            self.node(ui, child, path, child_rect);
+            path.pop();
+            cursor = end;
+
+            // Thin separator between two siblings, draggable to resize them.
+            // Registered after the subtree's terminals, so its (invisibly
+            // widened) grip wins the hit test.
+            if i + 1 < count {
+                let sep = if horizontal {
+                    egui::Rect::from_min_max(
+                        egui::pos2(cursor, rect.top()),
+                        egui::pos2(cursor + GROUP_SEPARATOR_WIDTH, rect.bottom()),
+                    )
+                } else {
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), cursor),
+                        egui::pos2(rect.right(), cursor + GROUP_SEPARATOR_WIDTH),
+                    )
+                };
+                let grip = if horizontal {
+                    sep.expand2(egui::vec2(GROUP_SEPARATOR_GRIP, 0.0))
+                } else {
+                    sep.expand2(egui::vec2(0.0, GROUP_SEPARATOR_GRIP))
+                };
+                let icon = if horizontal {
+                    egui::CursorIcon::ResizeHorizontal
+                } else {
+                    egui::CursorIcon::ResizeVertical
+                };
+                let response = ui
+                    .interact(
+                        grip,
+                        egui::Id::new(("terra_group_separator", path.clone(), i)),
+                        egui::Sense::drag(),
+                    )
+                    .on_hover_cursor(icon);
+                if response.dragged() {
+                    ui.ctx().set_cursor_icon(icon);
+                    let raw = if horizontal {
+                        response.drag_delta().x
+                    } else {
+                        response.drag_delta().y
+                    };
+                    let delta = raw / usable.max(1.0);
+                    let mut next = self.tabs.split_weights(path);
+                    if next.len() == count {
+                        // The drag trades extent between the two neighbours
+                        // only, and neither may go below the floor. A child
+                        // already under it (splits can make one) can only
+                        // grow, never shrink further.
+                        let lo = (MIN_GROUP_FRACTION - next[i]).min(0.0);
+                        let hi = (next[i + 1] - MIN_GROUP_FRACTION).max(0.0);
+                        let delta = delta.clamp(lo, hi);
+                        if delta != 0.0 {
+                            next[i] += delta;
+                            next[i + 1] -= delta;
+                            self.tabs.set_split_weights(path, &next);
+                        }
+                    }
+                }
+                ui.painter().rect_filled(sep, 0.0, GROUP_SEPARATOR_COLOR);
+                cursor = if horizontal {
+                    sep.right()
+                } else {
+                    sep.bottom()
+                };
+            }
+        }
+    }
+
+    /// One group: its tab bar across the top of `column`, the active tab's
+    /// terminal below, and this leaf's geometry pushed for the drag overlay.
+    fn leaf(&mut self, ui: &mut egui::Ui, group: usize, column: egui::Rect) {
+        debug_assert_eq!(self.geoms.len(), group, "leaves arrive in DFS order");
+        let focused = group == self.env.focused_group;
+
+        // Clicking anywhere in the leaf — bar or grid — focuses its group.
+        // Read, not consumed: the click still reaches whatever it landed on.
+        let pressed_here = !self.env.palette_open
+            && ui.input(|i| {
+                i.pointer.primary_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| column.contains(p))
+            });
+        if pressed_here && !focused {
+            self.actions.push(AppAction::FocusGroup(group));
+        }
+
+        let mut col_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(column)
+                .id_salt(("terra_group_column", group)),
+        );
+        col_ui.set_clip_rect(column);
+        ui::tab_bar(
+            &mut col_ui,
+            self.tabs,
+            group,
+            focused,
+            self.icons,
+            self.actions,
+        );
+
+        // The group's active terminal fills the leaf below its bar, inset by
+        // the familiar margins.
+        let area = col_ui.available_rect_before_wrap();
+        self.geoms.push(ui::GroupGeometry {
+            bar: if ui::bar_visible(self.tabs.group_tabs(group).len(), self.tabs.group_count()) {
+                egui::Rect::from_min_size(
+                    column.min,
+                    egui::vec2(column.width(), ui::TAB_BAR_HEIGHT),
+                )
+            } else {
+                egui::Rect::NOTHING
+            },
+            terminal: area,
+        });
+        let grid = egui::Rect::from_min_max(
+            egui::pos2(area.left() + 10.0, area.top() + 8.0),
+            egui::pos2(area.right() - 4.0, area.bottom() - 4.0),
+        );
+        let active = self.tabs.group_active(group);
+        if let Some(tab) = active.and_then(|id| self.tabs.get_mut(id)) {
+            if grid.width() > 1.0 && grid.height() > 1.0 {
+                let mut term_ui = col_ui.new_child(egui::UiBuilder::new().max_rect(grid));
+                term_ui.set_clip_rect(column);
+                // Only the focused group's view takes the keyboard; the
+                // palette beats them all.
+                let view = TerminalView::new(&mut term_ui, &mut tab.backend)
+                    .set_focus(!self.env.palette_open && focused)
+                    .set_theme(terminal_theme())
+                    .set_font(self.env.font.clone())
+                    .set_bidi(self.env.bidi)
+                    .set_bidi_base(self.env.bidi_base)
+                    .set_size(grid.size());
+                let rect = term_ui.add(view).rect;
+                // After the terminal, so the thumb wins the hit test.
+                scrollbar::show(
+                    &mut term_ui,
+                    rect,
+                    &mut tab.backend,
+                    self.scrollbars.entry(group).or_default(),
+                );
             }
         }
     }
@@ -636,12 +1044,38 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.ensure_started(&ctx);
 
-        if ctx.input(|i| i.viewport().close_requested()) {
-            if let Some(arc) = self.tabs.clone() {
-                lock(&arc).clear();
+        let now = ctx.input(|i| i.time);
+        // There is content behind the alpha now, so fade it up — on the frame
+        // `OpenAnimation` picks, which is never this first one.
+        match self.opening.step(now, macos::window_visible(frame)) {
+            macos::OpenStep::Wait => ctx.request_repaint(),
+            macos::OpenStep::Animate => macos::animate_open(frame),
+            macos::OpenStep::GiveUp => macos::show_now(frame),
+            macos::OpenStep::Done => {}
+        }
+
+        let step = if ctx.input(|i| i.viewport().close_requested()) {
+            self.closing.requested(now, || macos::animate_close(frame))
+        } else {
+            self.closing.tick(now)
+        };
+        match step {
+            macos::CloseStep::Close => {
+                if let Some(arc) = self.tabs.clone() {
+                    lock(&arc).clear();
+                }
+                self.ipc = None;
+                return;
             }
-            self.ipc = None;
-            return;
+            // Hold the window open and keep painting it: what fades has to be
+            // the terminal, not an empty rectangle.
+            macos::CloseStep::Fade => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.request_repaint();
+            }
+            // The fade is spent — ask again, and this time nothing cancels it.
+            macos::CloseStep::Confirm => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            macos::CloseStep::Idle => {}
         }
 
         // Before anything else this frame: the framebuffer readback for a
@@ -668,12 +1102,11 @@ impl eframe::App for App {
             self.apply(action);
         }
 
+        // One process-table snapshot for the whole window: every group's bar
+        // reads the same cache, so the cost is per frame, not per group.
         if let Some(arc) = self.tabs.clone() {
             let tabs = lock(&arc);
-            ui::tab_bar(ui, &tabs, &mut actions);
-        }
-        for action in std::mem::take(&mut actions) {
-            self.apply(action);
+            self.sync_tab_icons(&ctx, &tabs);
         }
 
         // Re-read after the actions above, so a toggle applied this frame is
@@ -684,43 +1117,53 @@ impl eframe::App for App {
         let bidi_base = self.config.get().text.bidi_base;
         let font = self.cached_font.clone();
         let tabs_arc = self.tabs.clone();
-        let scrollbar = &mut self.scrollbar;
+        let icons = &self.tab_icons;
+        let scrollbars = &mut self.scrollbars;
+        let panel_actions = &mut actions;
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE
-                    .fill(egui::Color32::from_rgb(0x1e, 0x1e, 0x1e))
-                    .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 4,
-                        top: 8,
-                        bottom: 4,
-                    }),
-            )
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x1e, 0x1e, 0x1e)))
             .show(ui, |ui| {
                 let Some(arc) = tabs_arc else {
                     return;
                 };
-                // One guard for the whole active-tab render: `TerminalView`
-                // wants a `&mut Tab` that lives inside the manager, and nothing
-                // in here reaches for the lock a second time.
+                // One guard for the whole window render: `TerminalView` wants
+                // a `&mut Tab` that lives inside the manager, and nothing in
+                // here reaches for the lock a second time.
                 let mut tabs = lock(&arc);
-                if let Some(tab) = tabs.active_mut() {
-                    let view = TerminalView::new(ui, &mut tab.backend)
-                        .set_focus(!palette_open)
-                        .set_theme(terminal_theme())
-                        .set_font(font)
-                        .set_bidi(bidi)
-                        .set_bidi_base(bidi_base)
-                        .set_size(ui.available_size());
-                    let rect = ui.add(view).rect;
-                    // After the terminal, so the thumb wins the hit test.
-                    scrollbar::show(ui, rect, &mut tab.backend, scrollbar);
-                }
-            });
+                let Some(root) = tabs.layout() else {
+                    return;
+                };
+                let full = ui.available_rect_before_wrap();
+                let mut frame = TreeFrame {
+                    env: RenderEnv {
+                        palette_open,
+                        bidi,
+                        bidi_base,
+                        font: font.clone(),
+                        focused_group: tabs.focused_group(),
+                    },
+                    tabs: &mut tabs,
+                    icons,
+                    scrollbars: &mut *scrollbars,
+                    geoms: Vec::new(),
+                    actions: &mut *panel_actions,
+                };
+                frame.node(ui, &root, &mut Vec::new(), full);
+                let geoms = frame.geoms;
 
-        // Last tab gone (or Quit chosen) -> the app is done.
+                // The cross-group half of a tab drag: floating ghost, drop
+                // zones, and the drop itself (as actions applied below).
+                ui::tab_drag_overlay(ui, &tabs, icons, &geoms, panel_actions);
+            });
+        for action in std::mem::take(&mut actions) {
+            self.apply(action);
+        }
+
+        // Last tab gone (or Quit chosen) -> the app is done. Not while the
+        // window is already fading out, though: re-asking every frame would
+        // count as the user insisting, and cut the animation short.
         let empty = self.tabs.as_ref().is_some_and(|tabs| lock(tabs).is_empty());
-        if self.quitting || empty {
+        if (self.quitting || empty) && !self.closing.is_fading() {
             self.ipc = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

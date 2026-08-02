@@ -56,10 +56,26 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSWindow",
     "NSApplication",
     "NSRunningApplication",
+    # The window's open/close transition: `NSAnimationContext` + the
+    # `animator()` proxy from `NSAnimation`, with the easing curve coming from
+    # QuartzCore (hence the `objc2-quartz-core` bridge feature).
+    "NSAnimation",
+    "NSAnimationContext",
+    "objc2-quartz-core",
+    # `NSWindow.alphaValue` and `frame` are CGFloat/CGRect, which live behind
+    # the CoreFoundation bridge feature.
+    "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSString",
+    "NSGeometry",
+] }
+# Just `CAMediaTimingFunction`, for the ease-in/ease-out curves the window
+# transition runs on. Already in the tree via winit, so this costs no build.
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "std",
+    "CAMediaTimingFunction",
 ] }
 
 # One `sysctl(KERN_PROC_ALL)` to find the program running in a tab (see
