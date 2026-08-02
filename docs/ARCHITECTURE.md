@@ -34,8 +34,12 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
 - Palette actions (ids): `tab.new`, `tab.close`, `tab.rename` (opens prompt
   mode, prompt id "rename"), `tab.next`, `tab.prev`, `tab.select.<id>` (one per
   open tab, label = title), `app.quit`.
-- IPC server (`ipc.rs`): thread with `UnixListener` on `terra_protocol::socket_path()`
-  (create parent dir 0700; remove stale socket on startup; remove on exit).
+- IPC server (`ipc.rs`): thread with an `interprocess::local_socket::Listener`
+  on `terra_protocol::socket_address()` — a unix socket on Unix, a named pipe
+  on Windows (create parent dir 0700 where there is one; reclaim a stale
+  socket only after probing that nobody answers; remove on exit). A single
+  atomic instance claim lives here too, so a second launch focuses the first
+  and exits.
   Connection threads execute requests directly against the shared
   `Arc<Mutex<TabManager>>` — never via the UI thread, which eframe parks
   entirely while the window is occluded. Repaint is requested after mutating

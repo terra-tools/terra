@@ -5,6 +5,24 @@
 //! - `ipc.rs`   — unix-socket server; its threads drive the tabs directly
 //! - palette integration (terra-palette)
 
+// Windows gives a process either a console or a window, decided at link time by
+// the subsystem in the PE header. The default is `console`, so a released
+// terra would open a stray black console box behind its own window, which the
+// user cannot close without killing the app.
+//
+// Gated on `debug_assertions` rather than applied outright, because the
+// subsystem is also what makes stdout exist: under `windows` there is no
+// console attached, so `println!` and everything `env_logger` writes to stderr
+// go nowhere at all — including the `RUST_LOG` output that is the only way to
+// see `terra: ipc server unavailable` or `cannot spawn the initial shell`. A
+// debug build keeps its console and stays debuggable; a release build is a
+// GUI. This is the same split eframe's own template and the Tauri/egui
+// ecosystem use.
+//
+// The attribute is ignored on every non-Windows target, so it needs no
+// `cfg(windows)` of its own.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod config;
 mod fonts;
 mod ghostty_theme;
@@ -148,20 +166,30 @@ impl App {
         if self.tabs.is_some() {
             return;
         }
-        let mut tabs = TabManager::new(ctx.clone(), self.pty_sender.clone());
-        if let Err(err) = tabs.open(&[], None, None) {
-            log::error!("terra: cannot spawn the initial shell: {err}");
-            self.quitting = true;
-        }
-        let tabs = Arc::new(Mutex::new(tabs));
+        // IPC first, then the shell. `TabManager::new` spawns nothing — only
+        // `open` does — and `ipc::start` is where the single-instance claim is
+        // made and where a second launch hands over and exits. Opening the tab
+        // first would spawn a PTY that is thrown away moments later.
+        let tabs = Arc::new(Mutex::new(TabManager::new(
+            ctx.clone(),
+            self.pty_sender.clone(),
+        )));
         self.tabs = Some(Arc::clone(&tabs));
 
-        match ipc::start(ctx.clone(), tabs) {
+        match ipc::start(ctx.clone(), Arc::clone(&tabs)) {
             Ok(server) => {
                 log::info!("terra: listening on {}", server.socket_path().display());
                 self.ipc = Some(server);
             }
             Err(err) => log::error!("terra: ipc server unavailable: {err}"),
+        }
+
+        // Scoped so the guard is dropped before `ensure_started` returns —
+        // every other caller takes this lock too.
+        let spawned = lock(&tabs).open(&[], None, None);
+        if let Err(err) = spawned {
+            log::error!("terra: cannot spawn the initial shell: {err}");
+            self.quitting = true;
         }
     }
 

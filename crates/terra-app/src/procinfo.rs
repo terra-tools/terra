@@ -10,19 +10,34 @@
 //!
 //! So this module is built around one constraint: it is polled from the UI
 //! thread every few hundred milliseconds. That rules out spawning `ps`, and it
-//! rules out crates like `sysinfo` that walk `/proc`-equivalents and allocate
-//! per process. What is left is a single `sysctl(KERN_PROC_ALL)`, which hands
-//! back the whole process table in one copy — a few hundred kilobytes, no
-//! syscall per process.
+//! rules out crates like `sysinfo`, which allocate a rich record per process
+//! and re-stat far more than a pid and a parent.
+//!
+//! The shape is the same on all three platforms and only the middle step
+//! differs: enumerate `(pid, ppid, name)` for every process, walk down from the
+//! tab's shell with [`innermost_pid`], then name the pid we landed on with
+//! [`command_name`]. Only the enumeration is `cfg`-gated, so the tree walk and
+//! the naming rules — the parts with the interesting edge cases — are one
+//! implementation tested everywhere.
+//!
+//! - **macOS** — one `sysctl(KERN_PROC_ALL)`, which hands back the whole
+//!   process table in a single copy: a few hundred kilobytes, no syscall per
+//!   process.
+//! - **Windows** — one `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, likewise
+//!   a single kernel-side snapshot walked with `Process32NextW`.
+//! - **Linux** — `/proc`, which has no whole-table call: one `read` of
+//!   `/proc/<pid>/stat` per process, a few hundred of them. That is more
+//!   syscalls than the other two but each is a page out of a virtual file with
+//!   no I/O behind it, and at two polls a second it does not register.
 //!
 //! The second constraint is that it must never panic. A wrong answer here costs
 //! a mis-rendered line of Hebrew; a panic costs the window. Every failure mode
-//! — sysctl erroring, the table shrinking mid-call, a pid that exited between
-//! the poll and the read, a corrupt parent chain — funnels into `None`, which
-//! callers read as "no opinion" and not as an error.
+//! — the enumeration erroring, the table shrinking mid-call, a pid that exited
+//! between the poll and the read, a corrupt parent chain — funnels into `None`,
+//! which callers read as "no opinion" and not as an error.
 //!
-//! Everything platform-specific is `cfg`-gated; other platforms get a stub that
-//! always returns `None`, so the caller never has to branch.
+//! Platforms outside the three get a stub that always returns `None`, so the
+//! caller never has to branch.
 
 /// How far down the child chain we are willing to walk.
 ///
@@ -30,7 +45,12 @@
 /// purely so that a parent-pointer *cycle* — which cannot happen in a healthy
 /// kernel table, but can happen in one we read while it was being mutated —
 /// terminates instead of spinning the UI thread forever.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// Dead only on a platform with no process enumeration below; the three that
+// have one all route through it.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
 const MAX_DEPTH: usize = 32;
 
 /// The command currently running in the tab whose shell has pid `shell_pid`,
@@ -57,9 +77,199 @@ pub fn foreground_command(shell_pid: u32) -> Option<String> {
     command_name(&proc.p_comm)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// See [`foreground_command`] — same contract, Windows enumeration.
+#[cfg(target_os = "windows")]
+pub fn foreground_command(shell_pid: u32) -> Option<String> {
+    let table = process_table()?;
+    let edges: Vec<(u32, u32)> = table.iter().map(|row| (row.pid, row.ppid)).collect();
+    let target = innermost_pid(&edges, shell_pid)?;
+    let row = table.iter().find(|row| row.pid == target)?;
+    command_name(row.name.as_bytes())
+}
+
+/// See [`foreground_command`] — same contract, `/proc` enumeration.
+#[cfg(target_os = "linux")]
+pub fn foreground_command(shell_pid: u32) -> Option<String> {
+    let table = process_table()?;
+    let edges: Vec<(u32, u32)> = table.iter().map(|row| (row.pid, row.ppid)).collect();
+    let target = innermost_pid(&edges, shell_pid)?;
+    let row = table.iter().find(|row| row.pid == target)?;
+    command_name(row.name.as_bytes())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn foreground_command(_shell_pid: u32) -> Option<String> {
     None
+}
+
+/// One process, reduced to the three things the tree walk needs.
+///
+/// macOS reads these straight out of its `kinfo_proc` rows and needs no such
+/// type; Windows and Linux both have to copy the name out of a kernel buffer
+/// anyway, so they materialise it here and share everything downstream.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+struct ProcRow {
+    pid: u32,
+    ppid: u32,
+    /// The executable's own name, already stripped of its directory (and, on
+    /// Windows, its `.exe`). Still raw otherwise — [`command_name`] does the
+    /// trimming, dash-stripping and lowercasing.
+    name: String,
+}
+
+/// Every process on the machine, from one kernel snapshot.
+///
+/// `CreateToolhelp32Snapshot` copies the process list into kernel memory in one
+/// call and `Process32NextW` then walks that copy, so the whole enumeration
+/// sees a consistent table rather than one that shifts under it — the same
+/// property `sysctl(KERN_PROC_ALL)` gives on macOS, and the reason neither
+/// platform needs the retry loop a per-process API would.
+///
+/// The snapshot is a kernel handle, so it is wrapped in a guard: every early
+/// return below is a leaked handle otherwise, and this runs twice a second for
+/// the lifetime of the app.
+#[cfg(target_os = "windows")]
+fn process_table() -> Option<Vec<ProcRow>> {
+    use std::mem::size_of;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    struct Snapshot(HANDLE);
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` came from `CreateToolhelp32Snapshot` and was
+            // checked against `INVALID_HANDLE_VALUE`, so it is a live handle
+            // this guard uniquely owns, and it is closed exactly once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    // SAFETY: no arguments to get wrong; the call either yields a handle or
+    // `INVALID_HANDLE_VALUE`, which is checked before the guard takes ownership.
+    let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return None;
+    }
+    let snapshot = Snapshot(handle);
+
+    // `dwSize` is how the API knows which version of the struct it was handed;
+    // leaving it zero makes `Process32FirstW` fail with ERROR_INVALID_PARAMETER.
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+
+    // SAFETY: `snapshot.0` is a live process snapshot and `entry` is a
+    // correctly sized, fully initialised `PROCESSENTRY32W` we exclusively own.
+    if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+        return None;
+    }
+
+    let mut rows = Vec::with_capacity(256);
+    loop {
+        rows.push(ProcRow {
+            pid: entry.th32ProcessID,
+            ppid: entry.th32ParentProcessID,
+            name: exe_name(&entry.szExeFile),
+        });
+        // SAFETY: as above; `Process32NextW` returns zero at the end of the
+        // list (and on any error), which ends the loop.
+        if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+            break;
+        }
+    }
+
+    if rows.is_empty() {
+        None
+    } else {
+        Some(rows)
+    }
+}
+
+/// `PROCESSENTRY32W::szExeFile` — a NUL-terminated UTF-16 buffer — as a name
+/// the shared [`command_name`] can finish normalising.
+///
+/// Two Windows-only adjustments happen here rather than in `command_name`, so
+/// the macOS path stays exactly what it was. The buffer is UTF-16 and only
+/// NUL-*terminated* within its 260 units, so it is cut at the first NUL and
+/// decoded lossily — an unpaired surrogate is a replacement character, never a
+/// panic. And the trailing `.exe` is dropped, case-insensitively, so that one
+/// `[text.quirks]` table written as `claude` matches `claude.exe` here and
+/// `claude` on the other two platforms.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn exe_name(raw: &[u16]) -> String {
+    let end = raw.iter().position(|&u| u == 0).unwrap_or(raw.len());
+    let name = String::from_utf16_lossy(&raw[..end]);
+    match name.len().checked_sub(4) {
+        Some(stem) if name[stem..].eq_ignore_ascii_case(".exe") => name[..stem].to_string(),
+        _ => name,
+    }
+}
+
+/// Every process on the machine, one `/proc/<pid>/stat` at a time.
+///
+/// Linux has no equivalent of the single-copy calls the other two platforms
+/// use, so this is genuinely a syscall per process. It is affordable because
+/// `/proc` files are generated on read with no block device behind them, and
+/// because the poll is twice a second, not per frame.
+///
+/// A pid that exits mid-walk simply fails its `read` and is skipped: that is
+/// the same "the table moved under us" race macOS retries for, and here it
+/// costs one missing row rather than a wrong answer.
+#[cfg(target_os = "linux")]
+fn process_table() -> Option<Vec<ProcRow>> {
+    let mut rows = Vec::with_capacity(256);
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else { continue };
+        // `/proc` holds `self`, `net`, `sys` and friends alongside the pids;
+        // an all-digits name is exactly the process test.
+        let file_name = entry.file_name();
+        let Some(pid) = file_name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if let Some((pid, ppid, name)) = parse_stat(pid, &stat) {
+            rows.push(ProcRow { pid, ppid, name });
+        }
+    }
+    if rows.is_empty() {
+        None
+    } else {
+        Some(rows)
+    }
+}
+
+/// `pid`, `ppid` and `comm` out of one `/proc/<pid>/stat` line.
+///
+/// Splitting on whitespace and indexing field 4 is the obvious implementation
+/// and it is wrong: field 2 is the command in parentheses, and a command may
+/// contain spaces *and* parentheses (`(tmux: server)`, or any process that
+/// chose to `prctl(PR_SET_NAME)` itself something awkward), which shifts every
+/// later field by an unpredictable amount. The kernel's own documented
+/// workaround is to find the *last* `)` in the line: everything between the
+/// first `(` and it is the name, and the fields resume immediately after.
+///
+/// Like macOS's `p_comm`, this name is truncated by the kernel — to 15 bytes
+/// rather than 16 — which is fine for a table keyed on names like `claude` and
+/// `nvim`, and is the same limitation the macOS path has always had.
+///
+/// Pure, so the parenthesis handling is tested on every platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_stat(pid: u32, stat: &str) -> Option<(u32, u32, String)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let comm = stat.get(open + 1..close)?;
+    // What follows the `)` is ` <state> <ppid> …`.
+    let mut fields = stat.get(close + 1..)?.split_whitespace();
+    let _state = fields.next()?;
+    let ppid: u32 = fields.next()?.parse().ok()?;
+    Some((pid, ppid, comm.to_string()))
 }
 
 /// The three fields of `struct kinfo_proc` we care about, at their real
@@ -201,7 +411,10 @@ fn process_table() -> Option<Vec<KinfoProc>> {
 ///
 /// `None` means `shell_pid` is not in the table at all — the tab's shell has
 /// exited, and any name we produced would be a lie.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
 fn innermost_pid(edges: &[(u32, u32)], shell_pid: u32) -> Option<u32> {
     if !edges.iter().any(|&(pid, _)| pid == shell_pid) {
         return None;
@@ -243,7 +456,10 @@ fn innermost_pid(edges: &[(u32, u32)], shell_pid: u32) -> Option<u32> {
 ///
 /// The result is lowercased so callers can compare against a table of
 /// lowercase keys directly. An empty or all-NUL buffer yields `None`.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
 fn command_name(raw: &[u8]) -> Option<String> {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     let name = String::from_utf8_lossy(&raw[..end]);
@@ -319,6 +535,121 @@ mod tests {
     fn a_pid_missing_from_the_table_yields_no_opinion() {
         let edges = [(1u32, 0u32), (500, 1)];
         assert_eq!(innermost_pid(&edges, 4242), None);
+    }
+
+    /// The tree walk is one implementation for three platforms, so the shape
+    /// every enumeration produces — a shell with a real chain under it — has to
+    /// resolve the same way regardless of where the edges came from.
+    ///
+    /// These are the pids and parents a Windows `Process32NextW` walk or a
+    /// Linux `/proc` sweep would hand over for `pwsh → claude → node`, in the
+    /// arbitrary order the kernel happens to list them in.
+    #[test]
+    fn a_windows_or_linux_style_edge_list_resolves_the_same_as_a_macos_one() {
+        // 4 (System) ─ 1200 (pwsh) ─ 1300 (claude) ─ 1400 (node)
+        let edges = [
+            (1400u32, 1300u32),
+            (4, 0),
+            (1200, 4),
+            (9999, 4), // an unrelated sibling of the shell, not a descendant
+            (1300, 1200),
+        ];
+        assert_eq!(innermost_pid(&edges, 1200), Some(1400));
+        assert_eq!(innermost_pid(&edges, 1300), Some(1400));
+        assert_eq!(innermost_pid(&edges, 9999), Some(9999));
+    }
+
+    /// Windows names carry an extension the other platforms do not, and one
+    /// `[text.quirks]` table has to match on all three — so `.exe` comes off
+    /// here, before the shared normalisation, and the macOS path never sees it.
+    #[test]
+    fn a_windows_executable_name_loses_its_extension_and_its_padding() {
+        let wide = |s: &str| {
+            let mut buf = [0u16; 260];
+            for (slot, unit) in buf.iter_mut().zip(s.encode_utf16()) {
+                *slot = unit;
+            }
+            buf
+        };
+        assert_eq!(exe_name(&wide("claude.exe")), "claude");
+        // Windows filenames are case-insensitive, and installers are not
+        // consistent about which case they write.
+        assert_eq!(exe_name(&wide("PowerShell.EXE")), "PowerShell");
+        // A dot that is not a trailing `.exe` is part of the name.
+        assert_eq!(exe_name(&wide("python3.11")), "python3.11");
+        assert_eq!(exe_name(&wide("node")), "node");
+        // A name that is exactly the extension keeps it: dropping it would
+        // leave nothing at all.
+        assert_eq!(exe_name(&wide(".exe")), "");
+        assert_eq!(exe_name(&[0u16; 260]), "");
+        // Downstream, the shared rules still apply.
+        assert_eq!(
+            command_name(exe_name(&wide("Claude.exe")).as_bytes()),
+            Some("claude".into())
+        );
+    }
+
+    /// An unpaired surrogate is a replacement character, not a panic — the
+    /// kernel copies whatever bytes it was handed here just as it does on macOS.
+    #[test]
+    fn an_ill_formed_windows_name_is_replaced_rather_than_panicking() {
+        let mut buf = [0u16; 260];
+        buf[0] = u16::from(b'z');
+        buf[1] = 0xD800; // a high surrogate with nothing after it
+        buf[2] = u16::from(b'h');
+        assert!(exe_name(&buf).starts_with('z'));
+    }
+
+    /// `/proc/<pid>/stat` cannot be split on whitespace: field 2 is the command
+    /// in parentheses, and a command may contain both spaces and parentheses,
+    /// which would shift `ppid` to an unpredictable index.
+    #[test]
+    fn a_proc_stat_line_is_parsed_by_its_last_parenthesis() {
+        // The ordinary case: no space, no nesting.
+        let plain = "1300 (claude) S 1200 1300 1200 34816 1300 4194304 512 0 0 0";
+        assert_eq!(
+            parse_stat(1300, plain),
+            Some((1300, 1200, "claude".to_string()))
+        );
+
+        // The case that breaks the naive parse. Splitting on whitespace would
+        // read `server)` as the state and `S` as the ppid.
+        let spaced = "700 (tmux: server) S 1 700 700 0 -1 4194304 900 0 0 0";
+        assert_eq!(
+            parse_stat(700, spaced),
+            Some((700, 1, "tmux: server".to_string()))
+        );
+
+        // Parentheses inside the name: only the *last* `)` closes it.
+        let nested = "800 (weird (name)) R 42 800 800 0 -1 0 1 0 0 0";
+        assert_eq!(
+            parse_stat(800, nested),
+            Some((800, 42, "weird (name)".to_string()))
+        );
+
+        // An empty comm is legal and is not a parse failure — `command_name`
+        // is what decides it carries no opinion.
+        assert_eq!(parse_stat(9, "9 () S 1 9"), Some((9, 1, String::new())));
+        assert_eq!(command_name(b""), None);
+    }
+
+    /// A truncated, reordered or otherwise unreadable `stat` is one skipped row,
+    /// never a panic: `/proc` entries vanish under the reader all the time.
+    #[test]
+    fn a_malformed_proc_stat_line_yields_no_row() {
+        assert_eq!(parse_stat(1, ""), None);
+        assert_eq!(parse_stat(1, "1 init S 1"), None); // no parentheses at all
+        assert_eq!(parse_stat(1, "1 (init)"), None); // truncated before ppid
+        assert_eq!(parse_stat(1, "1 (init) S"), None); // state but no ppid
+        assert_eq!(parse_stat(1, "1 (init) S notanumber"), None);
+        // A `)` before the `(` cannot delimit a name; `get` returns `None`
+        // rather than slicing backwards and panicking.
+        assert_eq!(parse_stat(1, "1 )init( S 1"), None);
+        // Multi-byte characters must not be sliced through the middle.
+        assert_eq!(
+            parse_stat(1, "1 (héllo) S 1 1"),
+            Some((1, 1, "héllo".to_string()))
+        );
     }
 
     #[test]

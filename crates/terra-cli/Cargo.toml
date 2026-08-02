@@ -17,9 +17,29 @@ anyhow = { workspace = true }
 # `doctor` and `record` talk to the terminal itself: termios/raw mode,
 # TIOCGWINSZ, forkpty, poll, SIGWINCH. All of it is libc, none of it needs a
 # wrapper crate (see src/record.rs for why not portable-pty).
-#
-# Unix-only, and so are the two modules that use it: on other platforms
-# `tty.rs` and `record.rs` compile to stubs that say so at runtime, and the
-# rest of the CLI is unaffected.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# The same two commands on Windows: console modes, CONIN$/CONOUT$, and ConPTY.
+# windows-sys is raw bindings with no build script and no runtime — the same
+# crate and major version alacritty_terminal already pulls into this tree, so
+# it costs no extra build. Features are per-namespace and listed exactly:
+#
+#   Foundation            HANDLE, CloseHandle, WAIT_*, GENERIC_*
+#   Security              SECURITY_ATTRIBUTES (CreatePipe's parameter type)
+#   Storage_FileSystem    CreateFileW/ReadFile/WriteFile
+#   System_Console        console modes, screen buffer info, input records,
+#                         Create/Resize/ClosePseudoConsole
+#   System_IO             OVERLAPPED, in Read/WriteFile's signature
+#   System_Pipes          CreatePipe
+#   System_Threading      CreateProcessW + the proc-thread attribute list
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

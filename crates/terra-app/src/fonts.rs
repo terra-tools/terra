@@ -86,43 +86,137 @@ const EMOJI_WGHT_REGULAR: f32 = 400.0;
 /// does not (U+00A0, U+25CA, U+FEFF — none of them actually emoji).
 const EMOJI_SCALE: f32 = 0.81;
 
-/// macOS ships the system UI face as a single *variable* TrueType file (not a
-/// `.ttc` collection), so it needs no face index — just variation coordinates.
-#[cfg(target_os = "macos")]
-const SF_PRO_PATH: &str = "/System/Library/Fonts/SFNS.ttf";
-
-/// Candidate paths for the system UI face, best first; the first that exists
-/// and parses wins. See [`install_ui_family`].
+/// Directories searched for every system face, best first.
 ///
-/// One entry on macOS (the path is fixed and the face is variable), several
-/// elsewhere: Windows 11 ships a variable Segoe UI but Windows 10 only the
-/// static one, and on Linux there is no single system UI font at all.
+/// # Why directories and file names rather than whole paths
+///
+/// The same file lives in a different directory on every distribution — and on
+/// Windows in a different directory depending on whether it was installed for
+/// the machine or for the user — while its *name* is stable everywhere. Listing
+/// the two axes separately and taking their cross product means a face is found
+/// wherever it happens to be, without the table repeating each file name once
+/// per layout. A directory that does not exist simply produces paths that do not
+/// open, which is the pre-existing silent-skip path.
+///
+/// Entries may contain `${VAR}`, expanded from the environment by [`expand`];
+/// an unset variable drops that directory rather than probing a literal
+/// `${VAR}` path. This is how `%SystemRoot%` is honoured instead of assuming
+/// the C: drive, and how the per-user font directories are reached at all.
+///
+/// The cost is one `open` per (directory, file name) pair per missing face —
+/// on the order of a hundred failed syscalls once, at startup.
 #[cfg(target_os = "macos")]
-const UI_FONT_PATHS: &[&str] = &[SF_PRO_PATH];
+const FONT_DIRS: &[&str] = &[
+    "/System/Library/Fonts",
+    "/System/Library/Fonts/Supplemental",
+    // Machine- and user-installed faces, searched last so a system file always
+    // wins and the measured macOS table keeps resolving to exactly the files
+    // its tests read.
+    "/Library/Fonts",
+    "${HOME}/Library/Fonts",
+];
 
 #[cfg(windows)]
-const UI_FONT_PATHS: &[&str] = &[
-    // Windows 11's variable Segoe UI — the only one of these with a `wght`
-    // axis, and therefore the only one that yields a real medium weight.
-    r"C:\Windows\Fonts\SegUIVar.ttf",
-    r"C:\Windows\Fonts\segoeui.ttf",
-    r"C:\Windows\Fonts\arial.ttf",
+const FONT_DIRS: &[&str] = &[
+    // `%SystemRoot%\Fonts` is the documented system font directory
+    // (`FOLDERID_Fonts`, default path `%windir%\Fonts` — see
+    // learn.microsoft.com/windows/win32/shell/knownfolderid). Windows sets both
+    // spellings of the variable and its environment block is case-insensitive,
+    // so the second entry only matters on an environment missing the first.
+    r"${SystemRoot}\Fonts",
+    r"${WINDIR}\Fonts",
+    // Per-user fonts. Since Windows 10 1809 the Explorer "Install" verb (as
+    // opposed to "Install for all users") drops the file here and registers it
+    // under `HKCU\Software\Microsoft\Windows NT\CurrentVersion\Fonts` — which
+    // is where a user-installed Hebrew or Nerd font lands on a machine where
+    // the user is not an administrator. Microsoft documents this only in
+    // support answers, not in the Win32 reference, and there is no
+    // `KNOWNFOLDERID` for it; the path is nonetheless what every Windows 10/11
+    // machine uses.
+    r"${LOCALAPPDATA}\Microsoft\Windows\Fonts",
 ];
 
 #[cfg(all(unix, not(target_os = "macos")))]
-const UI_FONT_PATHS: &[&str] = &[
-    // Fontconfig would be the right answer here; a path list is the honest
-    // approximation until this crate takes that dependency. Distro layouts
-    // differ, so each face is listed everywhere it is commonly installed.
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/cantarell/Cantarell-VF.otf",
+const FONT_DIRS: &[&str] = &[
+    // Fontconfig would be the right answer here; a directory list is the honest
+    // approximation until this crate takes that dependency. See the note on
+    // [`SCRIPT_FALLBACKS`] for what fontconfig would actually cost.
+    //
+    // Debian/Ubuntu file the packages under `truetype/<family>` (and unifont
+    // under `opentype/`), Arch under `TTF`/`OTF` or a bare family directory,
+    // Fedora under a directory named after the *package*. Verified against the
+    // published file lists of `fonts-dejavu-core`, `fonts-noto-core`,
+    // `fonts-liberation`, `fonts-unifont` (packages.debian.org), `ttf-dejavu`,
+    // `noto-fonts`, `ttf-liberation` (archlinux.org) and the corresponding
+    // Fedora RPMs.
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/noto",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/unifont",
+    "/usr/share/fonts/opentype/unifont",
+    "/usr/share/fonts/TTF",
+    "/usr/share/fonts/OTF",
+    "/usr/share/fonts/dejavu",
+    "/usr/share/fonts/dejavu-sans-fonts",
+    "/usr/share/fonts/dejavu-sans-mono-fonts",
+    "/usr/share/fonts/noto",
+    "/usr/share/fonts/google-noto",
+    "/usr/share/fonts/liberation",
+    "/usr/share/fonts/liberation-sans-fonts",
+    "/usr/share/fonts/liberation-mono-fonts",
+    "/usr/share/fonts/unifont",
+    "/usr/share/fonts/cantarell",
+    "/usr/share/fonts/opentype/cantarell",
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    // Per-user fonts, from the XDG base directory spec and the two legacy
+    // locations fontconfig still honours. Only the top level is searched: a
+    // face filed under `~/.local/share/fonts/NerdFonts/` is not found, because
+    // walking user directories at startup is a different (and unbounded) cost.
+    "${XDG_DATA_HOME}/fonts",
+    "${HOME}/.local/share/fonts",
+    "${HOME}/.fonts",
 ];
+
+#[cfg(not(any(unix, windows)))]
+const FONT_DIRS: &[&str] = &[];
+
+/// macOS ships the system UI face as a single *variable* TrueType file (not a
+/// `.ttc` collection), so it needs no face index — just variation coordinates.
+#[cfg(target_os = "macos")]
+const SF_PRO_FILE: &str = "SFNS.ttf";
+
+/// Candidate file names for the system UI face, best first; the first that is
+/// found in some [`FONT_DIRS`] entry and parses wins. See [`install_ui_family`].
+///
+/// One entry on macOS (the name is fixed and the face is variable), several
+/// elsewhere: Windows 11 ships a variable Segoe UI but Windows 10 only the
+/// static one, and on Linux there is no single system UI font at all.
+#[cfg(target_os = "macos")]
+const UI_FONT_FILES: &[&str] = &[SF_PRO_FILE];
+
+#[cfg(windows)]
+const UI_FONT_FILES: &[&str] = &[
+    // Windows 11's variable Segoe UI — the only one of these with a `wght`
+    // axis, and therefore the only one that yields a real medium weight.
+    // Documented as new in Windows 11 (Segoe UI Variable, `SegUIVar.ttf`, in
+    // learn.microsoft.com/typography/fonts/windows_11_font_list), so on
+    // Windows 10 the static Segoe UI below is what is found.
+    "SegUIVar.ttf",
+    "segoeui.ttf",
+    "arial.ttf",
+];
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const UI_FONT_FILES: &[&str] = &[
+    "DejaVuSans.ttf",
+    "LiberationSans-Regular.ttf",
+    "NotoSans-Regular.ttf",
+    "Cantarell-VF.otf",
+];
+
+#[cfg(not(any(unix, windows)))]
+const UI_FONT_FILES: &[&str] = &[];
 
 /// Name the UI face is registered under. Cosmetic — it is a key in
 /// `FontDefinitions::font_data` — but it shows up in egui debug output, so it
@@ -140,11 +234,12 @@ const UI_FACE_MEDIUM: &str = "System UI Medium";
 struct ScriptFallback {
     /// Key under which the face is registered in `FontDefinitions::font_data`.
     name: &'static str,
-    /// Where the face may live, best first; [`read_fallback`] takes the first
-    /// that exists and parses. macOS has one fixed path per entry; Linux
-    /// genuinely needs the list, because the same font sits under
-    /// `truetype/dejavu`, `TTF` or `dejavu` depending on the distribution.
-    paths: &'static [&'static str],
+    /// File names this face may go by, best first; [`read_fallback`] looks for
+    /// each of them in every [`FONT_DIRS`] entry and takes the first that
+    /// exists and parses. Usually one name — the second is for faces whose
+    /// container differs by distribution (`unifont.otf` vs `unifont.ttf`) or
+    /// whose family ships under two names (Cascadia Mono / Cascadia Code).
+    files: &'static [&'static str],
     /// Face to use inside a `.ttc` collection; `0` for a plain `.ttf`.
     index: u32,
 }
@@ -177,9 +272,16 @@ struct ScriptFallback {
 /// emoji codepoint and then draw nothing), and STIX Two Math. So STIX is the
 /// only way to reach `⏺` at all.
 ///
+/// `⏺` U+23FA is a special case worth stating once: the bundled Noto Emoji has
+/// it (as does epaint's `emoji-icon-font`), so on *every* platform it is served
+/// from a face terra ships rather than from anything below. The macOS STIX
+/// entry predates that and is kept because it is measured and harmless.
+///
 /// Every platform has its own table below; the machinery around them
 /// ([`read_fallback`], [`baseline_offset_factor`], [`install_script_fallbacks`])
-/// is shared and unchanged, including the silent skip when a file is missing.
+/// is shared. A missing file is still skipped rather than being an error, but
+/// it is no longer silent: [`warn_about_uncovered_scripts`] logs whatever ends
+/// up with no covering face at all.
 #[cfg(target_os = "macos")]
 const SCRIPT_FALLBACKS: &[ScriptFallback] = &[
     // Arial Hebrew is kept at scale 1.0 deliberately. Measured against the
@@ -206,26 +308,26 @@ const SCRIPT_FALLBACKS: &[ScriptFallback] = &[
     // what the system's own cascade picks.
     ScriptFallback {
         name: "Arial Hebrew",
-        paths: &["/System/Library/Fonts/ArialHB.ttc"],
+        files: &["ArialHB.ttc"],
         index: 0,
     },
     // Face 0 of the collection is Menlo-Regular (0/1/2/3 are Regular, Bold,
     // Italic, Bold Italic); the italics don't even carry the dingbats.
     ScriptFallback {
         name: "Menlo",
-        paths: &["/System/Library/Fonts/Menlo.ttc"],
+        files: &["Menlo.ttc"],
         index: 0,
     },
     ScriptFallback {
         name: "Apple Symbols",
-        paths: &["/System/Library/Fonts/Apple Symbols.ttf"],
+        files: &["Apple Symbols.ttf"],
         index: 0,
     },
     // Note the file name: macOS ships this as `STIXTwoMath.otf`, without the
     // `-Regular` suffix the family's other members use.
     ScriptFallback {
         name: "STIX Two Math",
-        paths: &["/System/Library/Fonts/Supplemental/STIXTwoMath.otf"],
+        files: &["STIXTwoMath.otf"],
         index: 0,
     },
 ];
@@ -234,110 +336,172 @@ const SCRIPT_FALLBACKS: &[ScriptFallback] = &[
 /// actually ship rather than from one fixed system font set.
 ///
 /// There is no `/System/Library/Fonts` here and no guarantee any given face is
-/// installed, so each entry lists several paths and [`read_fallback`] takes the
-/// first that exists — Debian/Ubuntu put fonts under
-/// `/usr/share/fonts/truetype/<pkg>/`, Arch under `/usr/share/fonts/TTF/`,
-/// Fedora under `/usr/share/fonts/<pkg>/`. Every entry may legitimately be
-/// absent, which is the pre-existing silent-skip path, not a new failure mode.
+/// installed — a plain `ubuntu:24.04` image ships **no font package at all**
+/// (its OCI manifest lists none), and the GitHub Actions Ubuntu runners have
+/// only `fonts-noto-color-emoji`. So every entry here may legitimately be
+/// absent; that is the pre-existing silent-skip path, now reported by
+/// [`warn_about_uncovered_scripts`] instead of leaving the user with
+/// unexplained boxes.
 ///
-/// Ordering mirrors the macOS one: the script face first, then the broad
-/// symbol faces.
+/// Ordering mirrors the macOS one: the script face, then the monospace face
+/// (dingbats at cell width), then the broad symbol faces, then the last resort.
 ///
-/// * **Noto Sans Hebrew** is the Hebrew equivalent of Arial Hebrew and is what
-///   fontconfig's own cascade picks on a modern desktop.
-/// * **DejaVu Sans** is the closest thing Linux has to a universal fallback —
-///   it also carries Hebrew, so it doubles as the Hebrew backstop on a machine
-///   with no Noto, plus a good deal of the dingbat/geometric-shape range
-///   (`✳ ✻ ✽ ◒ ☒`).
-/// * **Noto Sans Symbols 2** is where the technical symbols live (`⎿` U+23BF,
-///   `⏺` U+23FA) — DejaVu has neither.
+/// * **Noto Sans Hebrew** is the Hebrew equivalent of Arial Hebrew and what
+///   fontconfig's own cascade picks on a modern desktop. 88 codepoints in
+///   U+0590..U+05FF (measured against the release TTF from
+///   `notofonts.github.io`). Debian/Ubuntu `fonts-noto-core`, Fedora
+///   `google-noto-sans-hebrew-fonts`, Arch `noto-fonts`.
+/// * **DejaVu Sans Mono** is the Menlo of this table: monospaced, so it draws
+///   the dingbats at the cell width, and it carries every symbol terra needs
+///   except U+23BF and U+23FA — but it has **no Hebrew whatsoever** (0
+///   codepoints in the block, measured against the 2.37 release), which is why
+///   it cannot lead. On Debian sid and Ubuntu 24.04 it moved out of
+///   `fonts-dejavu-core` into its own `fonts-dejavu-mono` package; Fedora
+///   `dejavu-sans-mono-fonts`, Arch `ttf-dejavu`.
+/// * **DejaVu Sans** is the closest thing Linux has to a universal fallback:
+///   54 Hebrew codepoints, so it doubles as the Hebrew backstop on a machine
+///   with no Noto, plus `✳ ✻ ✽ ◒ ⚒ ☒ ❯`. It has neither U+23BF nor U+23FA
+///   (upstream `unicover.txt` puts its Miscellaneous Technical coverage at
+///   25%, and the release TTF confirms both are missing).
+/// * **Noto Sans Symbols** — the *first* Symbols font, not Symbols 2 — is the
+///   only Noto face with `⎿` U+23BF. Symbols 2 does not have it. Both live in
+///   `fonts-noto-core` on Debian/Ubuntu and `noto-fonts` on Arch; Fedora
+///   splits them into `google-noto-sans-symbols-fonts` and
+///   `google-noto-sans-symbols-2-fonts`.
+/// * **Noto Sans Symbols 2** carries `⏺` U+23FA (which Symbols 1 lacks) and
+///   most of the dingbats — though not `⚒` U+2692.
 /// * **Unifont** is the last resort: a bitmap-derived outline face with
-///   near-complete BMP coverage, ugly but never tofu. Last in the list, so it
-///   only ever serves codepoints nothing else has.
+///   near-complete BMP coverage — it alone has both U+23BF and U+23FA — ugly
+///   but never tofu. Last in the list, so it only ever serves codepoints
+///   nothing else has. Debian/Ubuntu `fonts-unifont` ships it as
+///   `unifont.otf` under `opentype/`, **not** as a `.ttf`; Fedora
+///   `unifont-fonts` likewise `.otf`. It is not in Arch's official repos at
+///   all (AUR only), hence both file names are probed.
+///
+/// Coverage claims above are measured against upstream release archives, not
+/// against a running distribution: the *files* are known good, whether a given
+/// machine has them is what [`read_fallback`] finds out at startup.
+///
+/// # Why not fontconfig
+///
+/// Fontconfig is the correct answer to "which installed face covers U+05D0" and
+/// this list is an approximation of it. Taking it would mean either
+/// `yeslogic-fontconfig-sys` (a C `libfontconfig` dependency: `pkg-config` and
+/// headers at build time, or its `dlopen` feature to defer that to runtime) or
+/// `font-kit`, which additionally pulls FreeType in unconditionally on Linux.
+/// The pure-Rust alternative, `fontdb`, does *not* call fontconfig: its
+/// "system fonts" are its own hardcoded directory list — i.e. this list, with
+/// someone else maintaining it. So the choice is a C library on the build
+/// (or run) path versus a directory list, and terra currently keeps the list.
 #[cfg(all(unix, not(target_os = "macos")))]
 const SCRIPT_FALLBACKS: &[ScriptFallback] = &[
     ScriptFallback {
         name: "Noto Sans Hebrew",
-        paths: &[
-            "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
-            "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf",
-            "/usr/share/fonts/TTF/NotoSansHebrew-Regular.ttf",
-            "/usr/share/fonts/google-noto/NotoSansHebrew-Regular.ttf",
-        ],
+        files: &["NotoSansHebrew-Regular.ttf"],
+        index: 0,
+    },
+    ScriptFallback {
+        name: "DejaVu Sans Mono",
+        files: &["DejaVuSansMono.ttf"],
         index: 0,
     },
     ScriptFallback {
         name: "DejaVu Sans",
-        paths: &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
-        ],
+        files: &["DejaVuSans.ttf"],
+        index: 0,
+    },
+    ScriptFallback {
+        name: "Noto Sans Symbols",
+        files: &["NotoSansSymbols-Regular.ttf"],
         index: 0,
     },
     ScriptFallback {
         name: "Noto Sans Symbols 2",
-        paths: &[
-            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
-            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-            "/usr/share/fonts/TTF/NotoSansSymbols2-Regular.ttf",
-            "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
-        ],
+        files: &["NotoSansSymbols2-Regular.ttf"],
         index: 0,
     },
     ScriptFallback {
         name: "Unifont",
-        paths: &[
-            "/usr/share/fonts/truetype/unifont/unifont.ttf",
-            "/usr/share/fonts/misc/unifont.ttf",
-            "/usr/share/fonts/unifont/unifont.ttf",
-        ],
+        files: &["unifont.otf", "unifont.ttf"],
         index: 0,
     },
 ];
 
-/// Windows fallbacks, from the set that ships with the OS.
+/// Windows fallbacks, from the set Microsoft documents as shipping with the OS.
 ///
-/// Paths are literal rather than resolved through `%SystemRoot%`: the fonts
-/// directory has been `C:\Windows\Fonts` since NT, and a machine that moved it
-/// simply gets the existing silent skip. (Worth revisiting together with
-/// per-user fonts under `%LOCALAPPDATA%\Microsoft\Windows\Fonts`, which this
-/// does not look at either.)
+/// File names only; the directories they are looked up in are [`FONT_DIRS`],
+/// which resolves `%SystemRoot%` rather than assuming `C:\Windows` and also
+/// covers the per-user font directory.
 ///
-/// * **Segoe UI** is the system UI face and covers Hebrew.
-/// * **Segoe UI Symbol** is Windows' own technical-symbol face — the
-///   counterpart to Apple Symbols, and where `⎿`/`⏺` come from.
-/// * **Cascadia Mono** ships with Windows Terminal and, being monospaced,
-///   draws the dingbats at the cell width the way Menlo does on macOS.
-/// * **Arial** is the backstop.
+/// Every face here is in the *main* table of
+/// `learn.microsoft.com/typography/fonts/windows_10_font_list` and its Windows
+/// 11 counterpart — i.e. always installed — as opposed to the "Fonts included
+/// in Feature On Demand (FOD) packages" section further down those pages, which
+/// is where the extra Hebrew typefaces (David, Miriam, Narkisim, …) live. Terra
+/// deliberately depends on none of the FOD faces: the Hebrew Supplemental Fonts
+/// package is only installed once the user adds Hebrew to their language
+/// settings, so a fallback resting on it would be tofu on exactly the machine
+/// that has not got round to that yet.
 ///
-/// Unverified on hardware: this table is chosen from documented Windows font
-/// coverage, not measured the way the macOS one was (see the coverage tests,
-/// which only run on macOS because they read the installed files).
+/// * **Segoe UI** (`segoeui.ttf`) is the system UI face and covers Hebrew:
+///   its font page lists `Hebr` in both `dlng` and `slng` and code page 1255,
+///   and it carries the Hebrew OpenType layout tables.
+/// * **Cascadia Mono** is the Menlo of this table — monospaced, so it draws
+///   dingbats at the cell width. **Not expected to be found on a clean
+///   install**: although the Windows 11 font list names it, it is delivered
+///   inside the Windows Terminal MSIX package and registered through that
+///   package's `SharedFonts` manifest extension, so the file sits under
+///   `C:\Program Files\WindowsApps\…` and not in the fonts directory. It is
+///   probed anyway because a user who installs the upstream release gets
+///   `CascadiaMono.ttf` (or `CascadiaCode.ttf`) in the per-user font
+///   directory, and finding it there is free.
+/// * **Segoe UI Symbol** (`seguisym.ttf`) is Windows' own technical-symbol
+///   face — the counterpart to Apple Symbols, and where `⎿` U+23BF and the
+///   dingbats come from.
+/// * **Tahoma** is a second Hebrew source (`Hebr` in `dlng` *and* `slng`, code
+///   pages 1255 and 862), in case a future release trims Segoe UI.
+/// * **Arial** is the backstop; `slng` includes `Hebr`.
+///
+/// # What is and is not verified
+///
+/// *Verified from Microsoft's documentation:* that all four of Segoe UI, Segoe
+/// UI Symbol, Tahoma and Arial are always installed on Windows 10 and 11, and
+/// that Segoe UI, Tahoma and Arial declare Hebrew support.
+///
+/// *Not verified, and not verifiable from a Mac:* the per-codepoint symbol
+/// coverage. Microsoft publishes no cmap tables. Third-party coverage data
+/// (fileformat.info) says Segoe UI Symbol has U+23BF, U+2733, U+273B, U+273D,
+/// U+25D2, U+2692, U+2612 and U+276F but **not** U+23FA — which is survivable
+/// only because U+23FA comes from the bundled Noto Emoji on every platform
+/// (see [`REQUIRED_COVERAGE`]). That claim is a snapshot of one font version
+/// and is exactly what `windows_fallbacks_cover_the_scripts_the_grid_needs`
+/// checks on a real Windows machine; this table is a hypothesis until that
+/// test runs.
 #[cfg(windows)]
 const SCRIPT_FALLBACKS: &[ScriptFallback] = &[
     ScriptFallback {
         name: "Segoe UI",
-        paths: &[r"C:\Windows\Fonts\segoeui.ttf"],
-        index: 0,
-    },
-    ScriptFallback {
-        name: "Segoe UI Symbol",
-        paths: &[r"C:\Windows\Fonts\seguisym.ttf"],
+        files: &["segoeui.ttf"],
         index: 0,
     },
     ScriptFallback {
         name: "Cascadia Mono",
-        paths: &[
-            r"C:\Windows\Fonts\CascadiaMono.ttf",
-            r"C:\Windows\Fonts\CascadiaCode.ttf",
-        ],
+        files: &["CascadiaMono.ttf", "CascadiaCode.ttf"],
+        index: 0,
+    },
+    ScriptFallback {
+        name: "Segoe UI Symbol",
+        files: &["seguisym.ttf"],
+        index: 0,
+    },
+    ScriptFallback {
+        name: "Tahoma",
+        files: &["tahoma.ttf"],
         index: 0,
     },
     ScriptFallback {
         name: "Arial",
-        paths: &[r"C:\Windows\Fonts\arial.ttf"],
+        files: &["arial.ttf"],
         index: 0,
     },
 ];
@@ -371,7 +535,61 @@ pub fn has_real_ui_medium() -> bool {
     REAL_UI_MEDIUM.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Read the first system UI font in [`UI_FONT_PATHS`] that exists and carries
+/// Substitute `${VAR}` references from the environment, or `None` if any of
+/// them is unset.
+///
+/// This is what lets [`FONT_DIRS`] name `%SystemRoot%\Fonts` and the per-user
+/// font directories without hardcoding a drive letter or a home path. An unset
+/// variable drops the whole directory — probing a literal `${LOCALAPPDATA}\…`
+/// would only waste a syscall — and a malformed reference (`${` with no `}`)
+/// does the same rather than being pasted through.
+///
+/// Deliberately not a general shell expansion: no `$VAR`, no `~`, no nesting.
+/// The table is ours, so the only requirement is that it can say "this
+/// variable, here".
+fn expand(path: &str) -> Option<String> {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 2..];
+        let end = tail.find('}')?;
+        out.push_str(&std::env::var(&tail[..end]).ok()?);
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Read the first of `files` found in any `dirs` entry that carries font magic
+/// and really contains face `index`.
+///
+/// File names are the outer loop: a name earlier in the list is preferred
+/// wherever it lives, rather than a whole directory being preferred over a
+/// better-named file inside the next one. A path that exists but is not a font
+/// (or is a collection without our face index) is skipped rather than ending
+/// the search, so one bad file cannot mask a good one further along. A
+/// directory whose `${VAR}` is unset drops out entirely.
+///
+/// `dirs` is a parameter rather than [`FONT_DIRS`] read directly so the search
+/// can be exercised against a temporary tree on any platform; [`find_font`] is
+/// the only caller that matters.
+fn find_font_in(dirs: &[&str], files: &[&str], index: u32) -> Option<Vec<u8>> {
+    files.iter().find_map(|file| {
+        dirs.iter().find_map(|dir| {
+            let path = std::path::Path::new(&expand(dir)?).join(file);
+            let bytes = std::fs::read(path).ok()?;
+            (index < sfnt_face_count(&bytes)?).then_some(bytes)
+        })
+    })
+}
+
+/// [`find_font_in`] over this platform's [`FONT_DIRS`].
+fn find_font(files: &[&str], index: u32) -> Option<Vec<u8>> {
+    find_font_in(FONT_DIRS, files, index)
+}
+
+/// Read the first system UI font in [`UI_FONT_FILES`] that exists and carries
 /// font magic. Any failure is silent: the caller falls back to the default
 /// font.
 ///
@@ -381,10 +599,7 @@ pub fn has_real_ui_medium() -> bool {
 /// them would mean *no* UI font at all rather than one without a real medium
 /// weight. Which of the two we got is [`has_weight_axis`]'s job.
 fn read_system_ui_font() -> Option<Vec<u8>> {
-    UI_FONT_PATHS.iter().find_map(|path| {
-        let bytes = std::fs::read(path).ok()?;
-        sfnt_face_count(&bytes).map(|_| bytes)
-    })
+    find_font(UI_FONT_FILES, 0)
 }
 
 /// Whether a face exposes the `wght` axis, i.e. whether asking for a medium
@@ -414,18 +629,14 @@ fn sfnt_face_count(bytes: &[u8]) -> Option<u32> {
 
 /// Read a fallback face, but only hand back bytes epaint can actually parse:
 /// the file must carry font magic and must really contain the face index we
-/// ask for. Any failure is silent — the family just keeps what it had, which
-/// is the same tofu as before rather than a crash on startup.
+/// ask for. A face that is simply not installed yields `None` — the family
+/// keeps what it had, which is the same tofu as before rather than a crash on
+/// startup, and [`warn_about_uncovered_scripts`] is what tells the user.
 ///
-/// [`ScriptFallback::paths`] is tried in order and the first file that passes
-/// *both* checks wins; a path that exists but is not a font (or is a
-/// collection without our face index) is skipped rather than ending the search,
-/// so one bad file cannot mask a good one further down the list.
+/// See [`find_font`] for the search order over [`ScriptFallback::files`] and
+/// [`FONT_DIRS`].
 fn read_fallback(f: &ScriptFallback) -> Option<Vec<u8>> {
-    f.paths.iter().find_map(|path| {
-        let bytes = std::fs::read(path).ok()?;
-        (f.index < sfnt_face_count(&bytes)?).then_some(bytes)
-    })
+    find_font(f.files, f.index)
 }
 
 /// Big-endian sfnt readers that yield `None` past the end of the file, so a
@@ -465,6 +676,249 @@ fn table(bytes: &[u8], header: u32, tag: &[u8; 4]) -> Option<u32> {
         let rec = header + 12 + 16 * i;
         (bytes.get(rec..rec + 4)? == tag).then(|| be_u32(bytes, rec + 8))?
     })
+}
+
+/// Whether a `cmap` format 4 subtable at `sub` maps `cp` to a real glyph.
+///
+/// Format 4 is the BMP-only segmented mapping: parallel arrays of segment
+/// ends, starts, deltas and range offsets, the last of which either is 0
+/// (glyph = codepoint + delta) or is itself an offset *from its own slot*
+/// into a shared glyph id array.
+fn format4_glyph(bytes: &[u8], sub: usize, cp: u32) -> Option<u32> {
+    let cp = u16::try_from(cp).ok()?;
+    let seg_x2 = be_u16(bytes, sub + 6)? as usize;
+    let ends = sub + 14;
+    let starts = ends + seg_x2 + 2; // + the reservedPad u16
+    let deltas = starts + seg_x2;
+    let ranges = deltas + seg_x2;
+
+    for i in (0..seg_x2).step_by(2) {
+        if be_u16(bytes, ends + i)? < cp || be_u16(bytes, starts + i)? > cp {
+            continue;
+        }
+        let start = be_u16(bytes, starts + i)?;
+        let delta = be_u16(bytes, deltas + i)?;
+        let range = be_u16(bytes, ranges + i)?;
+        let glyph = if range == 0 {
+            cp.wrapping_add(delta)
+        } else {
+            let at = ranges + i + range as usize + 2 * (cp - start) as usize;
+            match be_u16(bytes, at)? {
+                0 => 0,
+                g => g.wrapping_add(delta),
+            }
+        };
+        return (glyph != 0).then_some(u32::from(glyph));
+    }
+    None
+}
+
+/// Whether a `cmap` format 12 subtable at `sub` maps `cp`: a u32 group
+/// count at sub+12 and then 12-byte (start, end, start glyph) groups. This
+/// is the only format that reaches past the BMP, but system fonts use it for
+/// BMP codepoints too, so it has to be checked either way.
+fn format12_glyph(bytes: &[u8], sub: usize, cp: u32) -> Option<u32> {
+    let groups = be_u32(bytes, sub + 12)? as usize;
+    for i in 0..groups {
+        let g = sub + 16 + 12 * i;
+        let (start, end) = (be_u32(bytes, g)?, be_u32(bytes, g + 4)?);
+        if (start..=end).contains(&cp) {
+            let glyph = be_u32(bytes, g + 8)?.wrapping_add(cp - start);
+            return (glyph != 0).then_some(glyph);
+        }
+    }
+    None
+}
+
+/// The glyph face `face` of the font in `bytes` maps `cp` to, if any.
+///
+/// Walks every `cmap` encoding record rather than picking one: Menlo and
+/// Apple Symbols hold their symbol coverage in a format 4 (3,1) subtable
+/// while STIX also carries a format 12 (3,10) one, and which subtable a
+/// given codepoint lives in is not something we want to hard-code.
+fn glyph_of(bytes: &[u8], face: u32, cp: u32) -> Option<u32> {
+    let header = face_offset(bytes, face)?;
+    let cmap = table(bytes, header, b"cmap")? as usize;
+    let count = be_u16(bytes, cmap + 2)?;
+    (0..count as usize).find_map(|i| {
+        let rec = cmap + 4 + 8 * i;
+        let sub = cmap + be_u32(bytes, rec + 4)? as usize;
+        match be_u16(bytes, sub) {
+            Some(4) => format4_glyph(bytes, sub, cp),
+            Some(12) => format12_glyph(bytes, sub, cp),
+            _ => None,
+        }
+    })
+}
+
+/// Whether face `face` of the font in `bytes` has a glyph for `cp`.
+///
+/// This is the same question epaint asks when it walks a family looking for
+/// the first face that can draw a character, so "no face in the family covers
+/// `cp`" is exactly "the user sees a box".
+fn covers(bytes: &[u8], face: u32, cp: u32) -> bool {
+    glyph_of(bytes, face, cp).is_some()
+}
+
+/// A run of characters terra has to be able to draw, and what to tell the user
+/// when nothing installed can.
+struct Requirement {
+    /// Named in the warning, so it has to mean something to a user reading a
+    /// log line rather than to this file.
+    what: &'static str,
+    codepoints: &'static [u32],
+    /// What to install. Platform-specific and necessarily approximate, but a
+    /// package name is the difference between a warning and an actionable one.
+    fix: &'static str,
+}
+
+/// Every Hebrew letter including the five final forms — the whole set the grid
+/// has to place, not a sample of it. A face that stops halfway through the
+/// alphabet is exactly the failure this catches.
+const HEBREW_LETTERS: &[u32] = &[
+    0x05D0, 0x05D1, 0x05D2, 0x05D3, 0x05D4, 0x05D5, 0x05D6, 0x05D7, 0x05D8, 0x05D9, 0x05DA, 0x05DB,
+    0x05DC, 0x05DD, 0x05DE, 0x05DF, 0x05E0, 0x05E1, 0x05E2, 0x05E3, 0x05E4, 0x05E5, 0x05E6, 0x05E7,
+    0x05E8, 0x05E9, 0x05EA,
+];
+
+/// The symbols TUIs paint that no monospace face carries — `✳ ✻ ✽ ◒ ⚒ ☒` plus
+/// `⎿` and `⏺`, the set Claude Code alone uses, and `❯`, which JetBrains Mono
+/// does have and which is therefore also a check that this list is being
+/// evaluated against the real families rather than against nothing.
+const TUI_SYMBOLS: &[u32] = &[
+    0x2733, 0x273B, 0x273D, 0x25D2, 0x2692, 0x2612, 0x23BF, 0x23FA, 0x276F,
+];
+
+/// What the fallback tables exist to cover. Checked against the *assembled*
+/// families at startup, so it accounts for the bundled faces and epaint's
+/// built-ins as well as for [`SCRIPT_FALLBACKS`] — U+23FA, for instance, is
+/// covered by the bundled Noto Emoji on every platform and must not be
+/// reported missing merely because no system face has it.
+const REQUIRED_COVERAGE: &[Requirement] = &[
+    Requirement {
+        what: "Hebrew",
+        codepoints: HEBREW_LETTERS,
+        fix: HEBREW_FIX,
+    },
+    Requirement {
+        what: "the TUI symbol set",
+        codepoints: TUI_SYMBOLS,
+        fix: SYMBOL_FIX,
+    },
+];
+
+#[cfg(target_os = "macos")]
+const HEBREW_FIX: &str = "Arial Hebrew is missing from /System/Library/Fonts";
+#[cfg(target_os = "macos")]
+const SYMBOL_FIX: &str = "Menlo, Apple Symbols or STIX Two Math is missing from \
+                          /System/Library/Fonts";
+
+#[cfg(windows)]
+const HEBREW_FIX: &str = "Segoe UI, Tahoma and Arial all carry Hebrew and all ship with \
+                          Windows — check %SystemRoot%\\Fonts";
+#[cfg(windows)]
+const SYMBOL_FIX: &str = "install Segoe UI Symbol (seguisym.ttf, part of Windows) or any \
+                          Nerd Font into %LOCALAPPDATA%\\Microsoft\\Windows\\Fonts";
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const HEBREW_FIX: &str = "install fonts-noto-core (Debian/Ubuntu), \
+                          google-noto-sans-hebrew-fonts (Fedora) or noto-fonts (Arch)";
+#[cfg(all(unix, not(target_os = "macos")))]
+const SYMBOL_FIX: &str = "install fonts-noto-core and fonts-unifont (Debian/Ubuntu), \
+                          google-noto-sans-symbols{,-2}-fonts and unifont-fonts (Fedora) \
+                          or noto-fonts (Arch)";
+
+#[cfg(not(any(unix, windows)))]
+const HEBREW_FIX: &str = "terra knows no font locations on this platform";
+#[cfg(not(any(unix, windows)))]
+const SYMBOL_FIX: &str = "terra knows no font locations on this platform";
+
+/// How many missing codepoints to spell out before summarising. Enough to see
+/// the shape of the gap, few enough that a machine with no fonts at all does
+/// not print the Hebrew alphabet into the log.
+const MAX_LISTED: usize = 4;
+
+/// Which codepoints of which [`REQUIRED_COVERAGE`] entries no face in `family`
+/// can draw. Entries that are fully covered are dropped, so an empty result
+/// means the user will see text everywhere terra knows to look.
+///
+/// The family is walked exactly as epaint walks it — first face with the
+/// codepoint wins — so this answers the user's question ("will I see boxes?")
+/// rather than the table's ("did the files load?"). A face named in the family
+/// but absent from `font_data` is skipped; that cannot happen today, but it
+/// would otherwise be an index panic during startup.
+fn missing_coverage(
+    fonts: &egui::FontDefinitions,
+    family: &egui::FontFamily,
+) -> Vec<(&'static Requirement, Vec<u32>)> {
+    let Some(names) = fonts.families.get(family) else {
+        return Vec::new();
+    };
+    let faces: Vec<_> = names
+        .iter()
+        .filter_map(|name| fonts.font_data.get(name))
+        .map(|data| (data.font.as_ref(), data.index))
+        .collect();
+
+    REQUIRED_COVERAGE
+        .iter()
+        .filter_map(|req| {
+            let missing: Vec<u32> = req
+                .codepoints
+                .iter()
+                .copied()
+                .filter(|&cp| !faces.iter().any(|(bytes, index)| covers(bytes, *index, cp)))
+                .collect();
+            (!missing.is_empty()).then_some((req, missing))
+        })
+        .collect()
+}
+
+/// [`missing_coverage`] as ready-to-log sentences.
+fn uncovered(fonts: &egui::FontDefinitions, family: &egui::FontFamily) -> Vec<String> {
+    missing_coverage(fonts, family)
+        .into_iter()
+        .map(|(req, missing)| {
+            let listed: Vec<String> = missing
+                .iter()
+                .take(MAX_LISTED)
+                .map(|cp| format!("U+{cp:04X}"))
+                .collect();
+            let more = match missing.len().saturating_sub(MAX_LISTED) {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
+            format!(
+                "no installed font covers {} ({}{}) — {} will render as empty boxes; {}",
+                req.what,
+                listed.join(" "),
+                more,
+                if missing.len() == 1 {
+                    "it".to_owned()
+                } else {
+                    format!("{} characters", missing.len())
+                },
+                req.fix,
+            )
+        })
+        .collect()
+}
+
+/// Log whatever the assembled monospace family cannot draw.
+///
+/// The terminal grid is [`egui::FontFamily::Monospace`], so that is the family
+/// that decides whether the user sees text or boxes; the other families are
+/// built from the same faces plus more.
+///
+/// Phrased and routed like `config.rs`'s warnings (`log::warn!("terra: <area>:
+/// {warning}")`) so both arrive the same way. It is a log line rather than a
+/// `Config::warnings()` entry because nothing here comes from the user's
+/// config file — it is a property of the machine, and there is no config error
+/// for the user to go and fix.
+fn warn_about_uncovered_scripts(fonts: &egui::FontDefinitions) {
+    for warning in uncovered(fonts, &egui::FontFamily::Monospace) {
+        log::warn!("terra: fonts: {warning}");
+    }
 }
 
 /// A face's `hhea` ascender and the row height epaint derives from it, both in
@@ -693,6 +1147,10 @@ pub fn install(ctx: &egui::Context) {
 
     install_ui_family(&mut fonts);
 
+    // After every face is registered, so this reports what the user will
+    // actually see rather than which files happened to be missing.
+    warn_about_uncovered_scripts(&fonts);
+
     ctx.set_fonts(fonts);
 }
 
@@ -806,84 +1264,6 @@ fn pin_text_rendering(ctx: &egui::Context) {
 mod tests {
     use super::*;
 
-    /// Whether a `cmap` format 4 subtable at `sub` maps `cp` to a real glyph.
-    ///
-    /// Format 4 is the BMP-only segmented mapping: parallel arrays of segment
-    /// ends, starts, deltas and range offsets, the last of which either is 0
-    /// (glyph = codepoint + delta) or is itself an offset *from its own slot*
-    /// into a shared glyph id array.
-    fn format4_glyph(bytes: &[u8], sub: usize, cp: u32) -> Option<u32> {
-        let cp = u16::try_from(cp).ok()?;
-        let seg_x2 = be_u16(bytes, sub + 6)? as usize;
-        let ends = sub + 14;
-        let starts = ends + seg_x2 + 2; // + the reservedPad u16
-        let deltas = starts + seg_x2;
-        let ranges = deltas + seg_x2;
-
-        for i in (0..seg_x2).step_by(2) {
-            if be_u16(bytes, ends + i)? < cp || be_u16(bytes, starts + i)? > cp {
-                continue;
-            }
-            let start = be_u16(bytes, starts + i)?;
-            let delta = be_u16(bytes, deltas + i)?;
-            let range = be_u16(bytes, ranges + i)?;
-            let glyph = if range == 0 {
-                cp.wrapping_add(delta)
-            } else {
-                let at = ranges + i + range as usize + 2 * (cp - start) as usize;
-                match be_u16(bytes, at)? {
-                    0 => 0,
-                    g => g.wrapping_add(delta),
-                }
-            };
-            return (glyph != 0).then_some(u32::from(glyph));
-        }
-        None
-    }
-
-    /// Whether a `cmap` format 12 subtable at `sub` maps `cp`: a u32 group
-    /// count at sub+12 and then 12-byte (start, end, start glyph) groups. This
-    /// is the only format that reaches past the BMP, but macOS system fonts
-    /// use it for BMP codepoints too, so it has to be checked either way.
-    fn format12_glyph(bytes: &[u8], sub: usize, cp: u32) -> Option<u32> {
-        let groups = be_u32(bytes, sub + 12)? as usize;
-        for i in 0..groups {
-            let g = sub + 16 + 12 * i;
-            let (start, end) = (be_u32(bytes, g)?, be_u32(bytes, g + 4)?);
-            if (start..=end).contains(&cp) {
-                let glyph = be_u32(bytes, g + 8)?.wrapping_add(cp - start);
-                return (glyph != 0).then_some(glyph);
-            }
-        }
-        None
-    }
-
-    /// The glyph face `face` of the font in `bytes` maps `cp` to, if any.
-    ///
-    /// Walks every `cmap` encoding record rather than picking one: Menlo and
-    /// Apple Symbols hold their symbol coverage in a format 4 (3,1) subtable
-    /// while STIX also carries a format 12 (3,10) one, and which subtable a
-    /// given codepoint lives in is not something we want to hard-code.
-    fn glyph_of(bytes: &[u8], face: u32, cp: u32) -> Option<u32> {
-        let header = face_offset(bytes, face)?;
-        let cmap = table(bytes, header, b"cmap")? as usize;
-        let count = be_u16(bytes, cmap + 2)?;
-        (0..count as usize).find_map(|i| {
-            let rec = cmap + 4 + 8 * i;
-            let sub = cmap + be_u32(bytes, rec + 4)? as usize;
-            match be_u16(bytes, sub) {
-                Some(4) => format4_glyph(bytes, sub, cp),
-                Some(12) => format12_glyph(bytes, sub, cp),
-                _ => None,
-            }
-        })
-    }
-
-    /// Whether face `face` of the font in `bytes` has a glyph for `cp`.
-    fn covers(bytes: &[u8], face: u32, cp: u32) -> bool {
-        glyph_of(bytes, face, cp).is_some()
-    }
-
     /// `cp`'s advance width in em, as epaint will scale it: `hmtx` looked up
     /// through `cmap`, over `head.unitsPerEm`. Glyphs past
     /// `hhea.numberOfHMetrics` share the last entry's advance, which is how
@@ -915,11 +1295,6 @@ mod tests {
         Some(x_height / units_per_em)
     }
 
-    /// Every Hebrew letter, including the five final forms — the whole set the
-    /// grid has to place, not a sample of it.
-    #[cfg(target_os = "macos")]
-    const HEBREW_LETTERS: std::ops::RangeInclusive<u32> = 0x05D0..=0x05EA;
-
     /// The width of one terminal cell, in em.
     ///
     /// `egui_term::TerminalFont::font_measure` takes it from `glyph_width` of
@@ -945,19 +1320,51 @@ mod tests {
         (bytes, tweak)
     }
 
-    /// The symbols TUIs paint that no monospace face on this machine covers —
-    /// the tofu this table exists to kill. See [`SCRIPT_FALLBACKS`].
-    #[cfg(target_os = "macos")]
-    const TUI_SYMBOLS: &[(char, u32)] = &[
-        ('✳', 0x2733),
-        ('✻', 0x273B),
-        ('✽', 0x273D),
-        ('◒', 0x25D2),
-        ('⚒', 0x2692),
-        ('☒', 0x2612),
-        ('⎿', 0x23BF),
-        ('⏺', 0x23FA),
-    ];
+    /// The families exactly as [`install`] assembles them, so a test can ask
+    /// what the user will really see instead of re-deriving it.
+    ///
+    /// Kept in step with `install` by construction: it calls the same four
+    /// steps in the same order. The `Context`-taking half of `install`
+    /// (`pin_text_rendering`, `set_fonts`) needs a running egui and is what is
+    /// left out.
+    fn assembled_families() -> egui::FontDefinitions {
+        use std::sync::Arc;
+
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "JetBrains Mono".to_owned(),
+            Arc::new(egui::FontData::from_static(JETBRAINS_MONO_REGULAR)),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "JetBrains Mono".to_owned());
+        install_emoji(&mut fonts);
+        let script = install_script_fallbacks(&mut fonts);
+        for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .extend(script.iter().cloned());
+        }
+        install_ui_family(&mut fonts);
+        fonts
+    }
+
+    /// Names of the [`SCRIPT_FALLBACKS`] entries actually present on this
+    /// machine, for tests that have to distinguish "absent, fine" from
+    /// "present and wrong". macOS does not need it: there every entry is a
+    /// system file that must be there, so its tests assert outright.
+    #[cfg(not(target_os = "macos"))]
+    fn installed_fallbacks() -> Vec<&'static str> {
+        SCRIPT_FALLBACKS
+            .iter()
+            .filter(|f| read_fallback(f).is_some())
+            .map(|f| f.name)
+            .collect()
+    }
 
     #[test]
     fn sfnt_face_count_reads_each_container() {
@@ -977,66 +1384,148 @@ mod tests {
 
     /// A fallback whose file is missing must be skipped, not panicked on:
     /// users can and do delete supplemental system fonts — and on Linux the
-    /// *normal* case is that most paths in an entry do not exist.
+    /// *normal* case is that no directory in the list has the file.
     #[test]
     fn missing_fallback_file_is_skipped() {
         assert!(read_fallback(&ScriptFallback {
             name: "nope",
-            paths: &["/definitely/not/a/font.ttc"],
+            files: &["definitely-not-a-font.ttc"],
             index: 0,
         })
         .is_none());
-        // Every path missing is still just "not available", never a panic.
+        // Every name missing is still just "not available", never a panic.
         assert!(read_fallback(&ScriptFallback {
             name: "nope",
-            paths: &["/nope/one.ttf", "/nope/two.ttf"],
+            files: &["nope-one.ttf", "nope-two.ttf"],
             index: 0,
         })
         .is_none());
         assert!(read_fallback(&ScriptFallback {
             name: "nope",
-            paths: &[],
+            files: &[],
             index: 0,
         })
         .is_none());
+        // A name that cannot be a file name at all must not escape the
+        // directory list into some absolute path.
+        assert!(find_font(&["../../../etc/hosts"], 0).is_none());
     }
 
-    /// The point of the path list: a face is found wherever the distribution
-    /// happens to put it, and entries ahead of it that are absent — or present
-    /// but not fonts — do not stop the search.
+    /// The point of the directory list: a face is found wherever the
+    /// distribution happens to put it, and directories ahead of it that are
+    /// absent — or hold a file of the same name that is not a font — do not
+    /// stop the search.
+    ///
+    /// Driven through the real [`find_font_in`] against a temporary directory
+    /// tree, one arm of which is reached through `${…}` expansion — the same
+    /// mechanism `%SystemRoot%` and the per-user font directories use.
     #[test]
-    fn a_fallback_takes_the_first_readable_path_and_skips_the_rest() {
-        let dir = std::env::temp_dir().join("terra-font-fallback-probe");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let decoy = dir.join("not-a-font.ttf");
-        let real = dir.join("real.ttf");
-        std::fs::write(&decoy, b"#!/bin/sh\n").expect("write decoy");
-        std::fs::write(&real, JETBRAINS_MONO_REGULAR).expect("write font");
+    fn a_fallback_takes_the_first_readable_directory_and_skips_the_rest() {
+        let root = std::env::temp_dir().join("terra-font-fallback-probe");
+        let (decoy_dir, real_dir) = (root.join("decoy"), root.join("real"));
+        std::fs::create_dir_all(&decoy_dir).expect("temp dir");
+        std::fs::create_dir_all(&real_dir).expect("temp dir");
+        std::fs::write(decoy_dir.join("probe.ttf"), b"#!/bin/sh\n").expect("write decoy");
+        std::fs::write(real_dir.join("second.ttf"), JETBRAINS_MONO_BOLD).expect("write font");
+        std::fs::write(real_dir.join("probe.ttf"), JETBRAINS_MONO_REGULAR).expect("write font");
+        std::env::set_var("TERRA_FONT_TEST_DIR", &real_dir);
 
-        let paths: Vec<&str> = vec![
-            "/definitely/not/a/font.ttc",
-            decoy.to_str().unwrap(),
-            real.to_str().unwrap(),
+        let dirs = &[
+            // Missing, then present-but-not-a-font, then the real one — and
+            // that last one only exists after expansion.
+            "/definitely/not/a/font/directory",
+            decoy_dir.to_str().expect("utf-8 temp dir"),
+            "${TERRA_FONT_TEST_DIR}",
+            "${TERRA_NOT_SET_ANYWHERE}",
         ];
-        // `paths` is `&'static` in the table; leaking here is a test-only way
-        // to build one from runtime paths.
-        let paths: &'static [&'static str] = Box::leak(
-            paths
-                .into_iter()
-                .map(|p| &*Box::leak(p.to_owned().into_boxed_str()))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
 
-        let found = read_fallback(&ScriptFallback {
-            name: "probe",
-            paths,
-            index: 0,
-        })
-        .expect("the readable font should have been found");
+        let found = find_font_in(dirs, &["probe.ttf"], 0).expect("the font should have been found");
         assert_eq!(found, JETBRAINS_MONO_REGULAR);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // File names are the outer loop: the first *name* wins wherever it
+        // lives, even though both names sit in the same directory.
+        let found = find_font_in(dirs, &["probe.ttf", "second.ttf"], 0).expect("no font found");
+        assert_eq!(found, JETBRAINS_MONO_REGULAR);
+        let found = find_font_in(dirs, &["second.ttf", "probe.ttf"], 0).expect("no font found");
+        assert_eq!(found, JETBRAINS_MONO_BOLD);
+
+        // A face index the file does not have is still refused, whichever
+        // directory the file was found in.
+        assert!(find_font_in(dirs, &["probe.ttf"], u32::MAX).is_none());
+        // And a directory that only exists as an unset variable finds nothing
+        // rather than probing a literal `${…}` path.
+        assert!(find_font_in(&["${TERRA_NOT_SET_ANYWHERE}"], &["probe.ttf"], 0).is_none());
+
+        std::env::remove_var("TERRA_FONT_TEST_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `${VAR}` expansion is what keeps `%SystemRoot%` and the per-user font
+    /// directories out of the source as literals. An unset or malformed
+    /// reference must drop the directory rather than produce a path with a
+    /// `${…}` in it, which would be probed forever and never found.
+    #[test]
+    fn environment_references_expand_or_drop_the_directory() {
+        std::env::set_var("TERRA_FONT_TEST_VAR", "/opt/fonts");
+
+        assert_eq!(
+            expand("/usr/share/fonts").as_deref(),
+            Some("/usr/share/fonts")
+        );
+        assert_eq!(
+            expand("${TERRA_FONT_TEST_VAR}/noto").as_deref(),
+            Some("/opt/fonts/noto")
+        );
+        assert_eq!(
+            expand("${TERRA_FONT_TEST_VAR}/a/${TERRA_FONT_TEST_VAR}").as_deref(),
+            Some("/opt/fonts/a//opt/fonts")
+        );
+        assert_eq!(expand("${TERRA_NOT_SET_ANYWHERE}/fonts"), None);
+        assert_eq!(expand("${unterminated/fonts"), None);
+        // A bare `$` or `}` is not a reference and must survive untouched.
+        assert_eq!(expand("/fonts/$weird}").as_deref(), Some("/fonts/$weird}"));
+
+        std::env::remove_var("TERRA_FONT_TEST_VAR");
+        assert_eq!(expand("${TERRA_FONT_TEST_VAR}/noto"), None);
+    }
+
+    /// Every directory terra probes has to be either absolute or an
+    /// environment reference that becomes absolute — a relative entry would
+    /// resolve against the shell's working directory, which for a terminal is
+    /// wherever the user happened to launch it from.
+    #[test]
+    fn every_font_directory_is_absolute_or_environment_rooted() {
+        for dir in FONT_DIRS {
+            assert!(
+                dir.starts_with('/') || dir.starts_with("${"),
+                "{dir} is neither absolute nor environment-rooted"
+            );
+            if let Some(expanded) = expand(dir) {
+                assert!(
+                    std::path::Path::new(&expanded).is_absolute(),
+                    "{dir} expands to the relative path {expanded}"
+                );
+            }
+        }
+    }
+
+    /// File names are names, not paths: a separator in the table would make
+    /// the directory list meaningless for that entry (and, with `..`, let it
+    /// point anywhere).
+    #[test]
+    fn every_fallback_names_a_bare_file() {
+        for f in SCRIPT_FALLBACKS
+            .iter()
+            .map(|f| f.files)
+            .chain([UI_FONT_FILES])
+        {
+            for file in f {
+                assert!(
+                    !file.contains('/') && !file.contains('\\'),
+                    "{file} is a path, not a file name"
+                );
+            }
+        }
     }
 
     /// An out-of-range face index would make epaint read past the collection.
@@ -1238,10 +1727,13 @@ mod tests {
             "a fallback file is missing or unparsable on this machine"
         );
 
-        for &(glyph, cp) in TUI_SYMBOLS {
+        // U+23FA is excluded: it comes from the bundled Noto Emoji on every
+        // platform (see `REQUIRED_COVERAGE`), and STIX Two Math happens to
+        // carry it here as well. Everything else has to come off the disk.
+        for &cp in TUI_SYMBOLS.iter().filter(|&&cp| cp != 0x23FA) {
             assert!(
                 loaded.iter().any(|(f, bytes)| covers(bytes, f.index, cp)),
-                "{glyph} (U+{cp:04X}) is not in any fallback — it will render as tofu"
+                "U+{cp:04X} is not in any fallback — it will render as tofu"
             );
         }
     }
@@ -1283,7 +1775,10 @@ mod tests {
             (advance - cell) / 2.0
         };
 
-        let worst = HEBREW_LETTERS.map(&spill).fold(f32::NEG_INFINITY, f32::max);
+        let worst = HEBREW_LETTERS
+            .iter()
+            .map(|&cp| spill(cp))
+            .fold(f32::NEG_INFINITY, f32::max);
         assert!(
             worst <= MAX_SPILL_EM,
             "a Hebrew letter hangs {worst:.3} em out of its {cell:.3} em cell"
@@ -1294,7 +1789,10 @@ mod tests {
         // bar is a hairline rather than zero. More than two means the face or
         // the cell derivation changed and the trade-off wants re-deciding.
         let hairline = 0.005; // ≈ 0.07 px at the default 14 pt.
-        let over = HEBREW_LETTERS.filter(|&cp| spill(cp) > hairline).count();
+        let over = HEBREW_LETTERS
+            .iter()
+            .filter(|&&cp| spill(cp) > hairline)
+            .count();
         assert!(over <= 2, "{over} Hebrew letters visibly overflow the cell");
     }
 
@@ -1312,7 +1810,8 @@ mod tests {
         assert_eq!(tweak.scale, 1.0, "the Hebrew face grew a scale tweak");
 
         let widest = HEBREW_LETTERS
-            .map(|cp| advance_em(&bytes, 0, cp).expect("Hebrew letter missing"))
+            .iter()
+            .map(|&cp| advance_em(&bytes, 0, cp).expect("Hebrew letter missing"))
             .fold(f32::NEG_INFINITY, f32::max);
         let to_fit = cell / widest;
         assert!(to_fit < 1.0, "nothing overflows — the trade-off is gone");
@@ -1424,7 +1923,7 @@ mod tests {
         let mut fonts = egui::FontDefinitions::default();
         install_ui_family(&mut fonts);
 
-        assert!(has_real_ui_medium(), "{SF_PRO_PATH} did not load");
+        assert!(has_real_ui_medium(), "{SF_PRO_FILE} did not load");
         assert_eq!(
             fonts.families[&egui::FontFamily::Name(UI_FAMILY.into())][0],
             "SF Pro"
@@ -1438,5 +1937,332 @@ mod tests {
         assert_eq!(weight("SF Pro"), SF_WGHT_REGULAR);
         assert_eq!(weight("SF Pro Medium"), SF_WGHT_MEDIUM);
         assert!(weight("SF Pro Medium") > weight("SF Pro"));
+    }
+
+    // ------------------------------------------------------------------
+    // The coverage warning
+    // ------------------------------------------------------------------
+
+    /// The warning has to be computed from the *family*, not from the table,
+    /// and it has to name something the user can act on. Runs everywhere: the
+    /// inputs are the bundled faces, so it needs no system font at all — which
+    /// also means the Windows and Linux CI runners exercise it.
+    #[test]
+    fn the_coverage_warning_names_what_the_family_cannot_draw() {
+        use std::sync::Arc;
+
+        let mut fonts = egui::FontDefinitions::empty();
+        fonts.font_data.insert(
+            "JetBrains Mono".to_owned(),
+            Arc::new(egui::FontData::from_static(JETBRAINS_MONO_REGULAR)),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Monospace,
+            vec!["JetBrains Mono".to_owned()],
+        );
+
+        let missing = |fonts: &egui::FontDefinitions, what| -> Vec<u32> {
+            missing_coverage(fonts, &egui::FontFamily::Monospace)
+                .into_iter()
+                .find(|(req, _)| req.what == what)
+                .map(|(_, cps)| cps)
+                .unwrap_or_default()
+        };
+
+        assert_eq!(missing(&fonts, "Hebrew"), HEBREW_LETTERS, "all 27 are gone");
+        // The negative control: JetBrains Mono *does* have `❯`, so a report
+        // that listed it would be reading the table rather than the family.
+        let symbols = missing(&fonts, "the TUI symbol set");
+        assert!(!symbols.contains(&0x276F), "{symbols:04X?}");
+        assert!(symbols.contains(&0x23BF), "{symbols:04X?}");
+        assert_eq!(symbols.len(), TUI_SYMBOLS.len() - 1);
+
+        // The wording: a script the user recognises, some codepoints, what
+        // goes wrong and what to do about it.
+        let all = uncovered(&fonts, &egui::FontFamily::Monospace).join("\n");
+        assert!(all.contains("Hebrew"), "{all}");
+        assert!(all.contains("U+05D0"), "{all}");
+        assert!(all.contains("empty boxes"), "{all}");
+        assert!(all.contains(HEBREW_FIX), "the warning says nothing to do");
+        assert!(all.contains(SYMBOL_FIX), "the warning says nothing to do");
+        // 27 Hebrew letters, of which only MAX_LISTED are spelled out.
+        assert!(
+            all.contains(&format!("and {} more", 27 - MAX_LISTED)),
+            "{all}"
+        );
+
+        // Adding a face that covers part of the gap must shrink the report:
+        // the bundled emoji is where U+23FA comes from on every platform.
+        install_emoji(&mut fonts);
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .expect("no monospace family")
+            .push(EMOJI_FACE.to_owned());
+        let symbols = missing(&fonts, "the TUI symbol set");
+        assert!(
+            !symbols.contains(&0x23FA),
+            "the emoji face was not credited"
+        );
+        assert!(
+            !symbols.contains(&0x2733),
+            "the emoji face was not credited"
+        );
+        assert!(symbols.contains(&0x23BF), "{symbols:04X?}");
+        assert_eq!(missing(&fonts, "Hebrew"), HEBREW_LETTERS, "still no Hebrew");
+
+        // A family with nothing in it, and a family that does not exist at
+        // all, must both degrade rather than panic during startup.
+        fonts
+            .families
+            .insert(egui::FontFamily::Monospace, Vec::new());
+        assert_eq!(
+            uncovered(&fonts, &egui::FontFamily::Monospace).len(),
+            REQUIRED_COVERAGE.len()
+        );
+        assert!(uncovered(&fonts, &egui::FontFamily::Name("nope".into())).is_empty());
+    }
+
+    /// Every codepoint the warning is about has to be one the terminal can
+    /// actually be asked to draw, and the two lists must not drift apart from
+    /// the tables they justify.
+    #[test]
+    fn the_required_coverage_lists_are_the_ones_the_tables_are_for() {
+        assert_eq!(HEBREW_LETTERS.len(), 27, "the Hebrew alphabet plus finals");
+        assert_eq!(*HEBREW_LETTERS.first().expect("empty"), 0x05D0);
+        assert_eq!(*HEBREW_LETTERS.last().expect("empty"), 0x05EA);
+        for cp in HEBREW_LETTERS.iter().chain(TUI_SYMBOLS) {
+            assert!(char::from_u32(*cp).is_some(), "U+{cp:04X} is not a char");
+        }
+        for req in REQUIRED_COVERAGE {
+            assert!(!req.codepoints.is_empty(), "{} checks nothing", req.what);
+            assert!(!req.fix.is_empty(), "{} suggests nothing", req.what);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // macOS
+    // ------------------------------------------------------------------
+
+    /// The whole point, on the platform whose table is measured: after
+    /// `install` has assembled the families, nothing terra needs is missing.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_families_can_draw_everything_required() {
+        let warnings = uncovered(&assembled_families(), &egui::FontFamily::Monospace);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // Windows
+    // ------------------------------------------------------------------
+
+    /// `%SystemRoot%\Fonts` has to resolve to a real directory, or every
+    /// Windows entry in the table is unreachable and the rest of these tests
+    /// would "pass" by finding nothing.
+    ///
+    /// This is also the check that the C: assumption is gone: it asserts the
+    /// directory the code will actually search, not a literal path.
+    #[test]
+    #[cfg(windows)]
+    fn windows_resolves_the_system_font_directory_without_assuming_a_drive() {
+        let system = expand(r"${SystemRoot}\Fonts").expect("%SystemRoot% is not set");
+        assert!(
+            std::path::Path::new(&system).is_dir(),
+            "{system} is not a directory"
+        );
+        assert!(
+            FONT_DIRS.iter().all(|dir| !dir.contains(':')),
+            "a Windows font directory still hardcodes a drive letter"
+        );
+        // The per-user directory need not exist (it is created on first
+        // per-user font install), but the variable behind it always is.
+        assert!(
+            std::env::var("LOCALAPPDATA").is_ok(),
+            "%LOCALAPPDATA% is not set — per-user fonts are unreachable"
+        );
+    }
+
+    /// The faces Microsoft documents as always installed on Windows 10 and 11
+    /// must actually be found. If this fails on a real Windows machine the
+    /// table is wrong, which is precisely what could not be checked before.
+    #[test]
+    #[cfg(windows)]
+    fn windows_ships_the_faces_the_table_claims_are_always_installed() {
+        let installed = installed_fallbacks();
+        for name in ["Segoe UI", "Segoe UI Symbol", "Tahoma", "Arial"] {
+            assert!(
+                installed.contains(&name),
+                "{name} is documented as shipping with Windows but was not found; \
+                 searched {FONT_DIRS:?}"
+            );
+        }
+        // Cascadia Mono is deliberately not asserted: it is delivered inside
+        // the Windows Terminal package rather than into the fonts directory,
+        // so its absence is expected and only its presence is a bonus.
+    }
+
+    /// Hebrew and the TUI symbols must both be reachable from the assembled
+    /// families. The per-codepoint coverage of Segoe UI Symbol is the one
+    /// claim in the Windows table that rests on third-party data; this is
+    /// where it is finally checked against the installed files.
+    #[test]
+    #[cfg(windows)]
+    fn windows_fallbacks_cover_the_scripts_the_grid_needs() {
+        let warnings = uncovered(&assembled_families(), &egui::FontFamily::Monospace);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // And name the source of each, so a failure says which face to go and
+        // look at rather than only that something is missing.
+        let loaded: Vec<(&ScriptFallback, Vec<u8>)> = SCRIPT_FALLBACKS
+            .iter()
+            .filter_map(|f| Some((f, read_fallback(f)?)))
+            .collect();
+        for &cp in HEBREW_LETTERS {
+            assert!(
+                loaded.iter().any(|(f, bytes)| covers(bytes, f.index, cp)),
+                "U+{cp:04X} is in no Windows fallback — Segoe UI should have it"
+            );
+        }
+    }
+
+    /// Same baseline correction the macOS faces get, checked against whatever
+    /// this machine actually has: a Windows fallback is just as proportional
+    /// as Arial Hebrew and just as badly centred without it.
+    #[test]
+    #[cfg(windows)]
+    fn windows_script_fallbacks_are_pulled_onto_the_jetbrains_mono_baseline() {
+        let (grid_ascent, grid_row_height) =
+            vertical_metrics(JETBRAINS_MONO_REGULAR, 0).expect("unreadable JetBrains Mono");
+
+        let mut fonts = egui::FontDefinitions::default();
+        let installed = install_script_fallbacks(&mut fonts);
+        assert!(!installed.is_empty(), "no Windows fallback loaded at all");
+
+        for f in SCRIPT_FALLBACKS {
+            let Some(bytes) = read_fallback(f) else {
+                continue; // not installed here; that is the silent-skip path
+            };
+            let (ascent, row_height) = vertical_metrics(&bytes, f.index).expect("unreadable face");
+            let shift = fonts.font_data[f.name].tweak.y_offset_factor;
+            let baseline = ascent + 0.5 * (grid_row_height - row_height) + shift;
+            assert!(
+                (baseline - grid_ascent).abs() < 1e-4,
+                "{} lands at {baseline:.4} em, not {grid_ascent:.4}",
+                f.name
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Linux
+    // ------------------------------------------------------------------
+
+    /// Nothing on Linux is guaranteed installed — a plain `ubuntu:24.04` image
+    /// and the GitHub Actions runners both ship essentially no fonts — so this
+    /// asserts one of two things depending on what is there:
+    ///
+    /// * with the Noto packages installed, the families cover everything;
+    /// * without them, the *warning* covers everything: it must fire, and it
+    ///   must name the packages to install rather than leaving the user with
+    ///   unexplained boxes.
+    ///
+    /// Both branches assert; neither is a silent skip.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn linux_either_covers_the_scripts_or_says_how_to() {
+        let installed = installed_fallbacks();
+        let warnings = uncovered(&assembled_families(), &egui::FontFamily::Monospace);
+
+        // `fonts-noto-core` (Debian/Ubuntu), `noto-fonts` (Arch) or the three
+        // `google-noto-*` packages (Fedora) supply exactly these.
+        let noto = [
+            "Noto Sans Hebrew",
+            "Noto Sans Symbols",
+            "Noto Sans Symbols 2",
+        ];
+        if noto.iter().all(|n| installed.contains(n)) {
+            assert!(
+                warnings.is_empty(),
+                "the Noto faces are installed but something is still uncovered: {warnings:?}"
+            );
+            return;
+        }
+
+        if warnings.is_empty() {
+            // Some other combination (DejaVu plus Unifont, say) covered it.
+            // Nothing to complain about, but prove it was really checked.
+            assert!(
+                !installed.is_empty(),
+                "nothing is installed yet nothing is missing — the check is inert"
+            );
+            return;
+        }
+
+        let all = warnings.join("\n");
+        for package in ["fonts-noto-core", "google-noto", "noto-fonts"] {
+            assert!(
+                all.contains(package),
+                "the warning does not tell the user to install {package}: {all}"
+            );
+        }
+        assert!(
+            all.contains("empty boxes"),
+            "the warning does not say what will go wrong: {all}"
+        );
+    }
+
+    /// Whatever *is* installed has to be usable: parsed at the claimed face
+    /// index and pulled onto the grid baseline. On a machine with no fonts
+    /// this asserts nothing about faces, which is why the coverage test above
+    /// asserts about the warning instead.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn linux_script_fallbacks_are_pulled_onto_the_jetbrains_mono_baseline() {
+        let (grid_ascent, grid_row_height) =
+            vertical_metrics(JETBRAINS_MONO_REGULAR, 0).expect("unreadable JetBrains Mono");
+
+        let mut fonts = egui::FontDefinitions::default();
+        install_script_fallbacks(&mut fonts);
+
+        for f in SCRIPT_FALLBACKS {
+            let Some(bytes) = read_fallback(f) else {
+                continue; // not installed on this distribution
+            };
+            let (ascent, row_height) = vertical_metrics(&bytes, f.index).expect("unreadable face");
+            let shift = fonts.font_data[f.name].tweak.y_offset_factor;
+            let baseline = ascent + 0.5 * (grid_row_height - row_height) + shift;
+            assert!(
+                (baseline - grid_ascent).abs() < 1e-4,
+                "{} lands at {baseline:.4} em, not {grid_ascent:.4}",
+                f.name
+            );
+        }
+    }
+
+    /// The Hebrew face must never be one with no Hebrew in it. DejaVu Sans
+    /// Mono is in the table for its dingbats and has **zero** Hebrew
+    /// codepoints, so if it ever moved ahead of the Hebrew faces the script
+    /// would keep rendering — as tofu from a face that claimed nothing.
+    ///
+    /// Checked as an ordering property of the table, so it holds on a runner
+    /// with no fonts installed too.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn linux_leads_with_a_face_that_actually_has_hebrew() {
+        let at = |name| SCRIPT_FALLBACKS.iter().position(|f| f.name == name);
+        assert!(
+            at("Noto Sans Hebrew") < at("DejaVu Sans Mono"),
+            "the Hebrew face must precede the monospace symbol face"
+        );
+        assert!(
+            at("Noto Sans Hebrew") < at("DejaVu Sans"),
+            "the dedicated Hebrew face must win over the generalist"
+        );
+        assert_eq!(
+            SCRIPT_FALLBACKS.last().map(|f| f.name),
+            Some("Unifont"),
+            "Unifont is the last resort and must stay last"
+        );
     }
 }

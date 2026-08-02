@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
@@ -24,6 +24,15 @@ alacritty_terminal = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+
+# Cross-platform local sockets: Unix domain sockets on Unix, named pipes on
+# Windows, behind one synchronous API (crates/terra-protocol). Pinned exactly:
+# it is a single-maintainer crate and the transport is the CLI's only way in.
+# 2.4.3's diff against the 2-million-download 2.4.2 is doc comments plus one
+# `&self.details` -> `self.details`, so it is that release's field exposure with
+# 2.4.1's fix for the crash on reading a disconnected Windows pipe. The `tokio`
+# feature is deliberately left off — terra has no async runtime.
+interprocess = "=2.4.3"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"

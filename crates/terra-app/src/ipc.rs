@@ -1,6 +1,6 @@
-//! Unix-socket control server.
+//! Local-socket control server.
 //!
-//! A background thread accepts connections on [`terra_protocol::socket_path`]
+//! A background thread accepts connections on [`terra_protocol::socket_address`]
 //! and reads newline-delimited JSON [`Request`]s. Each connection thread runs
 //! the request itself, against the [`TabManager`] shared with the UI thread
 //! behind a `Mutex`, and writes the [`Response`] back as a single JSON line.
@@ -13,74 +13,108 @@
 //!
 //! # Portability
 //!
-//! Only the *listener* is Unix-specific. [`start`] is `cfg`-gated the way
-//! `macos.rs` gates AppKit: a real implementation on `cfg(unix)`, and a
-//! fallback elsewhere that returns an error the existing call site already
-//! logs, so the app runs with no control socket rather than not compiling.
-//! [`execute`] — the actual protocol — is portable and still type-checks on
-//! every platform, so only the ~40 lines that own a socket are Unix-shaped.
-//! See `terra_protocol`'s module docs for why there is no Windows transport yet.
+//! One code path everywhere. `interprocess`'s local sockets are Unix domain
+//! sockets on Unix and named pipes on Windows; which of the two a
+//! [`terra_protocol::Address`] denotes is decided once, in `terra-protocol`.
+//! Nothing here is `cfg`-gated except two things that genuinely have no
+//! cross-platform spelling: [`harden`], which is `chmod 0700` on Unix and a
+//! comment about pipe DACLs on Windows, and [`InstanceLock`], which is a named
+//! kernel mutex on Windows and a no-op elsewhere.
+//!
+//! # Access control
+//!
+//! *Unix* — the socket lives in `~/.terra`, which is created `0700`. Connect
+//! permission on a Unix domain socket is the filesystem's, so no other user can
+//! reach it.
+//!
+//! *Windows* — a named pipe has no filesystem presence, so there is no
+//! directory mode to set; the equivalent is the pipe's DACL. terra creates the
+//! pipe with the default one, which (per `CreateNamedPipe`) grants full control
+//! to the creator, `LocalSystem` and administrators, and **read** access to
+//! `Everyone` and anonymous. Driving a terminal requires *writing* a request
+//! line, and write access is exactly what other users do not have, so the
+//! "any local user can drive the terminal" hazard is already closed. What the
+//! default does leave open is a same-machine nuisance: another user can open
+//! the pipe read-only and occupy an instance. Closing that too means handing
+//! `interprocess`'s `ListenerOptionsExt::security_descriptor` a DACL naming
+//! this user's SID — a change confined to [`bind`], and one that should be made
+//! by someone who can actually run it on Windows, since an SD that is wrong in
+//! either direction breaks the transport outright.
 
-#[cfg(unix)]
-use std::fs;
-#[cfg(unix)]
-use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::io::{BufRead, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use terra_protocol::{Request, Response};
+use interprocess::local_socket::{traits::ListenerExt as _, ListenerOptions, Stream};
+use terra_protocol::{Address, Request, Response};
 
 use crate::config::BidiMode;
 use crate::tabs::TabManager;
 
-/// Owns the listening socket path; unlinks it on drop (best effort).
+/// Owns the listening address; unlinks the socket file on drop (best effort,
+/// and a no-op for a named pipe, which the kernel reaps with the process).
 pub struct IpcServer {
-    socket_path: PathBuf,
+    address: Address,
+    /// Held for the process's lifetime so a second terra keeps seeing us.
+    #[allow(dead_code)]
+    lock: InstanceLock,
 }
 
 impl IpcServer {
-    pub fn socket_path(&self) -> &PathBuf {
-        &self.socket_path
+    /// The address as a printable path — `main.rs` logs it at startup.
+    pub fn socket_path(&self) -> std::path::PathBuf {
+        self.address.display()
     }
 }
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(file) = self.address.file() {
+            let _ = std::fs::remove_file(file);
+        }
     }
 }
 
 /// Take the tab lock, ignoring poisoning: a panic on one thread must not brick
 /// the other half of the app (the UI locks the same way, see `main.rs`).
-#[cfg_attr(not(unix), allow(dead_code))]
 fn lock(tabs: &Mutex<TabManager>) -> MutexGuard<'_, TabManager> {
     tabs.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 /// Bind the socket and spawn the accept loop.
-#[cfg(unix)]
+///
+/// Also the single-instance gate: if another terra of a wire-compatible version
+/// already owns the address, this focuses *that* one and exits the process
+/// rather than opening a rival app. See [`hand_over`].
 pub fn start(ctx: egui::Context, tabs: Arc<Mutex<TabManager>>) -> anyhow::Result<IpcServer> {
-    let socket_path = terra_protocol::socket_path();
+    let address = terra_protocol::socket_address();
 
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    // Windows: an atomic, kernel-owned claim, taken before we touch the pipe.
+    // "Does the address already exist?" is not atomic and, for a socket file,
+    // not even truthful — see the stale-socket dance in `bind`.
+    let Some(lock) = InstanceLock::acquire() else {
+        hand_over(&address, "another terra is already running");
+    };
+
+    if let Some(parent) = address.file().and_then(Path::parent) {
+        std::fs::create_dir_all(parent)?;
+        harden(parent);
     }
-    // A socket left behind by a crashed instance would make bind() fail.
-    let _ = fs::remove_file(&socket_path);
 
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = bind(&address)?;
 
     std::thread::Builder::new()
         .name("terra-ipc".into())
         .spawn(move || {
+            // A named pipe hands back an error for a client that connected and
+            // left before `accept` reached it, and that must not take the whole
+            // server down with it — but a listener that errors every time would
+            // spin, so give up after a run of failures with nothing in between.
+            let mut failures = 0u32;
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
+                        failures = 0;
                         let tabs = Arc::clone(&tabs);
                         let ctx = ctx.clone();
                         let spawned = std::thread::Builder::new()
@@ -92,28 +126,184 @@ pub fn start(ctx: egui::Context, tabs: Arc<Mutex<TabManager>>) -> anyhow::Result
                     }
                     Err(err) => {
                         log::warn!("terra ipc: accept failed: {err}");
-                        break;
+                        failures += 1;
+                        if failures >= 16 {
+                            log::error!("terra ipc: giving up on the listener");
+                            break;
+                        }
                     }
                 }
             }
         })?;
 
-    Ok(IpcServer { socket_path })
+    Ok(IpcServer { address, lock })
 }
 
-/// No listener on this platform: the app still starts, `terra ls` just has
-/// nothing to talk to. The call site in `main.rs` logs this and carries on.
-#[cfg(not(unix))]
-pub fn start(_ctx: egui::Context, _tabs: Arc<Mutex<TabManager>>) -> anyhow::Result<IpcServer> {
-    anyhow::bail!(terra_protocol::UNSUPPORTED_TRANSPORT)
-}
-
-#[cfg(unix)]
-fn serve(stream: UnixStream, tabs: &Mutex<TabManager>, ctx: &egui::Context) {
-    let Ok(mut out) = stream.try_clone() else {
-        return;
+/// Create the listener, resolving the one thing a Unix socket gets wrong on its
+/// own: a socket file left behind by a crashed instance makes `bind` fail with
+/// `AddrInUse` forever.
+///
+/// The old code unlinked it unconditionally, which also let a second terra
+/// silently steal the socket from a *running* first one. Instead the address is
+/// probed first: if something answers, there is a live terra and we hand over to
+/// it; only a socket nobody is listening on is removed. (`interprocess` offers
+/// `ListenerOptions::try_overwrite` for this, but it is the unconditional
+/// version — it displaces a live listener too.)
+///
+/// Windows never reaches the retry: a named pipe cannot go stale, and a name
+/// that is already taken fails with `PermissionDenied`, not `AddrInUse`. There
+/// the `InstanceLock` is what catches the second instance.
+fn bind(address: &Address) -> anyhow::Result<interprocess::local_socket::Listener> {
+    let create = || {
+        ListenerOptions::new()
+            .name(address.to_name()?)
+            .create_sync()
+            .map_err(anyhow::Error::from)
     };
-    let reader = BufReader::new(stream);
+
+    match create() {
+        Ok(listener) => Ok(listener),
+        Err(err) if is_addr_in_use(&err) => {
+            if terra_protocol::request_at(address, &Request::List).is_ok() {
+                hand_over(address, "another terra is already listening on this socket");
+            }
+            if let Some(file) = address.file() {
+                log::info!("terra ipc: removing a stale socket at {}", file.display());
+                let _ = std::fs::remove_file(file);
+            }
+            create()
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn is_addr_in_use(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|err| err.kind() == std::io::ErrorKind::AddrInUse)
+}
+
+/// Second instance: bring the running one forward and get out of the way.
+///
+/// The handover rides the transport that already exists rather than a
+/// platform-specific side channel (the Tauri plugin's `WM_COPYDATA` is one-way
+/// and window-bound, which is the wrong shape for a request/response CLI). A
+/// `Select` on the running instance's active tab is precisely "focus yourself":
+/// `dispatch` already answers it with `activate_app()` plus a viewport `Focus`.
+///
+/// Handing over rather than refusing is the behaviour a GUI expects — clicking
+/// the dock icon twice should not open a second terminal, and should not print
+/// an error either.
+///
+/// What actually raises the window is platform-dependent, and only macOS is
+/// covered end to end: `crate::macos::activate_app` is a real
+/// `NSRunningApplication` activation there and an empty function elsewhere. On
+/// Windows and X11 the `ViewportCommand::Focus` that follows it is winit's
+/// `SetForegroundWindow`/`_NET_ACTIVE_WINDOW`, which usually works but is
+/// subject to the foreground lock; on Wayland, compositors refuse
+/// self-activation outright and the window will not come forward. That is a gap
+/// to fix in `macos.rs`'s counterparts, not something to fake here.
+fn hand_over(address: &Address, why: &str) -> ! {
+    log::info!("terra: {why}; focusing it instead of starting a second app");
+    match terra_protocol::request_at(address, &Request::List) {
+        Ok(Response::Ok {
+            tabs: Some(tabs), ..
+        }) => {
+            if let Some(active) = tabs.iter().find(|tab| tab.active).or_else(|| tabs.first()) {
+                let _ = terra_protocol::request_at(address, &Request::Select { tab: active.id });
+            }
+        }
+        Ok(_) => {}
+        Err(err) => log::warn!("terra: could not reach the running instance: {err:#}"),
+    }
+    std::process::exit(0)
+}
+
+/// Restrict the socket's directory to this user.
+///
+/// Unix only in the literal sense: a named pipe has no containing directory, so
+/// on Windows the equivalent protection is the pipe's DACL and lives in [`bind`]
+/// (see the module docs).
+#[cfg(unix)]
+fn harden(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn harden(_dir: &Path) {}
+
+/// A process-wide claim on "the running terra of this version".
+struct InstanceLock {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl InstanceLock {
+    /// `Some` if this process is the first instance, `None` if another one
+    /// already holds the claim.
+    ///
+    /// Windows: a named kernel mutex, following the Tauri single-instance
+    /// plugin. `CreateMutexW` either creates the object or reports
+    /// `ERROR_ALREADY_EXISTS` in one atomic step, and the kernel destroys it
+    /// when the last handle closes — including when the process is killed — so
+    /// unlike a socket file it cannot go stale. The name is scoped to the login
+    /// session (`Local\`) and to the wire-compatible version range, so two
+    /// sessions and two installed builds each get their own.
+    ///
+    /// Elsewhere the claim is the socket itself: binding a Unix domain socket
+    /// is atomic, and [`bind`] distinguishes a live listener from a socket file
+    /// left behind by a crash. A second mechanism would only add a second thing
+    /// that can disagree.
+    #[cfg(windows)]
+    fn acquire() -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+
+        let name: Vec<u16> = format!(
+            r"Local\terra-single-instance-{}",
+            terra_protocol::instance_tag()
+        )
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+        // Not taking ownership (`bInitialOwner = FALSE`): only the *existence*
+        // of the named object is the signal, and an unowned mutex cannot be
+        // abandoned.
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            // We cannot tell whether anyone else is running; starting is the
+            // less destructive of the two guesses.
+            log::warn!("terra: single-instance mutex unavailable; not checking for a second app");
+            return Some(Self { handle });
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(handle) };
+            return None;
+        }
+        Some(Self { handle })
+    }
+
+    #[cfg(not(windows))]
+    fn acquire() -> Option<Self> {
+        Some(Self {})
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+        }
+    }
+}
+
+fn serve(stream: Stream, tabs: &Mutex<TabManager>, ctx: &egui::Context) {
+    // `&Stream` implements both `Read` and `Write`, so the two halves come from
+    // one borrow — no `try_clone`, which named pipes have no equivalent of.
+    let mut out = &stream;
+    let reader = std::io::BufReader::new(&stream);
 
     for line in reader.lines() {
         let line = match line {
@@ -144,7 +334,6 @@ fn serve(stream: UnixStream, tabs: &Mutex<TabManager>, ctx: &egui::Context) {
 
 /// Run one request against the shared tabs and apply its side effects on the
 /// window.
-#[cfg_attr(not(unix), allow(dead_code))]
 fn dispatch(request: Request, tabs: &Mutex<TabManager>, ctx: &egui::Context) -> Response {
     // Key notation is driven here rather than in `execute` because `{Delay N}`
     // has to wait *without* the tabs mutex held — `execute` runs under it, and
@@ -195,7 +384,6 @@ fn dispatch(request: Request, tabs: &Mutex<TabManager>, ctx: &egui::Context) -> 
 /// re-looked-up each time as a consequence — if it exits mid-sequence the
 /// remaining chunks are dropped and the client is told, rather than the write
 /// silently going nowhere.
-#[cfg_attr(not(unix), allow(dead_code))]
 fn send_keys(
     tabs: &Mutex<TabManager>,
     ctx: &egui::Context,
@@ -234,7 +422,6 @@ fn send_keys(
 }
 
 /// The whole protocol, in terms of [`TabManager`].
-#[cfg_attr(not(unix), allow(dead_code))]
 fn execute(tabs: &mut TabManager, request: Request) -> Response {
     let no_tab = |id: u64| Response::err(format!("no such tab: {id}"));
 
@@ -256,7 +443,9 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
             }
         }
         // `keys: true` is intercepted in `dispatch`; this is the literal path.
-        Request::Send { tab, text, enter, .. } => {
+        Request::Send {
+            tab, text, enter, ..
+        } => {
             if tabs.send(tab, &text, enter) {
                 Response::ok()
             } else {
@@ -303,9 +492,7 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
             };
             match parsed {
                 // Setting.
-                Some(m) if tabs.set_bidi(tab, Some(m)) => {
-                    Response::ok_text(m.name().to_string())
-                }
+                Some(m) if tabs.set_bidi(tab, Some(m)) => Response::ok_text(m.name().to_string()),
                 Some(_) => no_tab(tab),
                 // Querying: report the tab's own override, or the fact that
                 // it is following the config.
@@ -323,5 +510,61 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
                 no_tab(tab)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use interprocess::local_socket::traits::Listener as _;
+
+    /// The stale-socket path is the one piece of `bind` that is exercisable
+    /// without a GUI: a socket file with nothing behind it must be removed and
+    /// the bind must then succeed, and a *live* listener on the same address
+    /// must not be displaced.
+    #[test]
+    fn a_socket_file_with_nothing_behind_it_is_reclaimed() {
+        let dir = std::env::temp_dir().join(format!("terra-ipc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("terra.sock");
+
+        // A regular file standing where the socket goes is exactly what a
+        // crashed instance leaves behind, as far as `bind` can tell.
+        let address = Address::Path(path.clone());
+        let first = bind(&address).expect("binding a fresh address");
+        drop(first);
+        assert!(!path.exists(), "the listener reclaims its own name on drop");
+
+        // Bind, then abandon the file without unbinding, the way SIGKILL does.
+        {
+            let listener = bind(&address).expect("binding again");
+            let mut listener = listener;
+            listener.do_not_reclaim_name_on_drop();
+        }
+        assert!(path.exists(), "the socket file outlives a crashed instance");
+        let reclaimed = bind(&address);
+        assert!(
+            reclaimed.is_ok(),
+            "a stale socket must not be fatal: {reclaimed:?}"
+        );
+        drop(reclaimed);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `harden` is a no-op off Unix; where it does something, it must leave the
+    /// directory readable by nobody else.
+    #[test]
+    fn the_socket_directory_is_private_to_this_user() {
+        let dir = std::env::temp_dir().join(format!("terra-perm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        harden(&dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "got {mode:o}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

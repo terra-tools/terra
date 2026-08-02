@@ -14,6 +14,7 @@ eframe = { workspace = true }
 egui_term = { workspace = true }
 alacritty_terminal = { workspace = true }
 terra-protocol = { workspace = true }
+interprocess = { workspace = true }
 terra-palette = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,6 +34,20 @@ raw-window-handle = { workspace = true }
 objc2-app-kit = { workspace = true }
 objc2-foundation = { workspace = true }
 libc = { workspace = true }
+
+# ToolHelp32, to find the program running in a tab (see
+# crates/terra-app/src/procinfo.rs) — the Windows counterpart of the `libc`
+# dependency above. Already in the tree at this version via alacritty_terminal's
+# ConPTY backend, and features are additive across the graph, so naming it here
+# adds no crate and no extra compilation. Only the two feature groups the
+# snapshot walk needs are enabled, plus Threading for the `CreateMutexW` that
+# backs single-instance detection (see src/ipc.rs).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+] }
 
 # `cargo packager -p terra-app --release` — cross-platform bundles
 # (.app/.dmg on macOS, nsis/msi on Windows, deb/appimage on Linux).

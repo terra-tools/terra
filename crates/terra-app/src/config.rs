@@ -177,8 +177,6 @@ impl BidiQuirks {
         self.entries.get(&command.to_lowercase()).copied()
     }
 
-
-
     /// Insert one entry, overriding whatever a lower layer said for that key.
     /// Per key, so a user table naming one tool keeps the shipped rest.
     fn insert(&mut self, command: &str, mode: BidiMode) {
@@ -208,23 +206,15 @@ pub fn should_reorder(cfg: &Config, command: Option<&str>) -> bool {
     should_reorder_mode(cfg.text.bidi, &cfg.text.quirks, command)
 }
 
-pub fn should_reorder_mode(
-    mode: BidiMode,
-    quirks: &BidiQuirks,
-    command: Option<&str>,
-) -> bool {
+pub fn should_reorder_mode(mode: BidiMode, quirks: &BidiQuirks, command: Option<&str>) -> bool {
     match mode {
         BidiMode::Off => false,
         BidiMode::On => true,
         // A quirk that itself says `auto` carries no opinion, same as a
         // missing entry: fall through to the default rather than recursing.
-        BidiMode::Auto => matches!(
-            command.and_then(|c| quirks.get(c)),
-            Some(BidiMode::On)
-        ),
+        BidiMode::Auto => matches!(command.and_then(|c| quirks.get(c)), Some(BidiMode::On)),
     }
 }
-
 
 /// Below this the terminal is unreadable; above it a cell no longer fits.
 const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);

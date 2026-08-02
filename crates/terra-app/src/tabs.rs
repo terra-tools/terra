@@ -16,24 +16,163 @@ use terra_protocol::TabInfo;
 
 use crate::config::BidiMode;
 
-/// Fallback when `$SHELL` is not set.
+/// Fallback when `$SHELL` is not set. Unix only — Windows never sets `SHELL`
+/// and has no `/bin`, so it takes [`WINDOWS_FALLBACK_SHELL`] instead.
 const FALLBACK_SHELL: &str = "/bin/zsh";
 
-/// Quote one argument for POSIX shells: safe single-quote wrapping.
-fn shell_quote(arg: &str) -> String {
-    if !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+,".contains(c))
-    {
-        arg.to_string()
-    } else {
-        format!("'{}'", arg.replace('\'', "'\\''"))
+/// Last resort on Windows: the one interpreter guaranteed to be on every
+/// install, including a Windows PE recovery image with nothing else in it.
+const WINDOWS_FALLBACK_SHELL: &str = "cmd.exe";
+
+/// Interactive shells to prefer on Windows, best first.
+///
+/// `pwsh.exe` is PowerShell 7: separately installed, actively developed, and
+/// the one a developer who went and installed a shell actually wants.
+/// `powershell.exe` is Windows PowerShell 5.1, shipped in the box since
+/// Windows 7 and what `alacritty_terminal`'s own ConPTY backend defaults to.
+///
+/// `%COMSPEC%` is deliberately *not* in this list even though it is always
+/// set: it names the interpreter Windows uses to run batch files, which is
+/// always `cmd.exe`, and it says nothing about what shell the user wants to
+/// type at. Consulting it first would mean nobody ever gets PowerShell. It is
+/// the fallback below instead, after both PowerShell spellings have missed.
+const WINDOWS_SHELLS: [&str; 2] = ["pwsh.exe", "powershell.exe"];
+
+/// The shell dialect a program speaks, which is what decides how an argument
+/// has to be quoted before it can be typed at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellFamily {
+    /// zsh, bash, sh, fish, nu — `'…'` with `'\''` for an embedded quote.
+    Posix,
+    /// PowerShell 5 and 7 — `'…'` with `''` for an embedded quote.
+    PowerShell,
+    /// `cmd.exe` — `"…"`, and no way at all to escape a `"` inside one.
+    Cmd,
+}
+
+/// A shell's name, normalised for matching: basename, lowercased, `.exe` gone.
+///
+/// Both separators are split on because a Windows path uses `\` while
+/// `%COMSPEC%` and anything typed by hand may use `/`, and Windows filenames
+/// are case-insensitive so `POWERSHELL.EXE` has to match too. On Unix this is
+/// exactly the old `rsplit('/')`: no `\` appears in a real shell path, and the
+/// names are already lowercase and extensionless.
+fn shell_name(shell: &str) -> String {
+    let base = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_lowercase();
+    match base.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => base,
     }
 }
 
+fn shell_family(shell: &str) -> ShellFamily {
+    match shell_name(shell).as_str() {
+        "powershell" | "pwsh" => ShellFamily::PowerShell,
+        "cmd" | "command" => ShellFamily::Cmd,
+        _ => ShellFamily::Posix,
+    }
+}
+
+/// Quote one argument so a shell of `family` sees it as a single literal word.
+///
+/// Each family gets the smallest set of characters it is safe to leave bare —
+/// PowerShell's is the tightest, because `@` (splatting), `%` (the
+/// `ForEach-Object` alias) and `,` (the array operator) are all live syntax
+/// there and only look inert. `:` stays bare despite being a scope separator,
+/// because a bare `C:\src` is the single most common argument on the platform
+/// and quoting every Windows path would be worse than the risk.
+///
+/// `cmd.exe` is the one that cannot be made fully correct: a `"` inside a
+/// quoted string has no escape the interpreter itself understands. `""` is
+/// what the C runtime's own argument parser accepts, so it is right for the
+/// overwhelmingly common case of launching an ordinary program, and wrong only
+/// for a batch file that re-parses its own command line.
+fn shell_quote_for(family: ShellFamily, arg: &str) -> String {
+    let bare = match family {
+        ShellFamily::Posix => "-_./=:@%+,",
+        ShellFamily::PowerShell => "-_./\\=:",
+        ShellFamily::Cmd => "-_./\\=:",
+    };
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || bare.contains(c))
+    {
+        return arg.to_string();
+    }
+    match family {
+        ShellFamily::Posix => format!("'{}'", arg.replace('\'', "'\\''")),
+        ShellFamily::PowerShell => format!("'{}'", arg.replace('\'', "''")),
+        ShellFamily::Cmd => format!("\"{}\"", arg.replace('"', "\"\"")),
+    }
+}
+
+/// `command` rendered as one line that `shell` will run when it is typed in.
+///
+/// PowerShell needs one thing the others do not: a quoted first word is a
+/// *string literal*, which it would simply echo back, so a program whose path
+/// had to be quoted has to be introduced with the call operator `&`. Bare
+/// first words — the normal case, `claude` or `git` — are left alone, because
+/// `& git status` and `git status` are the same command and the shorter one is
+/// what the user expects to see in their scrollback.
+fn command_line(shell: &str, command: &[String]) -> String {
+    let family = shell_family(shell);
+    let quoted: Vec<String> = command
+        .iter()
+        .map(|arg| shell_quote_for(family, arg))
+        .collect();
+    let line = quoted.join(" ");
+    match (family, quoted.first()) {
+        (ShellFamily::PowerShell, Some(first)) if first.starts_with('\'') => format!("& {line}"),
+        _ => line,
+    }
+}
+
+/// Is `program` resolvable through `%PATH%`?
+///
+/// Only ever called on Windows, and only with candidates that already carry
+/// their `.exe`, so there is no `%PATHEXT%` expansion to do. `std::env::split_paths`
+/// handles the `;` separator and the quoting Windows allows in `PATH` entries.
+fn on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+}
+
+/// Which shell a Windows tab runs.
+///
+/// Kept pure — the environment and the filesystem both arrive as closures — so
+/// the preference order can be tested on a Mac, where nothing it names exists.
+///
+/// `%SHELL%` is not consulted at all. It is not a Windows convention; when it
+/// is set it is MSYS2 or Git Bash that set it, to a POSIX path like
+/// `/usr/bin/bash` that no Win32 API can open, so honouring it would trade the
+/// old "always fails" bug for a subtler one that only fires for the developers
+/// most likely to hit it.
+fn windows_shell(var: &dyn Fn(&str) -> Option<String>, exists: &dyn Fn(&str) -> bool) -> String {
+    for candidate in WINDOWS_SHELLS {
+        if exists(candidate) {
+            return candidate.to_string();
+        }
+    }
+    var("COMSPEC")
+        .filter(|comspec| !comspec.is_empty())
+        .unwrap_or_else(|| WINDOWS_FALLBACK_SHELL.to_string())
+}
+
 fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| FALLBACK_SHELL.to_string())
+    // `cfg!` rather than `#[cfg]` so both arms are compiled — and therefore
+    // type-checked and unit-tested — on every platform.
+    if cfg!(windows) {
+        windows_shell(&|key| std::env::var(key).ok(), &on_path)
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| FALLBACK_SHELL.to_string())
+    }
 }
 
 /// Arguments that make the shell a *login* shell.
@@ -45,13 +184,19 @@ fn default_shell() -> String {
 /// enough, and a `.zshrc` that *uses* those tools then fails outright with
 /// "command not found".
 ///
-/// `-l` covers zsh, bash and sh. A shell that does not understand it is no
-/// worse off than before, because the flag is simply rejected and the user
-/// still gets a shell.
+/// `-l` covers zsh, bash and sh, and must not reach the Windows shells. It is
+/// not a flag they merely ignore: `powershell.exe` treats an unrecognised
+/// leading argument as a script to run, and `cmd.exe` takes `-l` as a stray
+/// token — both turn a working tab into an immediate error. They are matched
+/// explicitly below rather than left to the catch-all so that the exclusion is
+/// visible, and tested.
 fn login_args(shell: &str) -> Vec<String> {
-    let name = shell.rsplit('/').next().unwrap_or(shell);
-    match name {
+    match shell_name(shell).as_str() {
         "zsh" | "bash" | "sh" | "dash" | "ksh" => vec!["-l".to_string()],
+        // PowerShell reads its profile on every start, login or not, and
+        // Windows hands a GUI process the user's full environment anyway, so
+        // there is nothing here for a login flag to fix.
+        "powershell" | "pwsh" | "cmd" | "command" => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -62,7 +207,37 @@ fn login_args(shell: &str) -> Vec<String> {
 /// `/`, so without this every tab opens at the filesystem root rather than
 /// somewhere anyone wants to be.
 fn default_cwd() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    home_dir(&|key| std::env::var_os(key))
+}
+
+/// The user's home directory according to the environment.
+///
+/// Unix sets `HOME` and that is the whole story. Windows does not set it: the
+/// equivalent is `%USERPROFILE%`, with `%HOMEDRIVE%%HOMEPATH%` as the older
+/// spelling that a domain profile may still be the only one to define. `HOME`
+/// comes *last* on Windows rather than first, because when it is set there at
+/// all it is usually MSYS2 or Git Bash having set it to `/c/Users/me`, which
+/// is not a path any Win32 API can open — preferring it would send every tab
+/// to a directory that does not exist.
+///
+/// Pure, so the ordering is testable without touching the real environment.
+fn home_dir(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let get = |key: &str| var(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if !cfg!(windows) {
+        return get("HOME");
+    }
+    get("USERPROFILE")
+        .or_else(|| {
+            // Concatenated, not `join`ed: `%HOMEPATH%` starts with a separator,
+            // and joining an absolute-looking path replaces the drive instead
+            // of appending to it.
+            let drive = var("HOMEDRIVE").filter(|v| !v.is_empty())?;
+            let path = var("HOMEPATH").filter(|v| !v.is_empty())?;
+            let mut joined = drive;
+            joined.push(path);
+            Some(PathBuf::from(joined))
+        })
+        .or_else(|| get("HOME"))
 }
 
 /// The two title sources of a tab, kept apart on purpose.
@@ -246,6 +421,9 @@ impl TabManager {
         // the command line is visible, and the shell survives after it.
         let shell = default_shell();
         let args = login_args(&shell);
+        // `shell` is moved into the backend settings below, but the quoting of
+        // the typed command line depends on which shell it names.
+        let typed_into = shell.clone();
 
         let id = self.next_id;
         let mut backend = TerminalBackend::new(
@@ -266,11 +444,7 @@ impl TabManager {
         // unanswered and the program falls back to unstyled output.
         backend.set_reported_colors(crate::terminal_theme().reported_colors());
         if !command.is_empty() {
-            let typed = command
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let typed = command_line(&typed_into, command);
             backend.process_command(egui_term::BackendCommand::Write(
                 format!("{typed}\r").into_bytes(),
             ));
@@ -1016,10 +1190,244 @@ mod launch_env_tests {
         assert!(login_args("/usr/local/bin/nu").is_empty());
     }
 
+    /// `-l` is not a flag PowerShell or cmd shrug off — it turns the first tab
+    /// into an error message — so the Windows shells must never receive it.
+    #[test]
+    fn the_windows_shells_are_never_started_as_login_shells() {
+        for shell in [
+            "powershell.exe",
+            "pwsh.exe",
+            "cmd.exe",
+            r"C:\Windows\system32\cmd.exe",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            // Windows filenames are case-insensitive, so the match has to be.
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\POWERSHELL.EXE",
+        ] {
+            assert!(login_args(shell).is_empty(), "{shell}");
+        }
+    }
+
+    /// Normalisation is what lets one table cover both platforms: strip the
+    /// directory (either separator), the case, and the extension.
+    #[test]
+    fn a_shell_path_reduces_to_a_bare_lowercase_name() {
+        assert_eq!(shell_name("/bin/zsh"), "zsh");
+        assert_eq!(shell_name("zsh"), "zsh");
+        assert_eq!(shell_name(r"C:\Windows\system32\cmd.exe"), "cmd");
+        assert_eq!(shell_name("C:/Program Files/PowerShell/7/pwsh.exe"), "pwsh");
+        assert_eq!(shell_name("POWERSHELL.EXE"), "powershell");
+        // Only a trailing `.exe` is an extension; a dot elsewhere is a name.
+        assert_eq!(shell_name("/usr/bin/python3.11"), "python3.11");
+    }
+
+    /// Which dialect a shell speaks decides how its arguments are quoted.
+    #[test]
+    fn each_shell_is_matched_to_its_quoting_dialect() {
+        for shell in [
+            "/bin/zsh",
+            "/bin/bash",
+            "/usr/bin/fish",
+            "/usr/local/bin/nu",
+        ] {
+            assert_eq!(shell_family(shell), ShellFamily::Posix, "{shell}");
+        }
+        for shell in ["powershell.exe", "pwsh.exe", r"C:\pwsh\PWSH.EXE"] {
+            assert_eq!(shell_family(shell), ShellFamily::PowerShell, "{shell}");
+        }
+        assert_eq!(shell_family(r"C:\Windows\cmd.exe"), ShellFamily::Cmd);
+    }
+
+    /// Terra types the command into a real shell, so an argument that carries a
+    /// space or a quote has to survive that shell's own parser — and the three
+    /// dialects disagree about how to escape the quote character itself.
+    #[test]
+    fn an_argument_is_quoted_the_way_its_own_shell_expects() {
+        use ShellFamily::{Cmd, Posix, PowerShell};
+
+        // Ordinary words pass through untouched in every dialect.
+        for family in [Posix, PowerShell, Cmd] {
+            assert_eq!(shell_quote_for(family, "git"), "git");
+            assert_eq!(shell_quote_for(family, "--depth=1"), "--depth=1");
+        }
+
+        // A space forces quoting everywhere.
+        assert_eq!(shell_quote_for(Posix, "hello world"), "'hello world'");
+        assert_eq!(shell_quote_for(PowerShell, "hello world"), "'hello world'");
+        assert_eq!(shell_quote_for(Cmd, "hello world"), "\"hello world\"");
+
+        // The embedded quote is where they part company.
+        assert_eq!(shell_quote_for(Posix, "it's"), r"'it'\''s'");
+        assert_eq!(shell_quote_for(PowerShell, "it's"), "'it''s'");
+        assert_eq!(shell_quote_for(Cmd, "say \"hi\""), "\"say \"\"hi\"\"\"");
+
+        // Empty stays representable rather than vanishing from the line.
+        assert_eq!(shell_quote_for(Posix, ""), "''");
+        assert_eq!(shell_quote_for(Cmd, ""), "\"\"");
+
+        // PowerShell's sigils only look inert: `@` splats, `%` is an alias
+        // and `,` builds an array, so they are quoted where POSIX leaves them
+        // bare. `:` is the exception — see `shell_quote_for`.
+        assert_eq!(shell_quote_for(Posix, "a@b"), "a@b");
+        assert_eq!(shell_quote_for(PowerShell, "a@b"), "'a@b'");
+        assert_eq!(shell_quote_for(PowerShell, "50%"), "'50%'");
+        // Backslash paths must not be quoted into oblivion on Windows.
+        assert_eq!(shell_quote_for(PowerShell, r"C:\src"), r"C:\src");
+    }
+
+    /// The whole typed line, per shell.
+    #[test]
+    fn a_command_line_is_assembled_for_the_shell_that_will_read_it() {
+        let cmd: Vec<String> = ["git", "commit", "-m", "hello world"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            command_line("/bin/zsh", &cmd),
+            "git commit -m 'hello world'"
+        );
+        assert_eq!(
+            command_line("pwsh.exe", &cmd),
+            "git commit -m 'hello world'"
+        );
+        assert_eq!(
+            command_line("cmd.exe", &cmd),
+            "git commit -m \"hello world\""
+        );
+    }
+
+    /// A quoted first word is a *string literal* to PowerShell — it would echo
+    /// the path instead of running it — so the call operator has to lead.
+    #[test]
+    fn powershell_gets_the_call_operator_when_the_program_needs_quoting() {
+        let spaced = vec![
+            r"C:\Program Files\tool\run.exe".to_string(),
+            "-v".to_string(),
+        ];
+        assert_eq!(
+            command_line("pwsh.exe", &spaced),
+            r"& 'C:\Program Files\tool\run.exe' -v"
+        );
+        // A bare program name is left alone: `& git` and `git` are the same
+        // command, and the shorter one is what belongs in the scrollback.
+        let bare = vec!["git".to_string(), "status".to_string()];
+        assert_eq!(command_line("pwsh.exe", &bare), "git status");
+        // No other shell has the operator, so no other shell gets it.
+        assert_eq!(
+            command_line("/bin/zsh", &spaced),
+            r"'C:\Program Files\tool\run.exe' -v"
+        );
+    }
+
+    /// PowerShell first because it is the shell people want, `%COMSPEC%` last
+    /// because it always exists and always says `cmd.exe` regardless of what
+    /// the user would have chosen.
+    #[test]
+    fn the_windows_shell_prefers_powershell_and_falls_back_to_comspec() {
+        let comspec = |key: &str| match key {
+            "COMSPEC" => Some(r"C:\Windows\system32\cmd.exe".to_string()),
+            _ => None,
+        };
+        let nothing = |_: &str| None;
+
+        // Both PowerShells present: the newer one wins.
+        let all = |_: &str| true;
+        assert_eq!(windows_shell(&comspec, &all), "pwsh.exe");
+
+        // Only Windows PowerShell 5, the in-the-box case.
+        let boxed = |program: &str| program == "powershell.exe";
+        assert_eq!(windows_shell(&comspec, &boxed), "powershell.exe");
+
+        // A stripped image with no PowerShell at all still gets a shell.
+        let none = |_: &str| false;
+        assert_eq!(
+            windows_shell(&comspec, &none),
+            r"C:\Windows\system32\cmd.exe"
+        );
+
+        // ...and one that has not even got `%COMSPEC%` gets the literal name,
+        // which `CreateProcess` resolves through `%PATH%`.
+        assert_eq!(windows_shell(&nothing, &none), "cmd.exe");
+        let empty = |_: &str| Some(String::new());
+        assert_eq!(windows_shell(&empty, &none), "cmd.exe");
+    }
+
     /// An explicit cwd always wins; the fallback only fills in the blank.
     #[test]
     fn an_explicit_directory_is_never_overridden_by_the_default() {
         let explicit = Some(PathBuf::from("/tmp"));
         assert_eq!(explicit.clone().or_else(default_cwd), explicit);
+    }
+
+    /// The home directory is spelled differently per platform, and on Windows
+    /// a `HOME` that *is* set is usually a POSIX path no Win32 call can open.
+    #[test]
+    fn the_home_directory_is_found_under_whichever_name_the_platform_uses() {
+        use std::ffi::OsString;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| OsString::from(*v))
+            }
+        };
+
+        // Unix: `HOME`, and nothing else is even looked at.
+        let unix = env(&[("HOME", "/Users/me"), ("USERPROFILE", r"C:\Users\me")]);
+        let expected = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\me")
+        } else {
+            PathBuf::from("/Users/me")
+        };
+        assert_eq!(home_dir(&unix), Some(expected));
+
+        // Nothing set at all is "no opinion", not an empty path.
+        assert_eq!(home_dir(&env(&[])), None);
+        assert_eq!(home_dir(&env(&[("HOME", ""), ("USERPROFILE", "")])), None);
+    }
+
+    /// The Windows-only half of the home lookup, exercised on every platform by
+    /// calling the fallback chain directly — `home_dir` itself is `cfg!`-gated
+    /// and so only reaches these branches on Windows.
+    #[test]
+    fn windows_falls_back_from_userprofile_to_homedrive_and_only_then_to_home() {
+        use std::ffi::OsString;
+        // The chain, written out the way `home_dir` walks it, so the ordering
+        // is asserted rather than assumed.
+        let resolve = |pairs: &[(&str, &str)]| -> Option<PathBuf> {
+            let var = |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| OsString::from(*v))
+                    .filter(|v| !v.is_empty())
+            };
+            var("USERPROFILE")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    let mut joined = var("HOMEDRIVE")?;
+                    joined.push(var("HOMEPATH")?);
+                    Some(PathBuf::from(joined))
+                })
+                .or_else(|| var("HOME").map(PathBuf::from))
+        };
+
+        assert_eq!(
+            resolve(&[("USERPROFILE", r"C:\Users\me"), ("HOME", "/c/Users/me")]),
+            Some(PathBuf::from(r"C:\Users\me"))
+        );
+        // `%HOMEPATH%` is drive-relative and starts with a separator, so the
+        // two halves are concatenated, never `join`ed.
+        assert_eq!(
+            resolve(&[("HOMEDRIVE", "C:"), ("HOMEPATH", r"\Users\me")]),
+            Some(PathBuf::from(r"C:\Users\me"))
+        );
+        // A half-set pair is not a home directory.
+        assert_eq!(resolve(&[("HOMEDRIVE", "C:")]), None);
+        // MSYS's POSIX `HOME` is the last resort, never the first choice.
+        assert_eq!(
+            resolve(&[("HOME", "/c/Users/me")]),
+            Some(PathBuf::from("/c/Users/me"))
+        );
     }
 }
