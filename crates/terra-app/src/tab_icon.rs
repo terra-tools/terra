@@ -334,15 +334,29 @@ pub fn from_text(text: &str) -> Option<TabIcon> {
         .map(|(_, icon)| *icon)
 }
 
-/// The icon for a tab: its foreground process if we recognise it, else its
+/// Icons that belong to interpreters and shells — *hosts* that are frequently
+/// just the runtime of something more specific. claude code is a node script,
+/// so its foreground process says `node`; half the CLI world says `python`.
+/// When the process says "host" and the text names a guest, the guest is the
+/// tab's real identity.
+fn is_host(icon: TabIcon) -> bool {
+    matches!(
+        icon,
+        TabIcon::Node | TabIcon::Python | TabIcon::Zsh | TabIcon::Bash | TabIcon::Fish
+    )
+}
+
+/// The icon for a tab: its foreground process if we recognise it — except
+/// that an interpreter/shell yields to a more specific text match — else its
 /// text, else the generic glyph.
 ///
 /// Pure, and the only entry point any tab-bar code should need.
 pub fn resolve(foreground: Option<&str>, text: &str) -> TabIcon {
-    foreground
-        .and_then(from_process)
-        .or_else(|| from_text(text))
-        .unwrap_or(TabIcon::Terminal)
+    match foreground.and_then(from_process) {
+        Some(icon) if !is_host(icon) => icon,
+        Some(host) => from_text(text).unwrap_or(host),
+        None => from_text(text).unwrap_or(TabIcon::Terminal),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +652,17 @@ mod tests {
             TabIcon::Htop,
             "the foreground process is the primary source"
         );
+    }
+
+    #[test]
+    fn an_interpreter_yields_to_what_it_is_running() {
+        // claude code is a node script: the process table says `node`, the
+        // title says claude. The title names the tab's real identity.
+        assert_eq!(resolve(Some("node"), "✳ Claude Code"), TabIcon::Claude);
+        assert_eq!(resolve(Some("python3"), "aider main.py"), TabIcon::Python);
+        // A bare interpreter with nothing more specific keeps its own mark.
+        assert_eq!(resolve(Some("node"), "node"), TabIcon::Node);
+        assert_eq!(resolve(Some("node"), "~"), TabIcon::Node);
     }
 
     #[test]
