@@ -62,6 +62,9 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   holding a single tab the bar hides entirely; a second tab or a second group
   brings every bar back.
 - Keybindings: Cmd+T new tab, Cmd+W close active, Cmd+Shift+P open palette,
+  Cmd+, open the config file in the OS's editor (the chevron menu's trailing
+  "Settings" row and palette `config.open` do the same; a missing file is
+  seeded from docs/config.example.toml first),
   Cmd+\ split right (move the active tab into a new group),
   Cmd+Alt+Left/Up and Cmd+Alt+Right/Down focus the previous/next leaf in DFS
   order (order-based, not spatial). Tab-scoped bindings act on the *focused

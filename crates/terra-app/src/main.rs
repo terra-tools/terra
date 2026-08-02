@@ -75,6 +75,62 @@ const FOREGROUND_POLL_SECS: f64 = 0.5;
 /// Every caller keeps its guard to the smallest possible scope, and never
 /// acquires a second one while holding the first — the UI thread is one thread,
 /// so a nested lock would simply deadlock against itself.
+/// Open the config file in whatever the OS considers its editor — the
+/// Windows Terminal "Settings" gesture, where settings are a file you edit
+/// rather than a UI. A missing file is seeded first with the documented
+/// example (`docs/config.example.toml`, every key commented and guaranteed
+/// warning-free by the config tests), so a first-timer lands in working
+/// docs instead of an empty buffer.
+fn open_config_in_editor(path: &std::path::Path) {
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let example = include_str!("../../../docs/config.example.toml");
+        if let Err(err) = std::fs::write(path, example) {
+            log::warn!("terra: cannot create {}: {err}", path.display());
+            return;
+        }
+        log::info!(
+            "terra: created {} from the documented example",
+            path.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `open` honours the user's `.toml` association (VS Code, Zed, …).
+        // It exits non-zero when nothing claims the extension, so wait for
+        // the status — it returns in milliseconds — and fall back to the
+        // default text editor rather than silently doing nothing.
+        let opened = std::process::Command::new("open")
+            .arg(path)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !opened {
+            if let Err(err) = std::process::Command::new("open")
+                .arg("-t")
+                .arg(path)
+                .spawn()
+            {
+                log::warn!("terra: cannot open {}: {err}", path.display());
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Err(err) = std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(path)
+        .spawn()
+    {
+        log::warn!("terra: cannot open {}: {err}", path.display());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Err(err) = std::process::Command::new("xdg-open").arg(path).spawn() {
+        log::warn!("terra: cannot open {}: {err}", path.display());
+    }
+}
+
 fn lock(tabs: &Mutex<TabManager>) -> MutexGuard<'_, TabManager> {
     tabs.lock().unwrap_or_else(|err| err.into_inner())
 }
@@ -451,6 +507,11 @@ impl App {
                 .with_icon(PaletteIcon::Cross),
         );
         actions.push(
+            PaletteAction::new("config.open", "Open Config File", Some("⌘,"))
+                .in_section(SETTINGS)
+                .with_icon(PaletteIcon::Pencil),
+        );
+        actions.push(
             PaletteAction::new("config.reload", "Reload Config File", None)
                 .in_section(SETTINGS)
                 .with_icon(PaletteIcon::ArrowRight),
@@ -502,6 +563,7 @@ impl App {
                     "config.font_smaller" => actions.push(AppAction::NudgeFontSize(-1)),
                     "config.reset_session" => actions.push(AppAction::ResetSession),
                     "config.reload" => actions.push(AppAction::ReloadConfig),
+                    "config.open" => actions.push(AppAction::OpenConfig),
                     "config.warnings" => actions.push(AppAction::ShowConfigWarnings),
                     "app.quit" => actions.push(AppAction::Quit),
                     // `tab.new` (exact) is handled above; `tab.new.<name>` is
@@ -595,6 +657,7 @@ impl App {
                     log::warn!("terra: config: {warning}");
                 }
             }
+            AppAction::OpenConfig => open_config_in_editor(self.config.path()),
             other => log::warn!("terra: {other:?} is not a config action"),
         }
     }
@@ -710,6 +773,7 @@ impl App {
             | AppAction::NudgeFontSize(_)
             | AppAction::ResetSession
             | AppAction::ReloadConfig
+            | AppAction::OpenConfig
             | AppAction::ShowConfigWarnings => return self.apply_config(action),
             _ => {}
         }
@@ -807,6 +871,7 @@ impl App {
             | AppAction::NudgeFontSize(_)
             | AppAction::ResetSession
             | AppAction::ReloadConfig
+            | AppAction::OpenConfig
             | AppAction::ShowConfigWarnings => unreachable!("handled above"),
             // The tabs are *not* torn down here: the window fades out first,
             // and an empty window is not what should be fading. Closing them
