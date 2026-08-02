@@ -20,6 +20,13 @@
 //! the naming rules — the parts with the interesting edge cases — are one
 //! implementation tested everywhere.
 //!
+//! A name is not always enough — `codex` is a node script and the kernel calls
+//! it `node` — so the pid the walk lands on is also asked for its arguments
+//! ([`process_argv`], macOS only for now), and the pair travels as a
+//! [`Foreground`]. That lookup follows the same per-platform adapter shape:
+//! a `cfg`-gated call around a pure parser, with an empty answer everywhere
+//! else.
+//!
 //! - **macOS** — one `sysctl(KERN_PROC_ALL)`, which hands back the whole
 //!   process table in a single copy: a few hundred kilobytes, no syscall per
 //!   process.
@@ -53,13 +60,45 @@
 )]
 const MAX_DEPTH: usize = 32;
 
+/// What is running in a tab: the innermost process's name, plus the first few
+/// entries of its argv.
+///
+/// The name alone is not enough to recognise a wrapped CLI. `codex` is a node
+/// script, so the kernel calls its process `node` and a tab running it looks
+/// exactly like a tab running a REPL. The argv is where the difference lives —
+/// `node /…/bin/codex` — so it is carried alongside, and the icon layer decides
+/// what to make of it.
+///
+/// `argv` is best-effort and frequently empty (an unsupported platform, a
+/// process that exited, a buffer that would not parse). Nothing may depend on
+/// it being populated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Foreground {
+    /// Lowercased basename from the process table, e.g. "claude", "node".
+    pub name: String,
+    /// Executable paths and arguments for the foreground chain, innermost
+    /// process first: [`MAX_ARGV`] entries each, for up to [`MAX_CHAIN`]
+    /// processes ([`chain_to_shell`]). Raw — not lowercased, not reduced to
+    /// basenames — because a *path* is often where the identity is.
+    pub argv: Vec<String>,
+}
+
+/// How many argv entries past the executable path are worth keeping.
+///
+/// Two: an interpreter's argv is `<interp> <script> [subcommand]`, and the
+/// identity of the tab is in the script or, for `npx foo`-shaped launchers, one
+/// word after it. Everything beyond that is the program's own arguments, where a
+/// path is as likely to name a *file being edited* as the editor.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MAX_ARGV: usize = 2;
+
 /// The command currently running in the tab whose shell has pid `shell_pid`,
 /// as a lowercased basename (e.g. "claude", "codex", "zsh").
 ///
 /// `None` when it cannot be determined, which callers must treat as "no
 /// opinion" rather than an error.
 pub fn foreground_command(shell_pid: u32) -> Option<String> {
-    foreground_commands(&[shell_pid]).pop()?
+    Some(foreground_commands(&[shell_pid]).pop()??.name)
 }
 
 /// [`foreground_command`] for several shells at once, answering in the order
@@ -74,7 +113,12 @@ pub fn foreground_command(shell_pid: u32) -> Option<String> {
 /// Answering from one snapshot is also the more correct thing to do: every
 /// tab's answer then describes the same instant, rather than a row of tabs each
 /// describing a slightly different one.
-pub fn foreground_commands(shell_pids: &[u32]) -> Vec<Option<String>> {
+///
+/// The argv lookup is the one part that cannot come from the shared snapshot —
+/// the kernel hands out a process's arguments one pid at a time — so it costs
+/// one extra call per *tab*, not per process, and only for the pid the walk
+/// landed on.
+pub fn foreground_commands(shell_pids: &[u32]) -> Vec<Option<Foreground>> {
     let Some(rows) = snapshot() else {
         return vec![None; shell_pids.len()];
     };
@@ -84,9 +128,178 @@ pub fn foreground_commands(shell_pids: &[u32]) -> Vec<Option<String>> {
         .map(|shell_pid| {
             let target = innermost_pid(&edges, *shell_pid)?;
             let (_, _, name) = rows.iter().find(|(pid, _, _)| *pid == target)?;
-            command_name(name)
+            Some(Foreground {
+                name: command_name(name)?,
+                argv: chain_to_shell(&edges, target, *shell_pid)
+                    .into_iter()
+                    .flat_map(process_argv)
+                    .collect(),
+            })
         })
         .collect()
+}
+
+/// The processes between `innermost` and the tab's shell, innermost first and
+/// the shell itself excluded.
+///
+/// The innermost process is the right answer to "what is the user typing at",
+/// and the wrong one to "what is this tab". A real `codex` session is
+/// `zsh → node → codex → node_repl`: the deepest process is a helper nobody has
+/// heard of, and the identity of the tab is one step up. So the argv of the
+/// whole chain is collected and the icon layer takes the first entry it
+/// recognises, which is innermost-wins with a fallback rather than a new rule.
+///
+/// Bounded by [`MAX_CHAIN`], and by a self-parent or a missing row, so a table
+/// read mid-mutation cannot turn this into a loop.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
+fn chain_to_shell(edges: &[(u32, u32)], innermost: u32, shell_pid: u32) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut pid = innermost;
+    while pid != shell_pid && chain.len() < MAX_CHAIN {
+        chain.push(pid);
+        let Some(&(_, ppid)) = edges.iter().find(|&&(p, _)| p == pid) else {
+            break;
+        };
+        if ppid == pid || chain.contains(&ppid) {
+            break;
+        }
+        pid = ppid;
+    }
+    chain
+}
+
+/// How many processes up from the innermost one are worth asking for their
+/// arguments. Four covers `node → codex → helper` with room to spare, and caps
+/// the per-tab cost of [`process_argv`] at a handful of small `sysctl`s.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
+const MAX_CHAIN: usize = 4;
+
+/// The executable path and first [`MAX_ARGV`] arguments of one process.
+///
+/// `sysctl(KERN_PROCARGS2)` is the only way to read another process's arguments
+/// on macOS without spawning `ps`, and unlike `KERN_PROC_ALL` it answers for one
+/// pid at a time. It is asked for its size first, because the buffer it wants is
+/// bounded by `ARG_MAX` (a megabyte) and allocating that per tab per second to
+/// read forty bytes would be silly.
+///
+/// Every failure — the process exited between the walk and this call, it belongs
+/// to another user, the buffer does not parse — is an empty vector. Arguments
+/// are a hint, never a requirement.
+#[cfg(target_os = "macos")]
+fn process_argv(pid: u32) -> Vec<String> {
+    /// Refuse to allocate more than this, whatever the kernel says it wants.
+    const CAP: libc::size_t = 1 << 20;
+
+    let Ok(pid) = libc::c_int::try_from(pid) else {
+        return Vec::new();
+    };
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+
+    // Pass 1: how much does this process's argument block need?
+    let mut len: libc::size_t = 0;
+    // SAFETY: `mib` is a valid three-element MIB, and a null data pointer with a
+    // real `len` out-parameter is the documented size query.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 || len > CAP {
+        return Vec::new();
+    }
+
+    // Pass 2. A block that grew past `len` in between fails with ENOMEM, and
+    // one missing icon is a better answer than a retry loop on the UI thread.
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` owns `len` writable bytes, and `len` is updated in place
+    // with however many the kernel actually wrote.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Vec::new();
+    }
+    buf.truncate(len.min(buf.len()));
+    parse_procargs2(&buf, MAX_ARGV)
+}
+
+/// See [`process_argv`] — no equivalent single call elsewhere, so the icon layer
+/// falls back to the process name alone, exactly as it did before argv existed.
+#[cfg(not(target_os = "macos"))]
+fn process_argv(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
+/// The executable path and up to `max_argv` arguments out of a raw
+/// `KERN_PROCARGS2` block.
+///
+/// The layout is undocumented but stable, and is the reason this is a parser
+/// rather than a split: a native-endian `int` argc, then the *executable path*
+/// (which is not `argv[0]` and is not counted by argc), then NUL padding of
+/// unpredictable length that aligns what follows, then argc NUL-terminated
+/// arguments, then — immediately, with no marker — the environment.
+///
+/// The environment is why `argc` is honoured rather than ignored: without it a
+/// process invoked as a bare `node` would keep reading and hand back
+/// `TERM=xterm-256color`. Empty fields are skipped, which handles the padding
+/// and an empty argument in one rule, and every length is bounded, so a
+/// truncated or garbage block yields a short answer instead of a panic or a
+/// gigabyte of strings.
+///
+/// Pure, so the layout is tested on every platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_procargs2(buf: &[u8], max_argv: usize) -> Vec<String> {
+    /// Longer than any argument that could name a program. A command line can
+    /// carry a whole file in it.
+    const MAX_LEN: usize = 1024;
+
+    let mut out = Vec::new();
+    if buf.len() < 4 {
+        return out;
+    }
+    let (head, rest) = buf.split_at(4);
+    let argc = u32::from_ne_bytes([head[0], head[1], head[2], head[3]]) as usize;
+
+    let take = |field: &[u8]| {
+        let end = field.len().min(MAX_LEN);
+        String::from_utf8_lossy(&field[..end]).trim().to_string()
+    };
+
+    let mut fields = rest.split(|&b| b == 0);
+    // The executable path, which sits before argv and outside argc's count.
+    match fields.next() {
+        Some(exec) if !exec.is_empty() => out.push(take(exec)),
+        _ => return out,
+    }
+    let wanted = max_argv.min(argc);
+    for field in fields {
+        if out.len() > wanted {
+            break;
+        }
+        if field.is_empty() {
+            continue;
+        }
+        out.push(take(field));
+    }
+    out
 }
 
 /// `(pid, ppid, raw name)` for every process on the machine, from one kernel
@@ -678,6 +891,118 @@ mod tests {
         );
     }
 
+    /// The chain is what makes a real `codex` session — whose deepest process
+    /// is an anonymous helper — resolvable: the identity is one step up.
+    #[test]
+    fn the_chain_runs_from_the_innermost_process_up_to_the_shell() {
+        // 500 (zsh) → 600 (node) → 700 (codex) → 800 (node_repl)
+        let edges = [(500u32, 1u32), (600, 500), (700, 600), (800, 700)];
+        let innermost = innermost_pid(&edges, 500).expect("in the table");
+        assert_eq!(innermost, 800);
+        assert_eq!(chain_to_shell(&edges, innermost, 500), [800, 700, 600]);
+        // A shell with nothing in it contributes nothing to ask about.
+        assert_eq!(chain_to_shell(&edges, 500, 500), [] as [u32; 0]);
+    }
+
+    /// Same guarantee as the tree walk: a table read while it was being mutated
+    /// must not become a loop, and the depth is capped regardless.
+    #[test]
+    fn a_broken_parent_chain_is_bounded_rather_than_followed_forever() {
+        let cycle = [(700u32, 800u32), (800, 700)];
+        assert!(chain_to_shell(&cycle, 700, 1).len() <= MAX_CHAIN);
+        let deep: Vec<(u32, u32)> = (1..40u32).map(|p| (p + 1, p)).collect();
+        assert_eq!(chain_to_shell(&deep, 40, 1).len(), MAX_CHAIN);
+        // A pid whose row vanished ends the walk where it stands.
+        assert_eq!(chain_to_shell(&[], 900, 1), [900]);
+    }
+
+    /// A synthetic `KERN_PROCARGS2` block: argc, the executable path, `pad`
+    /// NULs of alignment, then the arguments and whatever follows them.
+    fn procargs2(argc: u32, exec: &str, pad: usize, tail: &[&str]) -> Vec<u8> {
+        let mut buf = argc.to_ne_bytes().to_vec();
+        buf.extend_from_slice(exec.as_bytes());
+        buf.push(0);
+        buf.extend(std::iter::repeat_n(0u8, pad));
+        for field in tail {
+            buf.extend_from_slice(field.as_bytes());
+            buf.push(0);
+        }
+        buf
+    }
+
+    /// The layout the icon layer depends on: the executable path is *not*
+    /// `argv[0]` and is not counted by argc, and the padding between them is of
+    /// no fixed length.
+    #[test]
+    fn an_argument_block_yields_the_exec_path_and_the_first_arguments() {
+        let buf = procargs2(
+            2,
+            "/usr/local/bin/node",
+            7,
+            &["node", "/opt/homebrew/lib/node_modules/codex/bin/codex.js"],
+        );
+        assert_eq!(
+            parse_procargs2(&buf, MAX_ARGV),
+            [
+                "/usr/local/bin/node",
+                "node",
+                "/opt/homebrew/lib/node_modules/codex/bin/codex.js"
+            ]
+        );
+    }
+
+    /// argc is what separates the arguments from the environment, which follows
+    /// them with no marker of its own. A bare REPL must not come back wearing
+    /// its `TERM`.
+    #[test]
+    fn the_environment_after_the_arguments_is_not_mistaken_for_one() {
+        let buf = procargs2(
+            1,
+            "/usr/bin/node",
+            3,
+            &["node", "TERM=xterm", "SHELL=/bin/zsh"],
+        );
+        assert_eq!(parse_procargs2(&buf, MAX_ARGV), ["/usr/bin/node", "node"]);
+    }
+
+    /// Two arguments is the whole budget: past the script, a path is as likely
+    /// to name the file being edited as the editor.
+    #[test]
+    fn no_more_arguments_are_kept_than_were_asked_for() {
+        let buf = procargs2(9, "/bin/sh", 1, &["sh", "-c", "vim", "notes.md", "extra"]);
+        assert_eq!(parse_procargs2(&buf, MAX_ARGV), ["/bin/sh", "sh", "-c"]);
+        assert_eq!(parse_procargs2(&buf, 0), ["/bin/sh"]);
+    }
+
+    /// Every failure mode is a short answer, never a panic: this is parsing a
+    /// kernel buffer for a process that may have exited mid-call.
+    #[test]
+    fn a_truncated_or_nonsense_argument_block_parses_to_nothing() {
+        assert!(parse_procargs2(&[], MAX_ARGV).is_empty());
+        assert!(parse_procargs2(&[1, 0, 0], MAX_ARGV).is_empty()); // no room for argc
+        assert!(parse_procargs2(&[1, 0, 0, 0], MAX_ARGV).is_empty()); // argc, nothing after
+                                                                      // An argc the kernel could never produce must not be believed.
+        let huge = procargs2(u32::MAX, "/bin/ls", 1, &["ls", "-l", "/tmp", "and-more"]);
+        assert_eq!(parse_procargs2(&huge, MAX_ARGV), ["/bin/ls", "ls", "-l"]);
+        // A block that ends mid-argument keeps what was whole.
+        let mut cut = procargs2(2, "/bin/ls", 1, &["ls", "-l"]);
+        cut.truncate(cut.len() - 1);
+        assert_eq!(parse_procargs2(&cut, MAX_ARGV), ["/bin/ls", "ls", "-l"]);
+    }
+
+    /// The kernel copies whatever `execve` was handed, so an argument need not
+    /// be UTF-8 and need not be short.
+    #[test]
+    fn an_ill_formed_or_enormous_argument_is_bounded_rather_than_trusted() {
+        let mut buf = 1u32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/z\xff\xfeh\0\0");
+        buf.extend_from_slice(&vec![b'x'; 4096]);
+        buf.push(0);
+        let argv = parse_procargs2(&buf, MAX_ARGV);
+        assert!(argv[0].starts_with("/bin/z"));
+        assert!(argv[1].len() <= 1024, "{} bytes", argv[1].len());
+    }
+
     #[test]
     fn a_cycle_in_the_parent_chain_terminates_instead_of_hanging() {
         // 500 → 600 → 700 → 500: a table this corrupt cannot come from a
@@ -710,6 +1035,24 @@ mod tests {
             .expect("the test binary's own pid is always in the table");
         assert!(!name.is_empty());
         assert_eq!(name, name.to_lowercase());
+    }
+
+    /// The synthetic buffers above prove the layout; this proves the *kernel*
+    /// agrees, by reading the arguments of the one process we know the argv of.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn our_own_arguments_come_back_from_the_kernel() {
+        let argv = process_argv(std::process::id());
+        assert!(!argv.is_empty(), "no arguments for our own pid");
+        // The exec path leads, and it is this test binary.
+        assert!(argv[0].contains('/'), "{:?} is not a path", argv[0]);
+        assert!(argv.len() <= MAX_ARGV + 1, "{argv:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_implausible_pid_yields_no_arguments_rather_than_failing() {
+        assert!(process_argv(u32::MAX).is_empty());
     }
 
     #[cfg(target_os = "macos")]

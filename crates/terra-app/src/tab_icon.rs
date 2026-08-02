@@ -6,14 +6,20 @@
 //! Python tab", it is a shell that has a Python in it right now and will not in
 //! a minute.
 //!
-//! # Two sources, in order
+//! # Three sources, in order
 //!
-//! 1. **The foreground process.** [`crate::procinfo`] already walks the process
+//! 1. **The foreground processes' arguments.** A wrapped CLI is invisible to
+//!    its process name: `codex` is a node script, so the kernel says `node`.
+//!    Its argv says `node …/bin/codex`, and [`resolve_argv`] reads the argv of
+//!    the whole chain from the innermost process up to the shell before
+//!    anything else, because it is the one source that is both specific and
+//!    certain.
+//! 2. **The foreground process's name.** [`crate::procinfo`] walks the process
 //!    tree down from a tab's shell to name whatever is actually running in it —
 //!    that machinery exists for the BiDi quirks table, and it is exactly the
 //!    question an icon asks. This is the source that gets `htop` right, because
 //!    it is the only one that knows `htop` exited.
-//! 2. **Text.** The tab's effective title plus the command it was spawned with,
+//! 3. **Text.** The tab's effective title plus the command it was spawned with,
 //!    matched on whole words. Wrong more often, but it is all there is when the
 //!    process table cannot be read (a sandbox, an unsupported platform), and it
 //!    answers instantly for a tab whose command has not been typed yet.
@@ -21,6 +27,14 @@
 //! Anything unmatched gets a generic `>_` glyph rather than nothing, so the
 //! titles in a row stay aligned instead of jittering left and right as
 //! programs come and go.
+//!
+//! # What does *not* get a logo
+//!
+//! A default shell is not an identity. zsh, bash, sh, dash and cmd wear the
+//! generic glyph, because a row of tabs that all say "you are in a shell" says
+//! nothing at all and a quiet row makes the one tab running something stand
+//! out. `fish` and PowerShell keep their marks: nobody ends up in fish by
+//! accident, and on Windows "this is pwsh, not cmd" is real information.
 //!
 //! # Colour
 //!
@@ -48,6 +62,8 @@
 use std::collections::HashMap;
 
 use egui::{Color32, ColorImage, Context, Rect, TextureHandle, TextureOptions, Ui};
+
+use crate::procinfo::Foreground;
 
 /// Edge length of every shipped PNG. Assets are square by construction; a file
 /// that is not is dropped rather than stretched (see [`master`]).
@@ -81,8 +97,12 @@ const LIFTED_LUMINANCE: f32 = 0.40;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TabIcon {
     Claude,
-    Zsh,
-    Bash,
+    /// Deliberately *not* a variant for zsh, bash, sh or dash: a login shell is
+    /// the tab's furniture, not its identity, and a row of shell logos says
+    /// nothing. Those wear [`Self::Terminal`]. `fish` keeps its mark because
+    /// nobody arrives at fish by default, and PowerShell keeps one because on
+    /// Windows the distinction between it and `cmd` is real.
+    PowerShell,
     Fish,
     Python,
     Node,
@@ -106,8 +126,7 @@ impl TabIcon {
     pub const fn key(self) -> &'static str {
         match self {
             Self::Claude => "claude",
-            Self::Zsh => "zsh",
-            Self::Bash => "gnubash",
+            Self::PowerShell => "powershell",
             Self::Fish => "fishshell",
             Self::Python => "python",
             Self::Node => "nodedotjs",
@@ -128,8 +147,7 @@ impl TabIcon {
     pub const fn png(self) -> &'static [u8] {
         match self {
             Self::Claude => include_bytes!("../assets/tab-icons/claude-64.png"),
-            Self::Zsh => include_bytes!("../assets/tab-icons/zsh-64.png"),
-            Self::Bash => include_bytes!("../assets/tab-icons/gnubash-64.png"),
+            Self::PowerShell => include_bytes!("../assets/tab-icons/powershell-64.png"),
             Self::Fish => include_bytes!("../assets/tab-icons/fishshell-64.png"),
             Self::Python => include_bytes!("../assets/tab-icons/python-64.png"),
             Self::Node => include_bytes!("../assets/tab-icons/nodedotjs-64.png"),
@@ -159,8 +177,7 @@ impl TabIcon {
     #[cfg(test)]
     pub const ALL: &'static [Self] = &[
         Self::Claude,
-        Self::Zsh,
-        Self::Bash,
+        Self::PowerShell,
         Self::Fish,
         Self::Python,
         Self::Node,
@@ -189,10 +206,17 @@ impl TabIcon {
 /// instead of being enumerated, so `python3.13` needs no row of its own.
 const BY_PROCESS: &[(&str, TabIcon)] = &[
     ("claude", TabIcon::Claude),
-    ("zsh", TabIcon::Zsh),
-    ("bash", TabIcon::Bash),
-    ("sh", TabIcon::Bash),
-    ("dash", TabIcon::Bash),
+    // The default shells, mapped to the generic glyph on purpose — see
+    // [`TabIcon::PowerShell`]. They are rows rather than omissions because
+    // `resolve` needs to tell "this tab is a shell" from "no idea", and because
+    // a shell is a *host*: it yields to anything the text knows better.
+    ("zsh", TabIcon::Terminal),
+    ("bash", TabIcon::Terminal),
+    ("sh", TabIcon::Terminal),
+    ("dash", TabIcon::Terminal),
+    ("cmd", TabIcon::Terminal),
+    ("pwsh", TabIcon::PowerShell),
+    ("powershell", TabIcon::PowerShell),
     ("fish", TabIcon::Fish),
     ("python", TabIcon::Python),
     ("ipython", TabIcon::Python),
@@ -260,8 +284,8 @@ const BY_KEYWORD: &[(&str, TabIcon)] = &[
     ("zellij", TabIcon::Tmux),
     ("vim", TabIcon::Vim),
     ("git", TabIcon::Git),
-    ("zsh", TabIcon::Zsh),
-    ("bash", TabIcon::Bash),
+    ("pwsh", TabIcon::PowerShell),
+    ("powershell", TabIcon::PowerShell),
     ("fish", TabIcon::Fish),
 ];
 
@@ -339,23 +363,91 @@ pub fn from_text(text: &str) -> Option<TabIcon> {
 /// so its foreground process says `node`; half the CLI world says `python`.
 /// When the process says "host" and the text names a guest, the guest is the
 /// tab's real identity.
+///
+/// The plain shells used to be here too. They are hosts in exactly this sense,
+/// but they now resolve to the generic glyph, which [`resolve`] already treats
+/// as yielding — so listing them would be saying the same thing twice.
 fn is_host(icon: TabIcon) -> bool {
-    matches!(
-        icon,
-        TabIcon::Node | TabIcon::Python | TabIcon::Zsh | TabIcon::Bash | TabIcon::Fish
-    )
+    matches!(icon, TabIcon::Node | TabIcon::Python | TabIcon::Fish)
 }
 
-/// The icon for a tab: its foreground process if we recognise it — except
-/// that an interpreter/shell yields to a more specific text match — else its
-/// text, else the generic glyph.
+/// Whether an icon is specific enough to end the search: a real brand mark for
+/// a program that is not merely hosting another one.
+fn is_specific(icon: TabIcon) -> bool {
+    !is_host(icon) && !icon.is_generic()
+}
+
+/// The icon for a tab: its foreground process if we recognise it — except that
+/// an interpreter, or a shell (which resolves to the generic glyph), yields to a
+/// more specific text match — else its text, else the generic glyph.
 ///
-/// Pure, and the only entry point any tab-bar code should need.
+/// Pure. [`resolve_argv`] is the entry point that also gets a look at the
+/// process's arguments; this one is what it falls back to.
 pub fn resolve(foreground: Option<&str>, text: &str) -> TabIcon {
     match foreground.and_then(from_process) {
-        Some(icon) if !is_host(icon) => icon,
-        Some(host) => from_text(text).unwrap_or(host),
+        Some(icon) if is_specific(icon) => icon,
+        // A host *or* the generic glyph: both mean "something is running here
+        // that the process name does not identify", and the title may.
+        Some(weak) => from_text(text).unwrap_or(weak),
         None => from_text(text).unwrap_or(TabIcon::Terminal),
+    }
+}
+
+/// Extensions worth looking through, because the file that carries them is a
+/// program rather than data: `codex.js` is codex. Kept short on purpose — this
+/// runs on argument *paths*, where a longer list would start eating filenames.
+const SCRIPT_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "py", "rb"];
+
+/// `…/codex.js` -> `…/codex`, and everything else unchanged.
+fn strip_script_extension(arg: &str) -> &str {
+    match arg.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && SCRIPT_EXTENSIONS.contains(&ext) => stem,
+        _ => arg,
+    }
+}
+
+/// The icon one argv entry names on its own, or `None`.
+///
+/// Two attempts, narrowest first. The basename is the reliable one: `codex`,
+/// `codex.js`, `/opt/homebrew/bin/codex` are all the row `codex` in
+/// [`BY_PROCESS`]. The second is for the launcher whose script is named after
+/// nothing (`…/claude-code/cli.js`, `…/codex/index.js`) — there the identity is
+/// in a *directory* of the path, so the whole entry is run through the keyword
+/// matcher, which is word-boundary anchored and so does not fire on
+/// `~/src/gitlab-runner`. It is tried only on entries that are paths, and only
+/// for a specific icon: a host or the generic glyph from a path is no evidence
+/// at all.
+fn from_argv_entry(arg: &str) -> Option<TabIcon> {
+    let by_name = from_process(arg).or_else(|| from_process(strip_script_extension(arg)));
+    by_name
+        .or_else(|| arg.contains(['/', '\\']).then(|| from_text(arg)).flatten())
+        .filter(|icon| is_specific(*icon))
+}
+
+/// [`resolve`], with the foreground process's arguments consulted first.
+///
+/// This is what makes a wrapped CLI recognisable no matter what the title says.
+/// `codex` and `claude` are node scripts: the process table calls them `node`,
+/// and if the tab's title is still the shell's — `~/src/terra`, because the
+/// program never set one — the old chain had nothing left to go on and fell all
+/// the way to the generic glyph. The argv says `node …/bin/codex`, which is not
+/// ambiguous.
+///
+/// `argv` is the whole foreground chain innermost-first (see
+/// [`crate::procinfo::chain_to_shell`]), not one process, because the deepest
+/// process is not always the interesting one — a live `codex` session is
+/// `zsh → node → codex → node_repl`, and its identity is one step up from the
+/// bottom. Taking the first *recognisable* entry is innermost-wins with a
+/// fallback rather than a second rule.
+///
+/// Arguments win over the title because they are what the kernel says is
+/// running, and lose to nothing: they are only consulted for a *specific* icon,
+/// so a bare `node` REPL (`node`, `/usr/local/bin/node`) matches nothing here
+/// and drops through to [`resolve`], which gives it Node's mark as before.
+pub fn resolve_argv(foreground: Option<&str>, argv: &[String], text: &str) -> TabIcon {
+    match argv.iter().find_map(|arg| from_argv_entry(arg)) {
+        Some(icon) => icon,
+        None => resolve(foreground, text),
     }
 }
 
@@ -367,8 +459,8 @@ pub fn resolve(foreground: Option<&str>, text: &str) -> TabIcon {
 /// never a letter, digit or ASCII mark) plus its trailing space is dropped.
 /// Paint-time only: capture, rename, `ls` and the window title keep the
 /// original string.
-pub fn display_title<'a>(title: &'a str, icon: Option<TabIcon>) -> &'a str {
-    if !icon.is_some_and(|i| !i.is_generic()) {
+pub fn display_title(title: &str, icon: Option<TabIcon>) -> &str {
+    if icon.is_none_or(TabIcon::is_generic) {
         return title;
     }
     let mut chars = title.chars();
@@ -400,9 +492,9 @@ pub struct TabFacts<'a> {
 /// is a syscall, is rate-limited.
 #[derive(Default)]
 pub struct IconCache {
-    /// Last known foreground command per tab. Kept between polls so a
-    /// throttled frame still resolves against the primary source.
-    foreground: HashMap<u64, Option<String>>,
+    /// Last known foreground process per tab — its name and argv. Kept between
+    /// polls so a throttled frame still resolves against the primary source.
+    foreground: HashMap<u64, Option<Foreground>>,
     icons: HashMap<u64, TabIcon>,
     checked: f64,
 }
@@ -425,12 +517,12 @@ impl IconCache {
     /// Refresh from `tabs`. `now` is a monotonically increasing seconds clock
     /// (egui's `input.time`).
     ///
-    /// `lookup` maps a batch of shell pids to their foreground commands; it is
+    /// `lookup` maps a batch of shell pids to their foreground processes; it is
     /// a parameter so this is testable without a process table, and so the
     /// whole batch costs one snapshot rather than one per tab.
     pub fn poll<F>(&mut self, now: f64, tabs: &[TabFacts<'_>], lookup: F)
     where
-        F: FnOnce(&[u32]) -> Vec<Option<String>>,
+        F: FnOnce(&[u32]) -> Vec<Option<Foreground>>,
     {
         // A tab that opened since the last poll must not wait out the interval
         // wearing the wrong icon, so a new id forces the walk.
@@ -438,18 +530,18 @@ impl IconCache {
         if unseen || now - self.checked >= POLL_SECS {
             self.checked = now;
             let pids: Vec<u32> = tabs.iter().filter_map(|t| t.shell_pid).collect();
-            let names = lookup(&pids);
-            let mut names = names.into_iter();
+            let found = lookup(&pids);
+            let mut found = found.into_iter();
             let mut fresh = HashMap::with_capacity(tabs.len());
             for tab in tabs {
-                let name = match tab.shell_pid {
+                let process = match tab.shell_pid {
                     // `lookup` is contractually one answer per pid, in order;
                     // a short answer degrades to "no opinion" rather than
                     // shifting every later tab onto the wrong process.
-                    Some(_) => names.next().flatten(),
+                    Some(_) => found.next().flatten(),
                     None => None,
                 };
-                fresh.insert(tab.id, name);
+                fresh.insert(tab.id, process);
             }
             self.foreground = fresh;
         }
@@ -457,8 +549,10 @@ impl IconCache {
         self.icons = tabs
             .iter()
             .map(|tab| {
-                let fg = self.foreground.get(&tab.id).and_then(Option::as_deref);
-                (tab.id, resolve(fg, tab.text))
+                let fg = self.foreground.get(&tab.id).and_then(Option::as_ref);
+                let name = fg.map(|f| f.name.as_str());
+                let argv = fg.map_or(&[][..], |f| f.argv.as_slice());
+                (tab.id, resolve_argv(name, argv, tab.text))
             })
             .collect();
     }
@@ -664,6 +758,15 @@ pub fn paint_on(
 mod tests {
     use super::*;
 
+    /// One process as the lookup would report it: a name and, optionally, the
+    /// argv the kernel gave for it.
+    fn process(name: &str, argv: &[&str]) -> Option<Foreground> {
+        Some(Foreground {
+            name: name.to_string(),
+            argv: argv.iter().map(|a| (*a).to_string()).collect(),
+        })
+    }
+
     #[test]
     fn a_recognised_foreground_process_wins_over_the_title() {
         // The title says the tab is sitting in a Rust checkout; the process
@@ -704,13 +807,53 @@ mod tests {
 
     #[test]
     fn a_login_shell_and_a_full_path_name_the_same_program() {
-        assert_eq!(from_process("-zsh"), Some(TabIcon::Zsh));
-        assert_eq!(from_process("/bin/zsh"), Some(TabIcon::Zsh));
+        // All four spellings of a plain shell reach the same row — which is
+        // now the generic glyph, not a shell logo.
+        assert_eq!(from_process("-zsh"), Some(TabIcon::Terminal));
+        assert_eq!(from_process("/bin/zsh"), Some(TabIcon::Terminal));
         assert_eq!(
             from_process(r"C:\Program Files\Git\bin\bash.exe"),
-            Some(TabIcon::Bash)
+            Some(TabIcon::Terminal)
         );
-        assert_eq!(from_process("  ZSH  "), Some(TabIcon::Zsh));
+        assert_eq!(from_process("  ZSH  "), Some(TabIcon::Terminal));
+        // The same normalisation on a shell that *does* have a mark, so this
+        // still tests the path/dash/case handling and not just one constant.
+        assert_eq!(from_process("/usr/local/bin/fish"), Some(TabIcon::Fish));
+        assert_eq!(from_process("-fish"), Some(TabIcon::Fish));
+        assert_eq!(
+            from_process(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            Some(TabIcon::PowerShell)
+        );
+    }
+
+    /// A default shell is the tab's furniture. zsh, bash, sh, dash and cmd all
+    /// wear the quiet `>_`; fish and PowerShell are chosen, and keep a mark.
+    #[test]
+    fn a_plain_shell_is_chrome_rather_than_a_brand() {
+        for shell in ["zsh", "bash", "sh", "dash", "cmd"] {
+            assert_eq!(from_process(shell), Some(TabIcon::Terminal), "{shell}");
+            assert_eq!(resolve(Some(shell), "~/src/terra"), TabIcon::Terminal);
+            assert!(resolve(Some(shell), "~/src/terra").is_generic());
+        }
+        assert_eq!(resolve(Some("fish"), "~/src/terra"), TabIcon::Fish);
+        assert_eq!(resolve(Some("pwsh"), "~"), TabIcon::PowerShell);
+        assert_eq!(resolve(Some("powershell"), "~"), TabIcon::PowerShell);
+        assert_eq!(resolve(None, "pwsh -NoLogo"), TabIcon::PowerShell);
+        assert!(!TabIcon::PowerShell.is_generic());
+        assert!(!TabIcon::Fish.is_generic());
+    }
+
+    /// The shells resolve to the generic glyph, and the generic glyph must
+    /// yield to the title exactly as an interpreter does — otherwise a tab
+    /// running `docker` under zsh would be stuck wearing `>_`.
+    #[test]
+    fn a_shell_yields_to_what_the_title_says_is_running() {
+        assert_eq!(resolve(Some("zsh"), "docker ps"), TabIcon::Docker);
+        assert_eq!(resolve(Some("-bash"), "✳ Claude Code"), TabIcon::Claude);
+        // ...and a fish tab, whose icon is a real one, yields the same way.
+        assert_eq!(resolve(Some("fish"), "docker ps"), TabIcon::Docker);
+        // A shell with nothing to yield to keeps the glyph.
+        assert_eq!(resolve(Some("zsh"), "~"), TabIcon::Terminal);
     }
 
     #[test]
@@ -726,7 +869,7 @@ mod tests {
     #[test]
     fn an_unrelated_program_gets_no_icon_from_the_process_table() {
         assert_eq!(from_process("ssh"), None);
-        assert_eq!(from_process("pwsh"), None);
+        assert_eq!(from_process("some-inhouse-tool"), None);
         assert_eq!(from_process(""), None);
     }
 
@@ -744,6 +887,140 @@ mod tests {
         assert_eq!(resolve(None, "opencode run"), TabIcon::OpenCode);
         assert!(!TabIcon::OpenAi.is_generic());
         assert!(!TabIcon::OpenCode.is_generic());
+    }
+
+    /// The failure this exists for: `codex` is a node script, so the process
+    /// table says `node`, and a tab whose title is still the shell's (`~/src`)
+    /// had nothing left to identify it. The argv is not ambiguous.
+    #[test]
+    fn a_wrapped_cli_is_recognised_from_its_arguments_whatever_the_title_says() {
+        let codex = [
+            "/opt/homebrew/bin/node".to_string(),
+            "node".to_string(),
+            "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js".to_string(),
+        ];
+        assert_eq!(
+            resolve_argv(Some("node"), &codex, "~/src/terra"),
+            TabIcon::OpenAi
+        );
+        // The `.js` is not the point: the same launcher without an extension,
+        // as an `env node` shebang script produces, resolves identically.
+        let bare = [
+            "/usr/bin/node".to_string(),
+            "/Users/me/.nvm/bin/codex".to_string(),
+        ];
+        assert_eq!(resolve_argv(Some("node"), &bare, "~"), TabIcon::OpenAi);
+        // A script named after nothing — the identity is a directory of the
+        // path, which the word-boundary keyword matcher still finds.
+        let claude = [
+            "/usr/bin/node".to_string(),
+            "node".to_string(),
+            "/Users/me/.claude/local/node_modules/claude-code/cli.js".to_string(),
+        ];
+        assert_eq!(
+            resolve_argv(Some("node"), &claude, "~/src"),
+            TabIcon::Claude
+        );
+    }
+
+    /// Arguments are only consulted for a *specific* answer, so a bare
+    /// interpreter — whose argv is nothing but its own name — still lands on
+    /// the old chain and keeps the interpreter's mark.
+    #[test]
+    fn a_bare_interpreter_is_not_talked_out_of_its_own_icon_by_its_own_argv() {
+        let repl = ["/usr/local/bin/node".to_string(), "node".to_string()];
+        assert_eq!(resolve_argv(Some("node"), &repl, "~"), TabIcon::Node);
+        // ...and the title still outranks a host, exactly as before.
+        assert_eq!(
+            resolve_argv(Some("node"), &repl, "✳ Claude Code"),
+            TabIcon::Claude
+        );
+        // A plain shell's argv says shell, which is no evidence: still `>_`.
+        let shell = ["/bin/zsh".to_string(), "-zsh".to_string()];
+        assert_eq!(
+            resolve_argv(Some("zsh"), &shell, "~/src"),
+            TabIcon::Terminal
+        );
+        // No argv at all is the pre-argv behaviour, exactly.
+        assert_eq!(resolve_argv(Some("htop"), &[], "~/src"), TabIcon::Htop);
+        assert_eq!(resolve_argv(None, &[], "docker ps"), TabIcon::Docker);
+    }
+
+    /// Earlier arguments win, so an interpreter never shadows its script and a
+    /// script never shadows the *file* it was given.
+    #[test]
+    fn the_first_specific_argument_wins() {
+        let editing = [
+            "/usr/bin/vim".to_string(),
+            "vim".to_string(),
+            "/Users/me/src/docker-compose.yml".to_string(),
+        ];
+        assert_eq!(resolve_argv(Some("vim"), &editing, ""), TabIcon::Vim);
+        // The argument that names a program beats the one that names data,
+        // in the order the kernel listed them.
+        let wrapped = [
+            "/usr/bin/env".to_string(),
+            "/usr/bin/python3".to_string(),
+            "/tmp/htop-notes.py".to_string(),
+        ];
+        assert_eq!(resolve_argv(Some("env"), &wrapped, ""), TabIcon::Htop);
+    }
+
+    /// An argument that is not a path is matched by name only: the keyword
+    /// sweep is what makes a *path* readable, and running it over ordinary
+    /// words would re-import every false positive the process table avoids.
+    #[test]
+    fn a_plain_argument_is_not_scanned_as_free_text() {
+        assert_eq!(from_argv_entry("commit-to-git"), None);
+        assert_eq!(from_argv_entry("gitlab"), None);
+        assert_eq!(from_argv_entry("/usr/bin/gitlab-runner"), None);
+        assert_eq!(from_argv_entry("git"), Some(TabIcon::Git));
+        // A host or the generic glyph is not an answer, at either stage.
+        assert_eq!(from_argv_entry("/usr/local/bin/node"), None);
+        assert_eq!(from_argv_entry("/bin/zsh"), None);
+    }
+
+    #[test]
+    fn only_a_script_extension_is_looked_through() {
+        assert_eq!(strip_script_extension("codex.js"), "codex");
+        assert_eq!(strip_script_extension("/a/b/manage.py"), "/a/b/manage");
+        // Not an extension we know: left alone, so `python3.13` still reaches
+        // the version stripper intact.
+        assert_eq!(strip_script_extension("python3.13"), "python3.13");
+        assert_eq!(strip_script_extension("archive.tar.gz"), "archive.tar.gz");
+        assert_eq!(strip_script_extension(".js"), ".js");
+        assert_eq!(strip_script_extension("codex"), "codex");
+    }
+
+    /// The cache is what the tab bar actually calls, so the argv has to survive
+    /// the trip through it — including the throttled frames in between.
+    #[test]
+    fn the_cache_resolves_a_tab_from_the_argv_it_was_handed() {
+        let mut cache = IconCache::default();
+        cache.poll(
+            0.0,
+            &[TabFacts {
+                id: 1,
+                shell_pid: Some(7),
+                text: "~/src/terra",
+            }],
+            |_| {
+                process("node", &["/usr/bin/node", "node", "/tmp/codex/index.js"])
+                    .map_or_else(Vec::new, |f| vec![Some(f)])
+            },
+        );
+        assert_eq!(cache.get(1), Some(TabIcon::OpenAi));
+        // A throttled frame answers from the same remembered argv.
+        cache.poll(
+            0.1,
+            &[TabFacts {
+                id: 1,
+                shell_pid: Some(7),
+                text: "~/src/terra",
+            }],
+            |_| panic!("the walk ran again inside the interval"),
+        );
+        assert_eq!(cache.get(1), Some(TabIcon::OpenAi));
     }
 
     /// The whole reason the text fallback matches words and not substrings.
@@ -879,7 +1156,7 @@ mod tests {
                 |pids| {
                     *calls += 1;
                     assert_eq!(pids, [42]);
-                    vec![Some("htop".to_string())]
+                    vec![process("htop", &[])]
                 },
             );
         };
@@ -903,7 +1180,7 @@ mod tests {
             shell_pid: Some(1),
             text: "",
         }];
-        cache.poll(0.0, &one, |_| vec![Some("zsh".into())]);
+        cache.poll(0.0, &one, |_| vec![process("zsh", &[])]);
         let mut called = false;
         let two = [
             TabFacts {
@@ -919,7 +1196,7 @@ mod tests {
         ];
         cache.poll(0.05, &two, |_| {
             called = true;
-            vec![Some("zsh".into()), Some("docker".into())]
+            vec![process("zsh", &[]), process("docker", &[])]
         });
         assert!(called);
         assert_eq!(cache.get(2), Some(TabIcon::Docker));
@@ -986,7 +1263,7 @@ mod tests {
                     text: "",
                 },
             ],
-            |_| vec![Some("htop".into())],
+            |_| vec![process("htop", &[])],
         );
         assert_eq!(cache.get(1), Some(TabIcon::Htop));
         assert_eq!(cache.get(2), Some(TabIcon::Terminal));
@@ -1020,7 +1297,7 @@ mod display_title_tests {
 
     #[test]
     fn ordinary_titles_never_lose_their_first_word() {
-        assert_eq!(display_title("~ home", Some(TabIcon::Zsh)), "~ home");
+        assert_eq!(display_title("~ home", Some(TabIcon::Docker)), "~ home");
         assert_eq!(display_title("[1] build", Some(TabIcon::Git)), "[1] build");
         assert_eq!(display_title("א שלום", Some(TabIcon::Claude)), "א שלום");
     }

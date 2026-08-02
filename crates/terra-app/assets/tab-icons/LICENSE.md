@@ -12,7 +12,7 @@ done
 
 ## Simple Icons — CC0 1.0 Universal
 
-Every icon except `terminal.svg` comes from [Simple Icons](https://simpleicons.org)
+The icons in the table below come from [Simple Icons](https://simpleicons.org)
 v16.28.0, fetched from `https://unpkg.com/simple-icons@16.28.0/icons/<slug>.svg`
 and given an explicit `fill` with that icon's published brand colour (the
 upstream files carry no fill and render black).
@@ -24,8 +24,6 @@ redistributed without permission or attribution.
 | file | slug | drawn for |
 | --- | --- | --- |
 | `claude.svg` | `claude` | `claude` (Claude Code) |
-| `zsh.svg` | `zsh` | `zsh` |
-| `gnubash.svg` | `gnubash` | `bash`, `sh`, `dash` |
 | `fishshell.svg` | `fishshell` | `fish` |
 | `python.svg` | `python` | `python`, `python3`, `ipython`, `uv`, `pip` |
 | `nodedotjs.svg` | `nodedotjs` | `node`, `npm`, `pnpm`, `yarn`, `bun`, `deno` |
@@ -106,15 +104,46 @@ but it is not pixel-identical to the source at paint time.
 | --- | --- |
 | `opencode.svg` | `opencode` (process name and title keyword) |
 
+## `powershell.svg` — the PowerShell mark
+
+**Not** from Simple Icons: PowerShell is absent from v16.28.0. The file here
+comes from a public gist:
+
+- source: <https://gist.githubusercontent.com/Xainey/d5bde7d01dcbac51ac951810e94313aa/raw/6c858c46726541b48ddaaebab29c41c07a196394/PowerShell.svg>
+- author of the gist: Xainey. The artwork it contains is **Microsoft's
+  PowerShell logo**, not the gist author's own design.
+
+Be clear about what this is and is not: the gist states **no licence** at all.
+So unlike Simple Icons (CC0) or OpenAI's mark (public domain on Commons), this
+entry documents *provenance* rather than a licence grant. It is included on the
+same footing as every other logo here — the brand-guideline caveat above applies
+in full, and it applies with particular force to a Microsoft trademark: the mark
+appears only as an indicator of which program is running in a tab, never as
+terra's branding, and never to suggest that Microsoft endorses or is affiliated
+with terra. If Microsoft (or the gist's author) objects, drop the file and its
+row and `pwsh` falls back to the generic glyph, exactly as it did before.
+
+The artwork is unmodified. It is 204.691×154.521 and every icon here is square,
+so the shipped `powershell.svg` wraps it unchanged in a 204.691×204.691 canvas
+(`<g transform="translate(0 25.085)">`) — a centring translation, not a redraw.
+
+| file | drawn for |
+| --- | --- |
+| `powershell.svg` | `pwsh`, `powershell` (process name and title keyword) |
+
 ## `terminal.svg` — part of terra
 
 `terminal.svg` is not from Simple Icons. It is a hand-authored `>_` prompt
 glyph, original to this repository and covered by terra's own MIT licence. It
-is the fallback drawn for any program with no icon of its own, which is also
-why it depicts no product.
+is the fallback drawn for any program with no icon of its own — and, since the
+tab icons stopped branding default shells, the glyph deliberately drawn for
+`zsh`, `bash`, `sh`, `dash` and `cmd` as well. It depicts no product, which is
+the point.
 
 ## Icons deliberately absent
 
-- **PowerShell.** Likewise absent from v16.28.0; `pwsh` and `powershell` fall
-  back to the generic glyph.
+- **zsh and bash.** Their Simple Icons marks (`zsh`, `gnubash`) shipped here
+  until the tab icons stopped treating a default shell as an identity; a shell
+  is chrome, so it wears `terminal.svg`. The files were deleted rather than left
+  unreferenced.
 - **ssh.** No such icon exists upstream — OpenSSH is not a Simple Icons entry.
