@@ -68,6 +68,18 @@ impl Screenshots {
     /// Returns the PNG-encoded window, or a message fit to hand straight to
     /// the user.
     pub fn capture(&self, ctx: &egui::Context) -> Result<Vec<u8>, String> {
+        self.capture_within(ctx, TIMEOUT)
+    }
+
+    /// [`capture`](Self::capture) with a caller-chosen patience. The short
+    /// budget exists for the quiet first attempt in `ipc::screenshot`: a
+    /// visible window delivers in a frame or two, so a fraction of a second
+    /// decides whether summoning is needed at all.
+    pub fn capture_within(
+        &self,
+        ctx: &egui::Context,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
         let ticket = {
             let mut state = lock(&self.state);
             state.next += 1;
@@ -81,7 +93,7 @@ impl Screenshots {
         )));
         ctx.request_repaint();
 
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let mut state = lock(&self.state);
         loop {
             if let Some(image) = state.ready.remove(&ticket) {
@@ -93,9 +105,9 @@ impl Screenshots {
                 state.waiting.retain(|t| *t != ticket);
                 state.ready.remove(&ticket);
                 return Err(format!(
-                    "timed out after {}s waiting for terra to draw a frame — \
+                    "timed out after {:.1}s waiting for terra to draw a frame — \
                      the window may be minimised, fully covered or on another Space",
-                    TIMEOUT.as_secs()
+                    timeout.as_secs_f32()
                 ));
             };
             state = self

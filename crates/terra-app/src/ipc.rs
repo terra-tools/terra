@@ -452,6 +452,14 @@ fn send_keys(
 /// compositor that refuses self-activation (Wayland); those end at
 /// `Screenshots::capture`'s timeout with a message that says so.
 fn screenshot(shots: &Screenshots, ctx: &egui::Context) -> Response {
+    // Quiet first: a visible window — focused or not — renders on a repaint
+    // request alone, so most screenshots need no focus change at all. Only
+    // when no frame arrives (minimised, fully covered, other Space — the
+    // states where eframe parks the UI thread) is the window summoned, which
+    // steals focus but is the one way to get a frame at all.
+    if let Ok(png) = shots.capture_within(ctx, std::time::Duration::from_millis(600)) {
+        return Response::ok_png(&png);
+    }
     crate::macos::activate_app();
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     ctx.request_repaint();
