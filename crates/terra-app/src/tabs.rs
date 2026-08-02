@@ -776,6 +776,15 @@ impl TabManager {
         self.leaves().iter().position(|g| g.tab_ids.contains(&id))
     }
 
+    /// The stable leaf id of group `group` — what survives the tree changing
+    /// shape. DFS indices renumber every leaf after an insertion; per-group
+    /// UI state (bar animations, widget ids) must key on this instead, or a
+    /// split in one place makes every bar to its right inherit a
+    /// neighbour's state.
+    pub fn group_leaf_id(&self, group: usize) -> Option<u64> {
+        self.leaves().get(group).map(|g| g.id)
+    }
+
     /// The tab ids of group `group` in bar order (empty for an unknown group).
     pub fn group_tabs(&self, group: usize) -> Vec<u64> {
         self.leaves()

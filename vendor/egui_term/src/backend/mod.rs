@@ -233,41 +233,46 @@ impl TerminalBackend {
         let _pty_event_subscription = std::thread::Builder::new()
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
-                if let Ok(event) = event_receiver.recv() {
-                    pty_event_proxy_sender
-                        .send((id, event.clone()))
-                        .unwrap_or_else(|_| {
-                            panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
-                        });
-                    if visible_in_thread.load(std::sync::atomic::Ordering::Relaxed)
-                        || matches!(event, Event::Exit | Event::Title(_))
-                    {
-                        app_context.clone().request_repaint();
-                    }
-                    match event {
-                        Event::Exit => break,
-                        Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
-                        // terra patch: answer colour queries.
-                        //
-                        // Programs ask what the terminal's foreground and
-                        // background actually are so they can derive a shade
-                        // that contrasts with it — Codex computes its
-                        // composer background this way. A terminal that
-                        // stays silent gets no styling at all, which looks
-                        // like a missing feature rather than an unanswered
-                        // question. alacritty hands us the index and a
-                        // formatter; all we owe it is the colour.
-                        Event::ColorRequest(index, format) => {
-                            let rgb = colors_in_thread
-                                .lock()
-                                .as_ref()
-                                .and_then(|table| table.get(index).copied());
-                            if let Some(rgb) = rgb {
-                                pty_notifier.notify(format(rgb).into_bytes());
-                            }
+                // A closed tab drops the Term (and with it every sender)
+                // without an Event::Exit ever arriving here; recv() then
+                // returns Err forever and `if let Ok` would spin this
+                // thread at 100% CPU for the rest of the process's life.
+                let Ok(event) = event_receiver.recv() else {
+                    break;
+                };
+                pty_event_proxy_sender
+                    .send((id, event.clone()))
+                    .unwrap_or_else(|_| {
+                        panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
+                    });
+                if visible_in_thread.load(std::sync::atomic::Ordering::Relaxed)
+                    || matches!(event, Event::Exit | Event::Title(_))
+                {
+                    app_context.clone().request_repaint();
+                }
+                match event {
+                    Event::Exit => break,
+                    Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
+                    // terra patch: answer colour queries.
+                    //
+                    // Programs ask what the terminal's foreground and
+                    // background actually are so they can derive a shade
+                    // that contrasts with it — Codex computes its
+                    // composer background this way. A terminal that
+                    // stays silent gets no styling at all, which looks
+                    // like a missing feature rather than an unanswered
+                    // question. alacritty hands us the index and a
+                    // formatter; all we owe it is the colour.
+                    Event::ColorRequest(index, format) => {
+                        let rgb = colors_in_thread
+                            .lock()
+                            .as_ref()
+                            .and_then(|table| table.get(index).copied());
+                        if let Some(rgb) = rgb {
+                            pty_notifier.notify(format(rgb).into_bytes());
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             })?;
 
