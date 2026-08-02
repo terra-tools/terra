@@ -1,0 +1,49 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- terra app icon — "Lit Glyph / Symmetric fix" (v14 #1), shipped 2026-08-01.
+       Dark tile, steel glowing squircle, white >_ with soft glow.
+       Composition approved at: chevron 136x192 w40, underscore 88 at baseline,
+       gap 48, glyph scale .76. Whole design sits on Apple's 824/1024 icon grid
+       (factor k = 824/900 applied to the approved 900-grid gallery render). -->
+  <defs>
+    <linearGradient id="tilegrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#232329"/>
+      <stop offset="0.5" stop-color="#17171c"/>
+      <stop offset="1" stop-color="#0e0e12"/>
+    </linearGradient>
+    <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#bfdbfe"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <filter id="halo" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="38"/>
+    </filter>
+    <filter id="glyphGlow" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+  </defs>
+
+  <!-- outer tile: 824x824 on the macOS icon grid -->
+  <rect x="100" y="100" width="824" height="824" rx="183" fill="url(#tilegrad)"/>
+
+  <!-- inner glowing squircle -->
+  <rect x="239.5" y="248.7" width="545" height="545" rx="152.6"
+        fill="url(#steel)" filter="url(#halo)" opacity="0.55"/>
+  <rect x="239.5" y="248.7" width="545" height="545" rx="152.6"
+        fill="url(#steel)"/>
+
+  <!-- the >_ : symmetric chevron + baseline underscore -->
+  <g filter="url(#glyphGlow)" opacity="0.8">
+    <g transform="translate(455.7 509.6) scale(0.828)">
+      <path d="M-68 -96 L68 0 L-68 96" stroke="#ffffff" stroke-width="40"
+            fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M116 124 L204 124" stroke="#ffffff" stroke-width="40"
+            fill="none" stroke-linecap="round"/>
+    </g>
+  </g>
+  <g transform="translate(455.7 509.6) scale(0.828)">
+    <path d="M-68 -96 L68 0 L-68 96" stroke="#ffffff" stroke-width="40"
+          fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M116 124 L204 124" stroke="#ffffff" stroke-width="40"
+          fill="none" stroke-linecap="round"/>
+  </g>
+</svg>

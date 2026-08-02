@@ -1,0 +1,84 @@
+# terra configuration — copy to ~/.terra/config.toml
+#
+# Every key is optional; anything you leave out keeps its default. Unknown
+# keys are ignored and reported as warnings, and a broken file never stops
+# terra from starting — it just falls back to the defaults.
+#
+# Set TERRA_CONFIG to load a different file.
+
+[font]
+# Terminal font size in points. 6.0 – 72.0.
+size = 15.0
+
+# Cell height multiplier, the equivalent of Ghostty's `adjust-cell-height`.
+# 0.5 – 3.0.
+line_height = 1.3
+
+[text]
+# Reorder right-to-left text (Hebrew, Arabic, …) for display, per the Unicode
+# Bidirectional Algorithm, UAX #9: https://unicode.org/reports/tr9/
+#
+#   "off"  — never reorder (default). What every other terminal does.
+#   "on"   — always reorder.
+#   "auto" — decide per tab from [text.bidi_quirks] below, using the program
+#            running in it. Anything not listed there is treated as "off".
+#
+# With this off, RTL text is painted exactly as the program sent it. With it
+# on, each row is reordered for display while the buffer, the clipboard and
+# any URL matching stay in logical order.
+#
+# The default is "off" because reordering is only correct for programs that
+# send *logical* order and leave the reordering to the terminal. A program
+# that runs its own BiDi and sends visual order gets double-reversed into
+# nonsense if the terminal reorders too — and, as below, the terminal cannot
+# tell the two apart. "off" is the answer that never corrupts anything.
+#
+# Note this is BiDi *level 1*: reordering and bracket mirroring, no Arabic
+# contextual shaping. Hebrew reads correctly; Arabic is ordered correctly but
+# renders as isolated letterforms.
+#
+# Toggle at runtime with ⌘⇧B, or "Toggle RTL Text Reordering" in the command
+# palette (⌘⇧P). Runtime toggles last for the session and are not written
+# back to this file.
+bidi = "off"
+
+# The paragraph direction each row is resolved against.
+#
+#   "auto" — detect per row with UAX #9 rules P2/P3 (default)
+#   "ltr"  — always left-to-right
+#   "rtl"  — always right-to-left
+#
+# "auto" is what puts sentence-final punctuation on the correct side: under
+# "ltr" the `?` of `היי מה קורה?` resolves to the paragraph level and is
+# stranded on the visual right. It does not move a shell prompt, because P2
+# stops at the first strong character — the `t` of `terra` in
+# `→ terra git:(main) ✗ …`.
+#
+# Detection runs over each row's non-blank prefix only. Including the row's
+# trailing padding would drag it into the reversed run and push a four-letter
+# Hebrew word out to column 76 of an 80-column terminal.
+#
+# Cycle at runtime from the command palette.
+bidi_base = "auto"
+
+# Per-application overrides, consulted when bidi = "auto".
+#
+# This table exists because the choice is undecidable from the byte stream.
+# A terminal receives one sequence of characters, and UAX #9 gives logical
+# order and visual order the *same* representation — there is no marker, no
+# heuristic, and no amount of looking at the text that distinguishes "please
+# reorder this" from "I already did". Only the program at the other end knows,
+# so terra keys the decision on which program is running in the tab.
+#
+# It is a compatibility table, not language detection: nothing here inspects
+# the text, and adding a program says nothing about what languages it prints.
+#
+# Keys are the command's basename, matched case-insensitively. Values are the
+# same "off" / "on" / "auto" as `bidi` above. Your entries are merged over the
+# ones terra ships, key by key, so listing one program keeps the rest.
+[text.bidi_quirks]
+# Runs its own bidirectional algorithm and emits visual order; reordering it
+# again would reverse it back to mirrored.
+claude = "off"
+# Emits logical order and expects the terminal to reorder.
+codex = "on"

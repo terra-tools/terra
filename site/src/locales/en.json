@@ -1,0 +1,115 @@
+{
+  "meta": {
+    "title": "terra — a terminal your agents can drive",
+    "description": "A GUI terminal with browser-style tabs and a remote-control CLI. Any process can open a tab, type into it, and read it back — while you watch the same tabs live."
+  },
+  "nav": {
+    "docs": "Docs",
+    "architecture": "Architecture",
+    "github": "GitHub",
+    "download": "Download"
+  },
+  "hero": {
+    "badge": {
+      "loading": "Checking for the latest release…",
+      "no-release": "Preview — not yet released",
+      "rate-limited": "Preview — GitHub rate limit hit, download links go to the releases page",
+      "network": "Preview — couldn't reach GitHub, download links go to the releases page"
+    },
+    "title": "A terminal your agents can drive.",
+    "subtitle": "Browser-style tabs in a clean, dark window. A <1>terra</1> CLI opens tabs, types into them, and reads them back — while you watch the same tabs live.",
+    "primaryCta": "Download for {{platform}}",
+    "secondaryCta": "See how it works",
+    "note": "Free and open source. MIT licensed."
+  },
+  "window": {
+    "tabOne": "~/terra",
+    "tabTwo": "tests",
+    "tabThree": "agent",
+    "update": "Update",
+    "updateTitle": "A new version of terra is available"
+  },
+  "story": {
+    "title": "tmux ergonomics, in a window you can actually watch",
+    "subtitle": "Agents work best when you can see what they're doing. terra gives every process a tab, and gives you the same tabs.",
+    "open": {
+      "title": "Open a tab",
+      "body": "Any process — a coding agent, a script, you — can spawn a real PTY with a title and a working directory. It prints the tab id."
+    },
+    "drive": {
+      "title": "Type into it",
+      "body": "Send keystrokes the way tmux does. The tab is live: you can take over mid-command, and the agent sees what you typed."
+    },
+    "read": {
+      "title": "Read it back",
+      "body": "Capture the screen as plain text, or as a full styled cell grid for tools that care about colour."
+    },
+    "watch": {
+      "title": "Watch it happen",
+      "body": "Every tab is a tab in your window. No attach, no detach, no separate session to reason about."
+    }
+  },
+  "install": {
+    "title": "Install",
+    "subtitle": "One action from here to a running terra.",
+    "platform": {
+      "macos": "macOS",
+      "windows": "Windows",
+      "linux": "Linux"
+    },
+    "download": "Download",
+    "cliTitle": "Or install from your terminal",
+    "cliNote": "Installs the app and puts the <1>terra</1> CLI on your PATH.",
+    "brewTitle": "Homebrew",
+    "copy": "Copy",
+    "copied": "Copied",
+    "version": "Version {{version}}",
+    "comingSoon": "Coming soon",
+    "notice": {
+      "loading": "Looking up the latest release on GitHub…",
+      "no-release": "The first release hasn't been published yet. The page is real; the artifacts aren't — the button goes to the releases page, which will fill in the moment a tag is cut.",
+      "rate-limited": "GitHub's API rate limit is in the way, so the exact files can't be listed right now. The releases page has everything.",
+      "network": "Couldn't reach GitHub to list the release files. The releases page has everything."
+    },
+    "checkReleases": "Downloads appear here as soon as a release is published.",
+    "noAssetForPlatform": "This release has no {{platform}} build yet.",
+    "viewReleases": "Releases",
+    "versionUnknown": "No release published yet",
+    "asset": {
+      "dmg": "Disk image (.dmg)",
+      "app": "App bundle (.app.tar.gz)",
+      "cli": "CLI only",
+      "exe": "Installer (.exe)",
+      "msi": "Installer (.msi)",
+      "deb": "Debian package (.deb)",
+      "rpm": "RPM package (.rpm)",
+      "appimage": "AppImage",
+      "archive": "Archive"
+    }
+  },
+  "docs": {
+    "title": "Read the docs",
+    "agents": {
+      "title": "For your agents",
+      "body": "A paste-ready block for your CLAUDE.md or AGENTS.md so agents run their commands in visible terra tabs."
+    },
+    "architecture": {
+      "title": "Architecture",
+      "body": "Crate layout, the wire protocol, and the CLI contract."
+    },
+    "development": {
+      "title": "Development",
+      "body": "Building, tasks, packaging, and project conventions."
+    },
+    "learn": {
+      "title": "terra learn",
+      "body": "The CLI teaches itself. One command prints everything an agent needs to know."
+    }
+  },
+  "footer": {
+    "tagline": "A GUI terminal with agent-controllable tabs.",
+    "license": "MIT licensed",
+    "issues": "Issues",
+    "source": "Source"
+  }
+}

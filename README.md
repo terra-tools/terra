@@ -13,10 +13,18 @@ just t learn          # the CLI teaches agents (and you) everything else
 ```
 
 ```sh
-id=$(terra new --title "tests" -- bash)   # open a tab
-terra send "$id" "cargo test" --enter      # type into it
-terra capture "$id"                        # read its screen
+id=$(terra new --title "tests")               # open a tab
+terra send "$id" "cargo test{Enter}" --keys   # type into it ({C-c}, {Tab}, {Up}, …)
+terra send "$id" "$(cat patch.txt)"           # no --keys: text goes in literally
+terra capture "$id"                           # read its screen
+terra capture "$id" --cells                   # …or as JSON, with colours and cursor
 ```
+
+Also: `terra bidi <tab> off|on|auto` (right-to-left reordering, per tab),
+`terra doctor` (what the terminal you're in advertises) and `terra record`
+(both directions of a program's terminal I/O) — the last two work in any
+terminal, so their output diffs. Settings live in `~/.terra/config.toml`
+([template](docs/config.example.toml)).
 
 ## Docs
 

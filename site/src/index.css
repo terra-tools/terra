@@ -1,0 +1,77 @@
+@import 'tailwindcss';
+
+/* Design tokens lifted from the app itself, so the site and the product are
+   literally the same colours:
+     - tile/steel gradients: crates/terra-app/assets/icon/terra.svg
+     - chrome greys:         crates/terra-app/src/ui.rs (BAR_BG, TAB_ACTIVE_BG, …)
+     - terminal bg/fg:       vendor/egui_term/src/theme.rs (ColorPalette::default)
+   Change one there, change it here. */
+@theme {
+  --color-tile-100: #232329;
+  --color-tile-200: #17171c;
+  --color-tile-300: #0e0e12;
+
+  --color-steel-100: #bfdbfe;
+  --color-steel-500: #3b82f6;
+  --color-steel-700: #1d4ed8;
+
+  --color-chrome-bar: #1c1c1e;
+  --color-chrome-line: #2a2a2e;
+  --color-chrome-tab: #1f1f21;
+  --color-chrome-active: #4a4a4f;
+  --color-chrome-edge: #5c5c62;
+  --color-chrome-sep: #141416;
+
+  --color-ink-100: #efeff4;
+  --color-ink-300: #b6b6be;
+  --color-ink-500: #6a6a74;
+
+  --color-term-bg: #181818;
+  --color-term-fg: #d8d8d8;
+
+  --font-mono:
+    'SF Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
+    monospace;
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+  background: var(--color-tile-300);
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-ink-100);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* The soft steel bloom the app icon uses behind its squircle. */
+.halo::before {
+  content: '';
+  position: absolute;
+  inset: -12% -6% 18%;
+  background: radial-gradient(
+    ellipse at 50% 40%,
+    color-mix(in oklab, var(--color-steel-500) 26%, transparent),
+    transparent 62%
+  );
+  filter: blur(72px);
+  z-index: -1;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
