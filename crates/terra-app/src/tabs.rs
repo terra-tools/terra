@@ -615,8 +615,9 @@ fn build_layout(node: &Node, next_leaf: &mut usize) -> LayoutNode {
 }
 
 /// `h([0,2] v([1] [3]))`-style rendering of the tree, leaves as their tab
-/// ids — one line the tree tests can assert whole shapes with.
-#[cfg(test)]
+/// ids — one line the tree tests can assert whole shapes with. Unix-only
+/// like its callers: the shape tests spawn real PTYs.
+#[cfg(all(test, unix))]
 fn shape_of(node: &Node) -> String {
     match &node.kind {
         NodeKind::Leaf(group) => format!(
@@ -824,8 +825,8 @@ impl TabManager {
     }
 
     /// The tree as a string — `h([0,2] v([1] [3]))`, leaves as tab ids — for
-    /// the shape tests.
-    #[cfg(test)]
+    /// the shape tests (unix-only, like [`shape_of`]).
+    #[cfg(all(test, unix))]
     pub fn shape(&self) -> String {
         match self.tree.borrow().as_ref() {
             Some(root) => shape_of(root),
