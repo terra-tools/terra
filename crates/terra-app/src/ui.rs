@@ -27,6 +27,7 @@ use egui::{
     Rect, Sense, Stroke, Ui, Vec2,
 };
 
+use crate::config::Profile;
 use crate::tab_icon::{IconCache, TabIcon};
 use crate::tabs::TabManager;
 
@@ -775,34 +776,60 @@ pub fn bar_visible(tab_count: usize, group_count: usize) -> bool {
 // The `⌄` dropdown
 // ---------------------------------------------------------------------------
 
-/// One row of a dropdown: what it says, and what choosing it does.
+/// One row of a dropdown: what it says, what it wears, and what choosing it
+/// does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuEntry {
     pub label: String,
+    /// The logo drawn to the left of the label, from the same set the pills
+    /// use — so the row for an `htop` profile and the tab it opens carry the
+    /// same mark.
+    pub icon: TabIcon,
     pub action: AppAction,
 }
 
 impl MenuEntry {
+    /// A row wearing the generic `>_`. Rows that can name a program build on
+    /// this with [`Self::with_icon`].
     pub fn new(label: impl Into<String>, action: AppAction) -> Self {
         Self {
             label: label.into(),
+            icon: TabIcon::Terminal,
             action,
         }
+    }
+
+    pub fn with_icon(mut self, icon: TabIcon) -> Self {
+        self.icon = icon;
+        self
     }
 }
 
 /// The entries the `⌄` next to a `+` offers: the default shell, then one row
 /// per profile in name order.
 ///
+/// Takes whole [`Profile`]s rather than names because the row wants an icon,
+/// and what a profile *runs* is the only honest source for one — a profile
+/// called `work` running `htop` is an htop row. The tab it opens will resolve
+/// its own icon from the live process table a moment later; this is the same
+/// guess made from the only thing known before the tab exists.
+///
 /// Split out from the drawing so the list is testable without a `Ui`, and so
 /// whoever re-anchors the button only has to decide *where* it goes.
-pub fn new_tab_entries<'a>(profiles: impl IntoIterator<Item = &'a str>) -> Vec<MenuEntry> {
+pub fn new_tab_entries<'a>(profiles: impl IntoIterator<Item = &'a Profile>) -> Vec<MenuEntry> {
     let mut entries = vec![MenuEntry::new("New Tab", AppAction::NewTab)];
-    entries.extend(
-        profiles
-            .into_iter()
-            .map(|name| MenuEntry::new(name, AppAction::NewTabProfile(name.to_owned()))),
-    );
+    entries.extend(profiles.into_iter().map(|profile| {
+        let mut text = profile.command.join(" ");
+        if let Some(title) = &profile.title {
+            text.push(' ');
+            text.push_str(title);
+        }
+        MenuEntry::new(
+            &profile.name,
+            AppAction::NewTabProfile(profile.name.clone()),
+        )
+        .with_icon(crate::tab_icon::from_text(&text).unwrap_or(TabIcon::Terminal))
+    }));
     entries
 }
 
@@ -861,20 +888,132 @@ pub fn chevron_menu(
         );
     }
 
+    let width = menu_width(ui, entries);
     let mut chosen = None;
     egui::Popup::menu(&response)
+        // Right-aligned under the chevron, which is itself the rightmost thing
+        // in the bar: growing left is the only direction that cannot run off
+        // the window.
         .align(egui::RectAlign::BOTTOM_END)
-        .gap(4.0)
+        .gap(MENU_GAP)
+        .frame(menu_frame())
         .show(|ui| {
-            ui.set_min_width(MENU_MIN_WIDTH);
-            for entry in entries {
-                if ui.button(&entry.label).clicked() {
+            // Fixed, not `set_min_width`: a row is a full-width shape, and
+            // `available_width` inside a free-floating popup is the rest of
+            // the screen — asking for it would stretch the panel to the
+            // window edge.
+            ui.set_width(width);
+            // Rows own their own height and the frame owns the padding, so
+            // egui's default rhythm has nothing left to add.
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            for (i, entry) in entries.iter().enumerate() {
+                // The default shell is not one of the profiles; a hairline
+                // says so without a heading.
+                if i == 1 {
+                    menu_separator(ui);
+                }
+                if menu_row(ui, entry).clicked() {
                     chosen = Some(entry.action.clone());
                     ui.close();
                 }
             }
         });
     chosen
+}
+
+/// How wide the panel's *content* has to be for the longest label to fit,
+/// floored at [`MENU_MIN_WIDTH`] so a menu of short names is still a menu and
+/// not a chip.
+fn menu_width(ui: &Ui, entries: &[MenuEntry]) -> f32 {
+    let font = title_font(false);
+    let widest = entries
+        .iter()
+        .map(|entry| {
+            ui.painter()
+                .layout_no_wrap(entry.label.clone(), font.clone(), MENU_TEXT)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max);
+    let content = MENU_ROW_PAD_X * 2.0 + ICON_SIZE + MENU_ICON_GAP + widest;
+    content.max(MENU_MIN_WIDTH - 2.0 * f32::from(MENU_PAD))
+}
+
+/// The dropdown's panel: a dark card a shade above the bar, hairlined and
+/// floated off the window with a soft shadow — the same material the command
+/// palette is made of (see `terra-palette`), scaled down to a menu.
+fn menu_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(MENU_BG)
+        .stroke(Stroke::new(1.0, MENU_BORDER))
+        .corner_radius(CornerRadius::same(MENU_CORNER))
+        .inner_margin(egui::Margin::same(MENU_PAD))
+        .shadow(egui::Shadow {
+            offset: [0, 8],
+            blur: 28,
+            spread: 0,
+            color: Color32::from_black_alpha(130),
+        })
+}
+
+/// One row: hover pill, icon, label. Drawn rather than composed out of
+/// `ui.button`, because a menu row is a shape (a full-width rounded highlight
+/// with a leading logo) and not a button with the padding filed off.
+fn menu_row(ui: &mut Ui, entry: &MenuEntry) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), MENU_ROW_HEIGHT),
+        Sense::click(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let hovered = response.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(MENU_ROW_CORNER), MENU_ROW_HOVER);
+    }
+    let text_color = if hovered { TITLE_ACTIVE } else { MENU_TEXT };
+
+    let icon = Rect::from_center_size(
+        egui::pos2(
+            rect.left() + MENU_ROW_PAD_X + ICON_SIZE * 0.5,
+            rect.center().y,
+        ),
+        Vec2::splat(ICON_SIZE),
+    );
+    // The generic `>_` is chrome and fades back like it does on a pill; a
+    // brand mark is the point of the row and stays at full strength.
+    let tint = if entry.icon.is_generic() {
+        text_color.gamma_multiply(GENERIC_ICON_ALPHA)
+    } else {
+        text_color
+    };
+    crate::tab_icon::paint(ui, entry.icon, icon, tint);
+
+    let galley = ui
+        .painter()
+        .layout_no_wrap(entry.label.clone(), title_font(false), text_color);
+    let baseline = egui::pos2(
+        icon.right() + MENU_ICON_GAP,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter().galley(baseline, galley, text_color);
+    response
+}
+
+/// The hairline between the default shell and the profiles, inset from the
+/// panel's edges the way a macOS menu separator is.
+fn menu_separator(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), MENU_SEPARATOR_HEIGHT),
+        Sense::hover(),
+    );
+    let y = rect.center().y.round() + 0.5;
+    ui.painter().hline(
+        (rect.left() + MENU_SEPARATOR_INSET)..=(rect.right() - MENU_SEPARATOR_INSET),
+        y,
+        Stroke::new(1.0, MENU_SEPARATOR),
+    );
 }
 
 /// Height of the chevron's hover fill — a little short of the tab height, so
@@ -884,7 +1023,36 @@ const CHEVRON_CORNER: u8 = 6;
 /// Half-width of the `⌄` glyph.
 const CHEVRON_ARM: f32 = 4.0;
 /// Keeps the menu from collapsing to the width of "New Tab".
-const MENU_MIN_WIDTH: f32 = 150.0;
+const MENU_MIN_WIDTH: f32 = 220.0;
+/// How far below the chevron the panel floats — enough to read as a separate
+/// surface, not so far it detaches from the button that opened it.
+const MENU_GAP: f32 = 5.0;
+/// One notch above the bar (`BAR_BG`), so the panel reads as sitting *over*
+/// the chrome rather than being cut out of it.
+const MENU_BG: Color32 = Color32::from_rgb(0x26, 0x26, 0x2b);
+/// ~9% white: the lit edge that lifts the card off whatever is behind it.
+const MENU_BORDER: Color32 = Color32::from_rgba_premultiplied(0x17, 0x17, 0x17, 0x17);
+const MENU_CORNER: u8 = 10;
+const MENU_PAD: i8 = 6;
+/// Roomy enough to click without aiming, from the same family as macOS's own
+/// menu rows.
+const MENU_ROW_HEIGHT: f32 = 29.0;
+const MENU_ROW_CORNER: u8 = 8;
+const MENU_ROW_PAD_X: f32 = 10.0;
+/// Wider than the pills' [`ICON_GAP`]: a menu has the room, and the extra air
+/// lets the labels line up as a column instead of crowding their logos.
+const MENU_ICON_GAP: f32 = 8.0;
+/// The hover fill, from the pills' grey family — between [`TAB_HOVER_BG`] and
+/// [`TAB_ACTIVE_BG`], because it has to read against the panel and not the bar.
+const MENU_ROW_HOVER: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x40);
+/// Vertical space the separator row takes, and the 1px rule inside it.
+const MENU_SEPARATOR_HEIGHT: f32 = 7.0;
+const MENU_SEPARATOR_INSET: f32 = 4.0;
+/// ~7% white — present, never a bar across the menu.
+const MENU_SEPARATOR: Color32 = Color32::from_rgba_premultiplied(0x12, 0x12, 0x12, 0x12);
+/// Menu labels sit a touch brighter than an inactive pill's: nothing in a
+/// dropdown is "inactive".
+const MENU_TEXT: Color32 = Color32::from_rgb(0xe2, 0xe2, 0xe8);
 
 /// Which slot index a tab dragged to `x` wants, given the pitch of the row.
 fn drop_index(x: f32, bar_left: f32, pitch: f32, count: usize) -> usize {
@@ -1147,8 +1315,8 @@ pub fn tab_bar(
                 egui::pos2(chevron_left, bar.top()),
                 Vec2::new(CHEVRON_WIDTH, bar.height()),
             );
-            let names: Vec<&str> = tabs.profiles().keys().map(String::as_str).collect();
-            if let Some(action) = chevron_menu(ui, chevron, group, &new_tab_entries(names)) {
+            let entries = new_tab_entries(tabs.profiles().values());
+            if let Some(action) = chevron_menu(ui, chevron, group, &entries) {
                 // The menu's rows open a tab in *this* group. `open` targets
                 // the focused group, so say which one that is first rather
                 // than leaning on the click having landed inside the column
@@ -1494,7 +1662,8 @@ mod tests {
         assert_eq!(bare.len(), 1);
         assert_eq!(bare[0], MenuEntry::new("New Tab", AppAction::NewTab));
 
-        let entries = new_tab_entries(["build", "htop"]);
+        let profiles = [profile("build", "cargo build"), profile("htop", "htop")];
+        let entries = new_tab_entries(&profiles);
         let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(labels, ["New Tab", "build", "htop"]);
         assert_eq!(
@@ -1504,6 +1673,41 @@ mod tests {
         assert_eq!(
             entries[2].action,
             AppAction::NewTabProfile("htop".to_owned())
+        );
+    }
+
+    fn profile(name: &str, command: &str) -> Profile {
+        Profile {
+            name: name.to_owned(),
+            command: command.split(' ').map(str::to_owned).collect(),
+            ..Profile::default()
+        }
+    }
+
+    /// A row wears the mark of whatever the profile runs, not of its name: a
+    /// profile called `top` that runs htop is an htop row. Anything terra does
+    /// not recognise falls back to the generic `>_` rather than to nothing, so
+    /// the labels stay in one column.
+    #[test]
+    fn a_profile_row_takes_its_icon_from_the_command_it_runs() {
+        let profiles = [
+            profile("top", "htop"),
+            profile("ai", "codex"),
+            profile("plain", "/bin/zsh -l"),
+        ];
+        let icons: Vec<TabIcon> = new_tab_entries(&profiles)
+            .iter()
+            .map(|entry| entry.icon)
+            .collect();
+        assert_eq!(
+            icons,
+            [
+                // "New Tab" itself.
+                TabIcon::Terminal,
+                TabIcon::Htop,
+                TabIcon::OpenAi,
+                TabIcon::Terminal,
+            ]
         );
     }
 
