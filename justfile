@@ -65,7 +65,33 @@ t *args:
 bundle: release
     cargo packager -p terra-app --release
 
-# Bundle + ad-hoc sign + install to /Applications and the CLI to bin, e.g. `just install 1 ~/.local/bin`
+# One-time: mint a stable self-signed "terra-dev" signing identity, so macOS
+# recognises the app across upgrades and TCC permission grants survive.
+# Ad-hoc signatures (`--sign -`) are per-build hashes: every upgrade looks
+# like a brand-new app and re-prompts for Downloads/Music/etc.
+setup-signing:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if security find-identity -v -p codesigning | grep -q terra-dev; then
+        echo "terra-dev identity already exists"; exit 0
+    fi
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -subj "/CN=terra-dev" \
+        -addext "keyUsage=digitalSignature" \
+        -addext "extendedKeyUsage=codeSigning" \
+        -keyout "$tmp/key.pem" -out "$tmp/cert.pem"
+    openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+        -passout pass:terra -out "$tmp/terra-dev.p12"
+    security import "$tmp/terra-dev.p12" -P terra -T /usr/bin/codesign
+    echo "terra-dev identity created. macOS may show one keychain prompt on the"
+    echo "next 'just upgrade' — choose Always Allow. Permissions will then"
+    echo "survive upgrades (one final round of TCC prompts, then never again)."
+
+# Bundle + sign + install to /Applications and the CLI to bin, e.g. `just install 1 ~/.local/bin`.
+# Signs with the stable terra-dev identity when present (see setup-signing),
+# else falls back to ad-hoc.
 install force="" bin="/usr/local/bin":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -75,7 +101,19 @@ install force="" bin="/usr/local/bin":
         exit 1
     fi
     just bundle
-    codesign --force --deep --sign - target/release/terra.app
+    identity=$(security find-identity -v -p codesigning \
+        | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')
+    if [ -z "$identity" ] && security find-identity -v -p codesigning | grep -q terra-dev; then
+        identity=terra-dev
+    fi
+    if [ -n "$identity" ]; then
+        echo "signing with: $identity"
+        codesign --force --deep --options runtime --sign "$identity" target/release/terra.app
+    else
+        echo "note: signing ad-hoc; run 'just setup-signing' once to stop macOS" >&2
+        echo "      re-asking for folder permissions after every upgrade" >&2
+        codesign --force --deep --sign - target/release/terra.app
+    fi
     # Deliberate: the bundle being replaced has to let go of the app first. The
     # pattern is bundle-only, so `just run`'s dev instance keeps running.
     pkill -f 'terra.app/Contents/MacOS/terra-app' 2>/dev/null || true
