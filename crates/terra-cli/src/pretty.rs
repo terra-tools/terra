@@ -33,16 +33,17 @@ use anyhow::{bail, Context, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
-/// The default background: indigo to pink, on the diagonal. Dark enough at
-/// both ends that a dark terminal card sits on it without glare, saturated
-/// enough that the card reads as a separate object.
-pub const DEFAULT_BG: (Rgb, Rgb) = (Rgb(0x4f, 0x46, 0xe5), Rgb(0xec, 0x48, 0x99));
+/// The default background: ray.so's soft lavender, on the diagonal — a
+/// bluish lilac into a paler pink-tinged one. Light on purpose: the dark
+/// terminal card reads as a separate object floating on it.
+pub const DEFAULT_BG: (Rgb, Rgb) = (Rgb(0xa8, 0x9b, 0xf2), Rgb(0xdc, 0xc9, 0xf2));
 
-/// macOS window controls, in the order they appear.
+/// The window dots. ray.so-style: three identical muted grey discs rather
+/// than the literal red/amber/green — decoration, not controls.
 const TRAFFIC_LIGHTS: [Rgb; 3] = [
-    Rgb(0xff, 0x5f, 0x57),
-    Rgb(0xfe, 0xbc, 0x2e),
-    Rgb(0x28, 0xc8, 0x40),
+    Rgb(0x56, 0x51, 0x60),
+    Rgb(0x56, 0x51, 0x60),
+    Rgb(0x56, 0x51, 0x60),
 ];
 
 /// A decoded image: 8-bit RGBA, row major, no padding.
@@ -114,15 +115,17 @@ impl Layout {
     fn for_image(width: usize, height: usize) -> Self {
         let scale = (width.min(height) as f32 / 720.0).clamp(1.0, 4.0);
         Self {
-            pad: 56.0 * scale,
-            radius: 12.0 * scale,
-            chrome: 34.0 * scale,
-            dot_inset: 19.0 * scale,
-            dot_radius: 6.0 * scale,
-            dot_gap: 20.0 * scale,
-            shadow_offset: 14.0 * scale,
-            shadow_blur: 22.0 * scale,
-            shadow_alpha: 0.42,
+            // ray.so proportions: the card floats with a wide margin —
+            // roughly an eighth of the card per side, not a thin frame.
+            pad: 190.0 * scale,
+            radius: 16.0 * scale,
+            chrome: 44.0 * scale,
+            dot_inset: 30.0 * scale,
+            dot_radius: 8.5 * scale,
+            dot_gap: 27.0 * scale,
+            shadow_offset: 16.0 * scale,
+            shadow_blur: 38.0 * scale,
+            shadow_alpha: 0.30,
         }
     }
 }
@@ -590,5 +593,23 @@ mod tests {
             Ok(_) => panic!("garbage must not decode as a PNG"),
         };
         assert!(format!("{err:#}").contains("not a PNG"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+
+    /// Not a test: a compositor preview for design iteration.
+    /// `cargo test -p terra-cli preview -- --ignored` after putting a plain
+    /// screenshot at /tmp/plain.png; writes /tmp/pretty-preview.png.
+    #[test]
+    #[ignore = "design preview, needs /tmp/plain.png"]
+    fn composite_a_local_shot() {
+        let bytes = std::fs::read("/tmp/plain.png").expect("no /tmp/plain.png");
+        let shot = decode(&bytes).expect("decode");
+        let out = compose(&shot, DEFAULT_BG);
+        std::fs::write("/tmp/pretty-preview.png", encode(&out).expect("encode"))
+            .expect("write");
     }
 }
