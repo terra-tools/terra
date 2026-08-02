@@ -13,3 +13,13 @@ terra-protocol = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+
+# `doctor` and `record` talk to the terminal itself: termios/raw mode,
+# TIOCGWINSZ, forkpty, poll, SIGWINCH. All of it is libc, none of it needs a
+# wrapper crate (see src/record.rs for why not portable-pty).
+#
+# Unix-only, and so are the two modules that use it: on other platforms
+# `tty.rs` and `record.rs` compile to stubs that say so at runtime, and the
+# rest of the CLI is unaffected.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
