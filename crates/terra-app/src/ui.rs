@@ -1024,9 +1024,11 @@ const CHEVRON_CORNER: u8 = 6;
 const CHEVRON_ARM: f32 = 4.0;
 /// Keeps the menu from collapsing to the width of "New Tab".
 const MENU_MIN_WIDTH: f32 = 220.0;
-/// How far below the chevron the panel floats — enough to read as a separate
-/// surface, not so far it detaches from the button that opened it.
-const MENU_GAP: f32 = 5.0;
+/// How far below the *chevron* the panel floats. The chevron is inset from the
+/// bar's bottom edge by [`PAD_Y`], so the visible gap under the bar is smaller
+/// than this — 8 here lands the panel ~5px clear of the bar, which is where it
+/// reads as a separate surface without detaching from the button.
+const MENU_GAP: f32 = 8.0;
 /// One notch above the bar (`BAR_BG`), so the panel reads as sitting *over*
 /// the chrome rather than being cut out of it.
 const MENU_BG: Color32 = Color32::from_rgb(0x26, 0x26, 0x2b);
