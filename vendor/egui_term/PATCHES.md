@@ -123,6 +123,12 @@
    `/System/Library/Fonts/Apple Color Emoji.ttc`. The tab bar and palette
    still go through epaint and stay monochrome.
 
+8. view.rs: U+23FA ⏺ is drawn as U+25CF ● at paint time. The codepoint
+   exists in emoji faces only, whose glyph is a record *button* (a square
+   around a dot); TUIs use it as an ANSI-tinted status bullet, which the
+   plain geometric circle serves and the button glyph does not. Cell,
+   clipboard and capture keep the original character.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to

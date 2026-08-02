@@ -406,6 +406,16 @@ impl<'a> TerminalView<'a> {
                 let glyph = row_map.map_or(indexed.c, |map| {
                     map.display_char(logical_col, indexed.c)
                 });
+                // terra patch: U+23FA ⏺ exists in emoji faces only, drawn as
+                // a record *button* (square around a dot). TUIs use it as a
+                // status bullet and tint it via ANSI, so draw the plain
+                // geometric circle the text cascade carries instead.
+                // Paint-time only: cell, clipboard and capture keep U+23FA.
+                let glyph = if glyph == '\u{23FA}' {
+                    '\u{25CF}'
+                } else {
+                    glyph
+                };
                 // terra patch (#19): emoji paint as colour bitmaps from the
                 // system emoji font, composited as textured quads — epaint's
                 // glyph path is outlines-only and cannot carry colour. A
