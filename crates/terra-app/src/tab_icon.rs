@@ -119,6 +119,10 @@ pub enum TabIcon {
     OpenCode,
     /// The fallback `>_`. Not a logo — see the module docs on colour.
     Terminal,
+    /// A gear, for the chevron menu's Settings row. Like [`Self::Terminal`]
+    /// it is chrome, not a brand, so it tints to the text colour; unlike it,
+    /// nothing ever *resolves* to it — no process is a gear.
+    Gear,
 }
 
 impl TabIcon {
@@ -140,6 +144,7 @@ impl TabIcon {
             Self::OpenAi => "openai",
             Self::OpenCode => "opencode",
             Self::Terminal => "terminal",
+            Self::Gear => "gear",
         }
     }
 
@@ -161,6 +166,7 @@ impl TabIcon {
             Self::OpenAi => include_bytes!("../assets/tab-icons/openai-64.png"),
             Self::OpenCode => include_bytes!("../assets/tab-icons/opencode-64.png"),
             Self::Terminal => include_bytes!("../assets/tab-icons/terminal-64.png"),
+            Self::Gear => include_bytes!("../assets/tab-icons/gear-64.png"),
         }
     }
 
@@ -168,7 +174,7 @@ impl TabIcon {
     /// tinted to the pill's text colour and faded back, so a row of unmatched
     /// tabs stays quiet.
     pub const fn is_generic(self) -> bool {
-        matches!(self, Self::Terminal)
+        matches!(self, Self::Terminal | Self::Gear)
     }
 
     /// Every variant, so the asset test can prove that each one has a file
@@ -191,6 +197,7 @@ impl TabIcon {
         Self::OpenAi,
         Self::OpenCode,
         Self::Terminal,
+        Self::Gear,
     ];
 }
 

@@ -140,6 +140,14 @@ tab icons stopped branding default shells, the glyph deliberately drawn for
 `zsh`, `bash`, `sh`, `dash` and `cmd` as well. It depicts no product, which is
 the point.
 
+## `gear.svg` — part of terra
+
+`gear.svg` is not from Simple Icons either: a hand-authored gear in the same
+stroke style as `terminal.svg`, original to this repository and covered by
+terra's own MIT licence. It is drawn only by the chevron menu's Settings row —
+no process ever resolves to it. Like the `>_` it is chrome, tinted to the text
+colour at paint time.
+
 ## Icons deliberately absent
 
 - **zsh and bash.** Their Simple Icons marks (`zsh`, `gnubash`) shipped here

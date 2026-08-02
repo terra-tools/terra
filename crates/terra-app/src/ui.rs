@@ -213,6 +213,10 @@ pub enum AppAction {
     ResetSession,
     /// Re-read `~/.terra/config.toml`, keeping session overrides on top.
     ReloadConfig,
+    /// Open `~/.terra/config.toml` in the system's editor (seeding it with
+    /// the documented example first if it does not exist yet) — Windows
+    /// Terminal's "Settings" menu item.
+    OpenConfig,
     ShowConfigWarnings,
     Quit,
 }
@@ -294,6 +298,10 @@ pub fn consume_shortcuts(ui: &mut Ui) -> Vec<AppAction> {
             if i.consume_shortcut(&cmd(key)) {
                 actions.push(AppAction::NudgeFontSize(1));
             }
+        }
+        // The macOS-universal Settings shortcut; terra's settings are a file.
+        if i.consume_shortcut(&cmd(Key::Comma)) {
+            actions.push(AppAction::OpenConfig);
         }
         if i.consume_shortcut(&cmd(Key::Minus)) {
             actions.push(AppAction::NudgeFontSize(-1));
@@ -830,6 +838,10 @@ pub fn new_tab_entries<'a>(profiles: impl IntoIterator<Item = &'a Profile>) -> V
         )
         .with_icon(crate::tab_icon::from_text(&text).unwrap_or(TabIcon::Terminal))
     }));
+    // Windows Terminal's dropdown ends on Settings; so does this one. The
+    // row opens the config file in an editor rather than a settings UI —
+    // the file *is* terra's settings surface.
+    entries.push(MenuEntry::new("Settings", AppAction::OpenConfig).with_icon(TabIcon::Gear));
     entries
 }
 
@@ -1665,17 +1677,21 @@ mod tests {
 
     /// The menu always offers a plain new tab first, then the profiles in the
     /// order they arrive — which is the config's `BTreeMap` order, i.e.
-    /// alphabetical.
+    /// alphabetical — and ends on Settings, Windows Terminal style.
     #[test]
     fn the_chevron_menu_lists_the_default_shell_then_every_profile() {
         let bare = new_tab_entries(std::iter::empty());
-        assert_eq!(bare.len(), 1);
+        assert_eq!(bare.len(), 2);
         assert_eq!(bare[0], MenuEntry::new("New Tab", AppAction::NewTab));
+        assert_eq!(
+            bare[1],
+            MenuEntry::new("Settings", AppAction::OpenConfig).with_icon(TabIcon::Gear)
+        );
 
         let profiles = [profile("build", "cargo build"), profile("htop", "htop")];
         let entries = new_tab_entries(&profiles);
         let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
-        assert_eq!(labels, ["New Tab", "build", "htop"]);
+        assert_eq!(labels, ["New Tab", "build", "htop", "Settings"]);
         assert_eq!(
             entries[1].action,
             AppAction::NewTabProfile("build".to_owned())
@@ -1717,6 +1733,8 @@ mod tests {
                 TabIcon::Htop,
                 TabIcon::OpenAi,
                 TabIcon::Terminal,
+                // The trailing Settings row.
+                TabIcon::Gear,
             ]
         );
     }
