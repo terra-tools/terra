@@ -646,7 +646,6 @@ mod preview {
         let bytes = std::fs::read("/tmp/plain.png").expect("no /tmp/plain.png");
         let shot = decode(&bytes).expect("decode");
         let out = compose(&shot, DEFAULT_BG);
-        std::fs::write("/tmp/pretty-preview.png", encode(&out).expect("encode"))
-            .expect("write");
+        std::fs::write("/tmp/pretty-preview.png", encode(&out).expect("encode")).expect("write");
     }
 }
