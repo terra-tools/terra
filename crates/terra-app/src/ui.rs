@@ -133,6 +133,17 @@ pub enum AppAction {
     PrevTab,
     OpenPalette,
     RenameActive,
+    /// Flip UAX #9 right-to-left reordering for the session.
+    ToggleBidi,
+    /// Cycle the BiDi paragraph direction: auto -> ltr -> rtl.
+    CycleBidiBase,
+    /// Nudge the terminal font size for the session. `+1.0` / `-1.0`.
+    NudgeFontSize(i8),
+    /// Drop every session override, returning to what the file says.
+    ResetSession,
+    /// Re-read `~/.terra/config.toml`, keeping session overrides on top.
+    ReloadConfig,
+    ShowConfigWarnings,
     Quit,
 }
 
@@ -171,6 +182,21 @@ pub fn consume_shortcuts(ui: &mut Ui) -> Vec<AppAction> {
         }
         if i.consume_shortcut(&cmd_shift(Key::CloseBracket)) {
             actions.push(AppAction::NextTab);
+        }
+        if i.consume_shortcut(&cmd_shift(Key::B)) {
+            actions.push(AppAction::ToggleBidi);
+        }
+        // Both `=` and `+` so the shortcut works without reaching for Shift.
+        for key in [Key::Plus, Key::Equals] {
+            if i.consume_shortcut(&cmd(key)) {
+                actions.push(AppAction::NudgeFontSize(1));
+            }
+        }
+        if i.consume_shortcut(&cmd(Key::Minus)) {
+            actions.push(AppAction::NudgeFontSize(-1));
+        }
+        if i.consume_shortcut(&cmd(Key::Num0)) {
+            actions.push(AppAction::ResetSession);
         }
         if i.consume_shortcut(&cmd(Key::T)) {
             actions.push(AppAction::NewTab);

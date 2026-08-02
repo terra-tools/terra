@@ -7,9 +7,14 @@ use std::sync::mpsc::Sender;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Line;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::TermMode;
+use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use egui_term::{BackendCommand, BackendSettings, PtyEvent, TerminalBackend};
+use serde::Serialize;
 use terra_protocol::TabInfo;
+
+use crate::config::BidiMode;
 
 /// Fallback when `$SHELL` is not set.
 const FALLBACK_SHELL: &str = "/bin/zsh";
@@ -29,6 +34,35 @@ fn shell_quote(arg: &str) -> String {
 
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| FALLBACK_SHELL.to_string())
+}
+
+/// Arguments that make the shell a *login* shell.
+///
+/// Launched from Finder, an app inherits launchd's minimal environment, not
+/// the one a terminal window gets. The PATH additions people actually depend
+/// on — Homebrew, nvm, pyenv, cargo — are conventionally set in `.zprofile`
+/// or `.profile`, which only a login shell reads; `.zshrc` alone is not
+/// enough, and a `.zshrc` that *uses* those tools then fails outright with
+/// "command not found".
+///
+/// `-l` covers zsh, bash and sh. A shell that does not understand it is no
+/// worse off than before, because the flag is simply rejected and the user
+/// still gets a shell.
+fn login_args(shell: &str) -> Vec<String> {
+    let name = shell.rsplit('/').next().unwrap_or(shell);
+    match name {
+        "zsh" | "bash" | "sh" | "dash" | "ksh" => vec!["-l".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// Where a tab starts when the caller did not say.
+///
+/// Also a launched-from-Finder problem: the app's own working directory is
+/// `/`, so without this every tab opens at the filesystem root rather than
+/// somewhere anyone wants to be.
+fn default_cwd() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// The two title sources of a tab, kept apart on purpose.
@@ -80,6 +114,13 @@ fn strip_user_host(title: &str) -> &str {
 pub struct Tab {
     pub backend: TerminalBackend,
     pub title: Title,
+    /// Per-tab override of `[text] bidi`, set from the palette or
+    /// `terra bidi`. `None` means "follow the config".
+    ///
+    /// It has to be per tab: whether the terminal should reorder depends on
+    /// which program is running, and one window routinely has a shell in one
+    /// tab and an agent that does its own BiDi in another.
+    pub bidi: Option<BidiMode>,
 }
 
 impl Tab {
@@ -200,7 +241,8 @@ impl TabManager {
         // A command tab is just a default-shell tab with the command typed
         // into it (tmux send-keys style): the user's real prompt renders,
         // the command line is visible, and the shell survives after it.
-        let (shell, args) = (default_shell(), Vec::new());
+        let shell = default_shell();
+        let args = login_args(&shell);
 
         let id = self.next_id;
         let mut backend = TerminalBackend::new(
@@ -210,9 +252,16 @@ impl TabManager {
             BackendSettings {
                 shell,
                 args,
-                working_directory: cwd.map(PathBuf::from),
+                working_directory: cwd.map(PathBuf::from).or_else(default_cwd),
             },
         )?;
+        // Answer colour queries from the very first byte the shell writes.
+        //
+        // Programs ask what the terminal's colours are while they start up,
+        // which for a tab opened in the background is long before it is ever
+        // drawn — so this cannot wait for the first frame, or the query goes
+        // unanswered and the program falls back to unstyled output.
+        backend.set_reported_colors(crate::terminal_theme().reported_colors());
         if !command.is_empty() {
             let typed = command
                 .iter()
@@ -229,6 +278,7 @@ impl TabManager {
             id,
             Tab {
                 backend,
+                bidi: None,
                 title: Title {
                     shell: format!("terra {id}"),
                     custom: title,
@@ -328,6 +378,27 @@ impl TabManager {
 
     /// Pin a user-chosen title. From here on the shell can no longer change
     /// what this tab displays.
+    /// The tab's BiDi override, or `None` when it follows the config.
+    pub fn bidi(&self, id: u64) -> Option<Option<BidiMode>> {
+        self.tabs.get(&id).map(|t| t.bidi)
+    }
+
+    /// Override a tab's BiDi mode. `None` returns it to the config value.
+    pub fn set_bidi(&mut self, id: u64, mode: Option<BidiMode>) -> bool {
+        match self.tabs.get_mut(&id) {
+            Some(tab) => {
+                tab.bidi = mode;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The pid of the tab's shell, for looking up what is running in it.
+    pub fn shell_pid(&self, id: u64) -> Option<u32> {
+        self.tabs.get(&id).map(|t| t.backend.pty_id())
+    }
+
     pub fn set_custom_title(&mut self, id: u64, title: String) -> bool {
         match self.tabs.get_mut(&id) {
             Some(tab) => {
@@ -386,6 +457,186 @@ impl TabManager {
         }
         Some(lines.join("\n"))
     }
+
+    /// The visible grid with styling, as a JSON string.
+    ///
+    /// Same rows as [`Self::capture`] — the viewport plus up to `scrollback`
+    /// lines above it — but every cell's colours and attributes come along,
+    /// run-length encoded by style. See [`GridDump`] for the shape.
+    pub fn capture_cells(&mut self, id: u64, scrollback: usize) -> Option<String> {
+        let tab = self.tabs.get_mut(&id)?;
+        let content = tab.backend.sync();
+        let grid = &content.grid;
+
+        let display_offset = grid.display_offset() as i32;
+        let screen_lines = grid.screen_lines() as i32;
+        let history = grid.history_size() as i32;
+        let scrollback = scrollback.min(i32::MAX as usize) as i32;
+
+        let top_visible = -display_offset;
+        let bottom_visible = top_visible + screen_lines - 1;
+        let start = (top_visible - scrollback).max(-history);
+
+        let rows_data = (start..=bottom_visible)
+            .map(|line| RowDump {
+                y: viewport_row(line, display_offset),
+                runs: encode_row(grid[Line(line)].into_iter()),
+            })
+            .collect();
+
+        let dump = GridDump {
+            cols: grid.columns(),
+            rows: grid.screen_lines(),
+            cursor: CursorDump {
+                row: viewport_row(grid.cursor.point.line.0, display_offset),
+                col: grid.cursor.point.column.0,
+                visible: content.terminal_mode.contains(TermMode::SHOW_CURSOR),
+            },
+            rows_data,
+        };
+        serde_json::to_string(&dump).ok()
+    }
+}
+
+/// A styled dump of the grid, as returned by [`TabManager::capture_cells`].
+///
+/// ```json
+/// {
+///   "cols": 120,
+///   "rows": 40,
+///   "cursor": {"row": 38, "col": 4, "visible": true},
+///   "rows_data": [
+///     {"y": 0, "runs": [
+///       {"x": 0, "text": "> hello", "fg": {"named": "Foreground"},
+///        "bg": {"named": "Background"}},
+///       {"x": 7, "text": "  ", "fg": {"named": "Foreground"},
+///        "bg": {"indexed": 236}, "flags": ["INVERSE"]}
+///     ]}
+///   ]
+/// }
+/// ```
+///
+/// `row`/`y` are viewport coordinates: 0 is the topmost visible row, exactly
+/// the space `view.rs` computes its `line_num` in, so scrollback rows are
+/// negative.
+#[derive(Serialize)]
+struct GridDump {
+    cols: usize,
+    rows: usize,
+    cursor: CursorDump,
+    rows_data: Vec<RowDump>,
+}
+
+#[derive(Serialize)]
+struct CursorDump {
+    row: i32,
+    col: usize,
+    visible: bool,
+}
+
+#[derive(Serialize)]
+struct RowDump {
+    y: i32,
+    runs: Vec<Run>,
+}
+
+/// A maximal span of adjacent cells sharing one style, starting at column `x`.
+#[derive(Serialize)]
+struct Run {
+    x: usize,
+    text: String,
+    fg: ColorDump,
+    bg: ColorDump,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    flags: Vec<&'static str>,
+}
+
+/// A colour exactly as the application asked for it — deliberately *not*
+/// resolved against the theme.
+///
+/// `{"named": "Background"}`, `{"indexed": 236}` or `"#3a3a3a"`. Resolving to
+/// RGB would bake the current theme into the dump and destroy its whole point:
+/// "this row asked for indexed 236" is the fact worth diffing, and it survives
+/// a theme change.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ColorDump {
+    Named { named: String },
+    Indexed { indexed: u8 },
+    Spec(String),
+}
+
+impl From<Color> for ColorDump {
+    fn from(color: Color) -> Self {
+        match color {
+            // `NamedColor` exposes no name accessor, but its variants are
+            // fieldless, so the derived `Debug` output *is* the name.
+            Color::Named(named) => ColorDump::Named {
+                named: format!("{named:?}"),
+            },
+            Color::Indexed(indexed) => ColorDump::Indexed { indexed },
+            Color::Spec(rgb) => {
+                ColorDump::Spec(format!("#{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b))
+            }
+        }
+    }
+}
+
+/// Grid line -> viewport row, the same arithmetic `view.rs` does for `line_num`.
+fn viewport_row(line: i32, display_offset: i32) -> i32 {
+    line + display_offset
+}
+
+/// Every set [`Flags`] bit, uppercase, in declaration order.
+fn flag_names(flags: Flags) -> Vec<&'static str> {
+    flags.iter_names().map(|(name, _)| name).collect()
+}
+
+/// Is this a cell nothing was ever written to? Trailing runs of these are
+/// dropped so a blank row costs `"runs": []`.
+fn is_default(cell: &Cell) -> bool {
+    cell.c == ' '
+        && cell.flags.is_empty()
+        && matches!(cell.fg, Color::Named(NamedColor::Foreground))
+        && matches!(cell.bg, Color::Named(NamedColor::Background))
+}
+
+/// Run-length encode one row by style.
+///
+/// Adjacent cells join a run while `fg`, `bg` and `flags` all match; any
+/// difference starts a new one. Wide-character spacers contribute their column
+/// to `x` but no character to `text` — the glyph is already there from the cell
+/// before them. Trailing default cells are dropped entirely.
+fn encode_row<'a>(cells: impl Iterator<Item = &'a Cell>) -> Vec<Run> {
+    let cells: Vec<&Cell> = cells.collect();
+    let end = cells
+        .iter()
+        .rposition(|cell| !is_default(cell))
+        .map_or(0, |i| i + 1);
+
+    let mut runs: Vec<Run> = Vec::new();
+    let mut style: Option<(Color, Color, Flags)> = None;
+    for (x, cell) in cells[..end].iter().enumerate() {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let here = (cell.fg, cell.bg, cell.flags);
+        if style == Some(here) {
+            if let Some(run) = runs.last_mut() {
+                run.text.push(cell.c);
+                continue;
+            }
+        }
+        runs.push(Run {
+            x,
+            text: cell.c.to_string(),
+            fg: cell.fg.into(),
+            bg: cell.bg.into(),
+            flags: flag_names(cell.flags),
+        });
+        style = Some(here);
+    }
+    runs
 }
 
 #[cfg(test)]
@@ -599,5 +850,161 @@ mod tests {
         assert_eq!(tabs.active_id(), None);
         assert!(!tabs.close(ids[1]));
         assert!(tabs.is_empty());
+    }
+
+    /// A cell carrying `c` in the default style.
+    fn cell(c: char) -> Cell {
+        Cell {
+            c,
+            ..Default::default()
+        }
+    }
+
+    /// The row `text` in the default style, padded with default cells to
+    /// `cols` — what an untouched grid row of that width looks like.
+    fn row(text: &str, cols: usize) -> Vec<Cell> {
+        let mut cells: Vec<Cell> = text.chars().map(cell).collect();
+        cells.resize_with(cols, Cell::default);
+        cells
+    }
+
+    /// The whole point of the format: uniform text costs one run, not one
+    /// entry per column.
+    #[test]
+    fn adjacent_cells_with_the_same_style_merge_into_one_run() {
+        let runs = encode_row(row("hello", 20).iter());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].x, 0);
+        assert_eq!(runs[0].text, "hello");
+        assert!(runs[0].flags.is_empty());
+    }
+
+    /// Any of the three style axes splits a run, which is what makes "is that
+    /// row's background actually gray?" a `jq` query.
+    #[test]
+    fn a_style_change_starts_a_new_run() {
+        let split = |mutate: &dyn Fn(&mut Cell)| {
+            let mut cells = row("abcd", 10);
+            mutate(&mut cells[2]);
+            encode_row(cells.iter())
+        };
+
+        let runs = split(&|c| c.fg = Color::Indexed(9));
+        assert_eq!(runs.len(), 3);
+        assert_eq!((runs[0].x, runs[0].text.as_str()), (0, "ab"));
+        assert_eq!((runs[1].x, runs[1].text.as_str()), (2, "c"));
+        assert_eq!((runs[2].x, runs[2].text.as_str()), (3, "d"));
+
+        let runs = split(&|c| c.bg = Color::Named(NamedColor::Red));
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].text, "c");
+
+        let runs = split(&|c| c.flags = Flags::BOLD);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].flags, vec!["BOLD"]);
+        assert!(runs[0].flags.is_empty());
+    }
+
+    /// Blank rows are the common case in a mostly-empty screen; they must not
+    /// cost a run each.
+    #[test]
+    fn a_blank_row_encodes_as_no_runs() {
+        assert!(encode_row(row("", 80).iter()).is_empty());
+        assert!(encode_row(row("   ", 80).iter()).is_empty());
+    }
+
+    /// Padding to the right edge is not content — but a styled trailing space
+    /// (a highlighted row, say) is, and stays.
+    #[test]
+    fn trailing_default_cells_are_not_emitted() {
+        let runs = encode_row(row("hi", 80).iter());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "hi");
+
+        let mut cells = row("hi", 80);
+        cells[40].bg = Color::Indexed(236);
+        let runs = encode_row(cells.iter());
+        // The padding up to the styled cell is real content now, and merges
+        // into the leading run; only what follows the styled cell is dropped.
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, format!("hi{}", " ".repeat(38)));
+        assert_eq!(runs[1].x, 40);
+        assert_eq!(runs[1].text, " ");
+    }
+
+    /// `y` and the cursor share one space: the topmost visible row is 0, so
+    /// scrollback is negative — exactly `view.rs`'s `line_num`.
+    #[test]
+    fn the_cursor_is_reported_in_viewport_coordinates() {
+        // Scrolled to the bottom: grid line and viewport row coincide.
+        assert_eq!(viewport_row(0, 0), 0);
+        assert_eq!(viewport_row(38, 0), 38);
+        // Scrolled up by 10: the cursor's grid line 38 is now 10 rows lower in
+        // the viewport, and the rows above the viewport top go negative.
+        assert_eq!(viewport_row(38, 10), 48);
+        assert_eq!(viewport_row(-10, 10), 0);
+        assert_eq!(viewport_row(-15, 10), -5);
+    }
+
+    /// A wide glyph occupies two columns; the second holds a spacer, whose
+    /// blank must not land in the run's text and whose style must not split it.
+    #[test]
+    fn a_wide_character_and_its_spacer_are_not_double_counted() {
+        let mut cells = row("a世 b", 10);
+        cells[1].flags = Flags::WIDE_CHAR;
+        cells[2].flags = Flags::WIDE_CHAR_SPACER;
+
+        let runs = encode_row(cells.iter());
+        assert_eq!(runs.len(), 3);
+        assert_eq!((runs[0].x, runs[0].text.as_str()), (0, "a"));
+        assert_eq!((runs[1].x, runs[1].text.as_str()), (1, "世"));
+        assert_eq!(runs[1].flags, vec!["WIDE_CHAR"]);
+        // The spacer's column is skipped entirely: `b` reports column 3.
+        assert_eq!((runs[2].x, runs[2].text.as_str()), (3, "b"));
+    }
+
+    /// Colours travel unresolved, so a dump still says what the app asked for.
+    #[test]
+    fn colours_are_dumped_in_the_form_the_app_asked_for() {
+        let named = serde_json::to_string(&ColorDump::from(Color::Named(NamedColor::Background)));
+        assert_eq!(named.unwrap(), r#"{"named":"Background"}"#);
+        let indexed = serde_json::to_string(&ColorDump::from(Color::Indexed(236)));
+        assert_eq!(indexed.unwrap(), r#"{"indexed":236}"#);
+        let rgb = alacritty_terminal::vte::ansi::Rgb {
+            r: 58,
+            g: 58,
+            b: 58,
+        };
+        let spec = serde_json::to_string(&ColorDump::from(Color::Spec(rgb)));
+        assert_eq!(spec.unwrap(), r##""#3a3a3a""##);
+    }
+}
+
+#[cfg(test)]
+mod launch_env_tests {
+    use super::*;
+
+    /// Launched from Finder the app inherits launchd's environment, so the
+    /// shell has to be a login shell or none of the user's PATH setup runs.
+    #[test]
+    fn the_common_shells_are_started_as_login_shells() {
+        for shell in ["/bin/zsh", "/bin/bash", "/bin/sh", "/opt/homebrew/bin/bash"] {
+            assert_eq!(login_args(shell), vec!["-l".to_string()], "{shell}");
+        }
+    }
+
+    /// A shell we do not recognise still gets a working session; we just do
+    /// not guess a flag it may reject.
+    #[test]
+    fn an_unrecognised_shell_is_launched_without_extra_flags() {
+        assert!(login_args("/usr/bin/fish").is_empty());
+        assert!(login_args("/usr/local/bin/nu").is_empty());
+    }
+
+    /// An explicit cwd always wins; the fallback only fills in the blank.
+    #[test]
+    fn an_explicit_directory_is_never_overridden_by_the_default() {
+        let explicit = Some(PathBuf::from("/tmp"));
+        assert_eq!(explicit.clone().or_else(default_cwd), explicit);
     }
 }

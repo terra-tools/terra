@@ -5,10 +5,12 @@
 //! - `ipc.rs`   — unix-socket server; its threads drive the tabs directly
 //! - palette integration (terra-palette)
 
+mod config;
 mod fonts;
 mod ghostty_theme;
 mod ipc;
 mod macos;
+mod procinfo;
 mod scrollbar;
 mod tabs;
 mod ui;
@@ -17,7 +19,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use egui_term::{PtyEvent, TerminalView};
-use terra_palette::{Palette, PaletteAction, PaletteEvent};
+use terra_palette::{Palette, PaletteAction, PaletteEvent, PaletteIcon};
 
 use crate::ipc::IpcServer;
 use crate::scrollbar::ScrollbarState;
@@ -25,6 +27,11 @@ use crate::tabs::TabManager;
 use crate::ui::AppAction;
 
 const RENAME_PROMPT_ID: &str = "rename";
+
+/// How often to re-check which program is running in the active tab. Fast
+/// enough that launching an agent takes effect before you can read a line of
+/// its output, slow enough to be free.
+const FOREGROUND_POLL_SECS: f64 = 0.5;
 
 /// Take the tab lock, ignoring poisoning: a panic on an IPC thread must not
 /// take the window down with it (`ipc.rs` locks the same way).
@@ -42,12 +49,13 @@ fn terminal_theme() -> egui_term::TerminalTheme {
     egui_term::TerminalTheme::new(Box::new(ghostty_theme::palette()))
 }
 
-fn terminal_font() -> egui_term::TerminalFont {
+/// Ghostty macOS: 13pt CoreText ≈ 15px egui em, plus the user's
+/// `adjust-cell-height = 30%`. Both are `[font]` keys now — see `config.rs`,
+/// whose defaults are pinned to exactly these numbers.
+fn terminal_font(cfg: &config::FontConfig) -> egui_term::TerminalFont {
     egui_term::TerminalFont::new(egui_term::FontSettings {
-        // Ghostty macOS: 13pt CoreText ≈ 15px egui em, plus the user's
-        // `adjust-cell-height = 30%`.
-        font_type: egui::FontId::monospace(15.0),
-        line_height: 1.3,
+        font_type: egui::FontId::monospace(cfg.size),
+        line_height: cfg.line_height,
     })
 }
 
@@ -91,6 +99,18 @@ struct App {
     palette: Palette,
     ipc: Option<IpcServer>,
     scrollbar: ScrollbarState,
+    config: config::ConfigStore,
+    /// `config.generation()` that `cached_font` was built from, so the font
+    /// is rebuilt when a setting moves rather than on every frame.
+    cached_config_generation: u64,
+    cached_font: egui_term::TerminalFont,
+    /// The active tab's foreground command, and when it was last looked up.
+    ///
+    /// Resolving it is a `sysctl` over the whole process table — cheap, but
+    /// not per-frame cheap, and what is running in a tab changes on human
+    /// timescales. Polled instead of watched.
+    foreground: Option<String>,
+    foreground_checked: f64,
     quitting: bool,
     last_window_title: String,
     /// Directory currently behind the titlebar proxy icon, so we only bother
@@ -102,6 +122,8 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         fonts::install(&cc.egui_ctx);
         let (pty_sender, pty_events) = mpsc::channel();
+        let config = config::ConfigStore::load();
+        let cached_font = terminal_font(&config.get().font);
         Self {
             pty_events,
             pty_sender,
@@ -109,6 +131,11 @@ impl App {
             palette: Palette::default(),
             ipc: None,
             scrollbar: ScrollbarState::default(),
+            cached_config_generation: config.generation(),
+            cached_font,
+            foreground: None,
+            foreground_checked: f64::NEG_INFINITY,
+            config,
             quitting: false,
             last_window_title: String::new(),
             last_represented_path: None,
@@ -184,24 +211,122 @@ impl App {
     }
 
     fn palette_actions(&self) -> Vec<PaletteAction> {
+        // Section *declaration* order fixes both the group order in the list
+        // and each group's accent colour, so neither moves while filtering.
+        const TABS: &str = "Tabs";
+        const NAVIGATE: &str = "Navigate";
+        const SETTINGS: &str = "Settings";
+        const APPLICATION: &str = "Application";
+
         let mut actions = vec![
-            PaletteAction::new("tab.new", "New Tab", Some("⌘T")),
-            PaletteAction::new("tab.close", "Close Tab", Some("⌘W")),
-            PaletteAction::new("tab.rename", "Rename Tab…", None),
-            PaletteAction::new("tab.next", "Next Tab", Some("⇧⌘]")),
-            PaletteAction::new("tab.prev", "Previous Tab", Some("⇧⌘[")),
+            PaletteAction::new("tab.new", "New Tab", Some("⌘T"))
+                .in_section(TABS)
+                .with_icon(PaletteIcon::Plus),
+            PaletteAction::new("tab.close", "Close Tab", Some("⌘W"))
+                .in_section(TABS)
+                .with_icon(PaletteIcon::Cross),
+            PaletteAction::new("tab.rename", "Rename Tab…", None)
+                .in_section(TABS)
+                .with_icon(PaletteIcon::Pencil),
+            PaletteAction::new("tab.next", "Next Tab", Some("⇧⌘]"))
+                .in_section(NAVIGATE)
+                .with_icon(PaletteIcon::ArrowRight),
+            PaletteAction::new("tab.prev", "Previous Tab", Some("⇧⌘["))
+                .in_section(NAVIGATE)
+                .with_icon(PaletteIcon::ArrowLeft),
         ];
         if let Some(tabs) = self.tabs.as_ref().map(|t| lock(t)) {
             for id in tabs.ids() {
                 let title = tabs.title(id).unwrap_or("shell");
-                actions.push(PaletteAction::new(
-                    format!("tab.select.{id}"),
-                    format!("Go to Tab: {title}"),
-                    None,
-                ));
+                actions.push(
+                    PaletteAction::new(
+                        format!("tab.select.{id}"),
+                        format!("Go to Tab: {title}"),
+                        None,
+                    )
+                    .in_section(NAVIGATE)
+                    .with_icon(PaletteIcon::Terminal),
+                );
             }
         }
-        actions.push(PaletteAction::new("app.quit", "Quit terra", Some("⌘Q")));
+        // The palette has no checkbox, so the label carries the state — the
+        // list is rebuilt every time it opens, so it can never go stale.
+        // One guard, not two: `lock(t).active_id().and_then(|id| lock(t)…)`
+        // deadlocks, because the first temporary guard lives to the end of
+        // the enclosing expression and this is all one thread.
+        let bidi = self
+            .tabs
+            .as_ref()
+            .and_then(|t| {
+                let tabs = lock(t);
+                tabs.active_id().and_then(|id| tabs.bidi(id))
+            })
+            .flatten()
+            .unwrap_or(self.config.get().text.bidi);
+        actions.push(
+            PaletteAction::new(
+                "config.toggle_bidi",
+                format!("RTL Reordering (this tab): {} — cycle", bidi.name()),
+                Some("⇧⌘B"),
+            )
+            .in_section(SETTINGS)
+            .with_icon(PaletteIcon::Dot),
+        );
+        actions.push(
+            PaletteAction::new(
+                "config.cycle_bidi_base",
+                format!(
+                    "RTL Paragraph Direction: {} — cycle",
+                    match self.config.get().text.bidi_base {
+                        egui_term::BidiBase::Ltr => "left-to-right",
+                        egui_term::BidiBase::Auto => "auto",
+                        egui_term::BidiBase::Rtl => "right-to-left",
+                    }
+                ),
+                None,
+            )
+            .in_section(SETTINGS)
+            .with_icon(PaletteIcon::ArrowLeft),
+        );
+        actions.push(
+            PaletteAction::new("config.font_bigger", "Increase Font Size", Some("⌘+"))
+                .in_section(SETTINGS)
+                .with_icon(PaletteIcon::Plus),
+        );
+        actions.push(
+            PaletteAction::new("config.font_smaller", "Decrease Font Size", Some("⌘-"))
+                .in_section(SETTINGS)
+                .with_icon(PaletteIcon::ArrowLeft),
+        );
+        actions.push(
+            PaletteAction::new("config.reset_session", "Reset Settings", Some("⌘0"))
+                .in_section(SETTINGS)
+                .with_icon(PaletteIcon::Cross),
+        );
+        actions.push(
+            PaletteAction::new("config.reload", "Reload Config File", None)
+                .in_section(SETTINGS)
+                .with_icon(PaletteIcon::ArrowRight),
+        );
+        if !self.config.warnings().is_empty() {
+            actions.push(
+                PaletteAction::new(
+                    "config.warnings",
+                    format!(
+                        "Config: {} problem(s) — show in log",
+                        self.config.warnings().len()
+                    ),
+                    None,
+                )
+                .in_section(SETTINGS)
+                .with_icon(PaletteIcon::Cross),
+            );
+        }
+        actions.push(
+            PaletteAction::new("app.quit", "Quit terra", Some("⌘Q"))
+                .in_section(APPLICATION)
+                .with_icon(PaletteIcon::Power),
+        );
         actions
     }
 
@@ -218,6 +343,13 @@ impl App {
                     "tab.rename" => actions.push(AppAction::RenameActive),
                     "tab.next" => actions.push(AppAction::NextTab),
                     "tab.prev" => actions.push(AppAction::PrevTab),
+                    "config.toggle_bidi" => actions.push(AppAction::ToggleBidi),
+                    "config.cycle_bidi_base" => actions.push(AppAction::CycleBidiBase),
+                    "config.font_bigger" => actions.push(AppAction::NudgeFontSize(1)),
+                    "config.font_smaller" => actions.push(AppAction::NudgeFontSize(-1)),
+                    "config.reset_session" => actions.push(AppAction::ResetSession),
+                    "config.reload" => actions.push(AppAction::ReloadConfig),
+                    "config.warnings" => actions.push(AppAction::ShowConfigWarnings),
                     "app.quit" => actions.push(AppAction::Quit),
                     other => match other.strip_prefix("tab.select.") {
                         Some(id) => match id.parse::<u64>() {
@@ -243,9 +375,138 @@ impl App {
         }
     }
 
+    /// Settings actions. Separate from [`Self::apply`] because they touch the
+    /// config rather than the tabs, and so must work before the first shell
+    /// has spawned.
+    fn apply_config(&mut self, action: AppAction) {
+        match action {
+            AppAction::ToggleBidi => {
+                // Cycles the *tab*, not the app: one window routinely has a
+                // shell in one tab and an agent that does its own BiDi in
+                // another, and they need opposite settings.
+                use config::BidiMode::{Auto, Off, On};
+                let Some(arc) = self.tabs.clone() else { return };
+                let mut tabs = lock(&arc);
+                let Some(id) = tabs.active_id() else { return };
+                let current = tabs
+                    .bidi(id)
+                    .flatten()
+                    .unwrap_or(self.config.get().text.bidi);
+                let next = match current {
+                    Off => On,
+                    On => Auto,
+                    Auto => Off,
+                };
+                tabs.set_bidi(id, Some(next));
+                log::info!("terra: tab {id} RTL reordering {}", next.name());
+            }
+            AppAction::CycleBidiBase => {
+                use egui_term::BidiBase::{Auto, Ltr, Rtl};
+                let next = match self.config.get().text.bidi_base {
+                    Auto => Ltr,
+                    Ltr => Rtl,
+                    Rtl => Auto,
+                };
+                self.config.apply(config::SessionEdit::BidiBase(Some(next)));
+                log::info!("terra: RTL paragraph direction {next:?}");
+            }
+            AppAction::NudgeFontSize(delta) => {
+                // Clamping lives in `config::resolve`, so repeatedly hitting
+                // the key at either end parks rather than drifting.
+                let next = self.config.get().font.size + f32::from(delta);
+                self.config.apply(config::SessionEdit::FontSize(Some(next)));
+            }
+            AppAction::ResetSession => {
+                self.config.clear_session();
+                log::info!("terra: settings reset to {}", self.config.path().display());
+            }
+            AppAction::ReloadConfig => {
+                self.config.reload();
+                log::info!("terra: reloaded {}", self.config.path().display());
+            }
+            AppAction::ShowConfigWarnings => {
+                for warning in self.config.warnings() {
+                    log::warn!("terra: config: {warning}");
+                }
+            }
+            other => log::warn!("terra: {other:?} is not a config action"),
+        }
+    }
+
+    /// Whether the active tab should reorder right-to-left text this frame.
+    ///
+    /// Precedence: the tab's own override (palette, `terra bidi`) beats the
+    /// config, and `auto` consults the quirks table for whatever program is
+    /// running in the tab. Nothing inspects the *text* — logical and visual
+    /// order are the same bytes, so the choice has to be declared.
+    fn active_bidi(&mut self, ctx: &egui::Context) -> bool {
+        let Some(arc) = self.tabs.clone() else {
+            return false;
+        };
+        let (active, shell_pid) = {
+            let tabs = lock(&arc);
+            let Some(active) = tabs.active_id() else {
+                return false;
+            };
+            (tabs.bidi(active).flatten(), tabs.shell_pid(active))
+        };
+
+        let Some(mode) = active else {
+            // No per-tab override: the config decides, and only `auto` needs
+            // to know what is running.
+            if self.config.get().text.bidi != config::BidiMode::Auto {
+                return config::should_reorder(self.config.get(), None);
+            }
+            let now = ctx.input(|i| i.time);
+            if now - self.foreground_checked >= FOREGROUND_POLL_SECS {
+                self.foreground_checked = now;
+                self.foreground = shell_pid.and_then(procinfo::foreground_command);
+            }
+            let command = self.foreground.clone();
+            return config::should_reorder(self.config.get(), command.as_deref());
+        };
+        // Only `auto` needs to know what is running, so the syscall is
+        // skipped entirely in the default configuration.
+        if mode != config::BidiMode::Auto {
+            return config::should_reorder_mode(mode, &self.config.get().text.quirks, None);
+        }
+
+        let now = ctx.input(|i| i.time);
+        if now - self.foreground_checked >= FOREGROUND_POLL_SECS {
+            self.foreground_checked = now;
+            self.foreground = shell_pid.and_then(procinfo::foreground_command);
+        }
+        config::should_reorder_mode(
+            mode,
+            &self.config.get().text.quirks,
+            self.foreground.as_deref(),
+        )
+    }
+
+    /// Rebuild anything derived from the config, but only when it moved.
+    fn sync_config_cache(&mut self) {
+        if self.cached_config_generation == self.config.generation() {
+            return;
+        }
+        self.cached_font = terminal_font(&self.config.get().font);
+        self.cached_config_generation = self.config.generation();
+    }
+
     /// Every arm takes the lock for exactly as long as it needs it — never
     /// across a call that would want it again (`palette_actions`).
     fn apply(&mut self, action: AppAction) {
+        // Config actions touch no tab, so they must not be gated on one
+        // existing — otherwise they would silently no-op before the first
+        // shell has spawned.
+        match action {
+            AppAction::ToggleBidi
+            | AppAction::CycleBidiBase
+            | AppAction::NudgeFontSize(_)
+            | AppAction::ResetSession
+            | AppAction::ReloadConfig
+            | AppAction::ShowConfigWarnings => return self.apply_config(action),
+            _ => {}
+        }
         let Some(arc) = self.tabs.clone() else {
             return;
         };
@@ -280,6 +541,12 @@ impl App {
                 self.palette
                     .open_prompt("Rename tab", prefill, RENAME_PROMPT_ID);
             }
+            AppAction::ToggleBidi
+            | AppAction::CycleBidiBase
+            | AppAction::NudgeFontSize(_)
+            | AppAction::ResetSession
+            | AppAction::ReloadConfig
+            | AppAction::ShowConfigWarnings => unreachable!("handled above"),
             AppAction::Quit => {
                 lock(&arc).clear();
                 self.quitting = true;
@@ -303,6 +570,7 @@ impl eframe::App for App {
 
         self.drain_pty_events();
         self.sync_window_title(&ctx, frame);
+        self.sync_config_cache();
 
         let mut actions: Vec<AppAction> = Vec::new();
         // Global shortcuts are consumed before the terminal widget reads events.
@@ -322,7 +590,13 @@ impl eframe::App for App {
             self.apply(action);
         }
 
+        // Re-read after the actions above, so a toggle applied this frame is
+        // the one this frame paints with.
+        self.sync_config_cache();
         let palette_open = self.palette.is_open();
+        let bidi = self.active_bidi(&ctx);
+        let bidi_base = self.config.get().text.bidi_base;
+        let font = self.cached_font.clone();
         let tabs_arc = self.tabs.clone();
         let scrollbar = &mut self.scrollbar;
         egui::CentralPanel::default()
@@ -348,7 +622,9 @@ impl eframe::App for App {
                     let view = TerminalView::new(ui, &mut tab.backend)
                         .set_focus(!palette_open)
                         .set_theme(terminal_theme())
-                        .set_font(terminal_font())
+                        .set_font(font)
+                        .set_bidi(bidi)
+                        .set_bidi_base(bidi_base)
                         .set_size(ui.available_size());
                     let rect = ui.add(view).rect;
                     // After the terminal, so the thumb wins the hit test.
