@@ -32,9 +32,10 @@ tasks (`just pre-commit` before committing).
 - Delegate implementation to background subagents so the main agent stays
   free to talk and review; plain subagents usually beat a workflow — reach
   for workflows only when staged fan-out genuinely pays.
-- Subagents default to the mid-tier model, not the frontier one. Escalate a
-  single subagent to the frontier tier only when its task is genuinely hard
-  (structural refactors, gnarly debugging).
+- Subagents default to the mid-tier model. Escalate to the frontier tier
+  only when the *approach* is still unsolved — not because the change is
+  large or touches many files. Transforming working, tested code along a
+  written spec is mid-tier work.
 
 ## ETA
 
