@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A second push to the same branch supersedes the first — no point burning a
+# slow macOS runner on a commit nobody will look at again.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Windows and Linux are new here and unproven. A panicking test that prints
+  # only "thread panicked at ..." with no frames costs a whole round-trip to
+  # diagnose; a backtrace costs nothing.
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    # e.g. "macOS / build test clippy". matrix.name rather than matrix.os so the
+    # check name in the PR UI says "Windows", not "windows-latest".
+    name: ${{ matrix.name }} / build test clippy
+    runs-on: ${{ matrix.os }}
+    # Cold egui/eframe/wgpu builds are slow; warm ones are minutes. 40 leaves
+    # room for a cache miss without letting a hung build run for an hour.
+    timeout-minutes: 40
+
+    strategy:
+      # The whole point of the matrix is to find out *which* platforms are
+      # broken. Cancelling the other two the moment one fails would hide that:
+      # you would fix Windows, push, and only then learn Linux was red too.
+      fail-fast: false
+      matrix:
+        include:
+          # macOS is the verified platform (docs/DEVELOPMENT.md); the app has
+          # actually been run there. Linux and Windows are compile-and-test
+          # only — nobody has launched the GUI on either.
+          - os: macos-latest
+            name: macOS
+          - os: ubuntu-latest
+            name: Linux
+          - os: windows-latest
+            name: Windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No rust-toolchain.toml in the repo, so CI pins stable explicitly.
+      # If one is ever added, drop the toolchain name and this action reads it.
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Caches ~/.cargo/{registry,git} and ./target, keyed on the lockfile.
+      # rust-cache already folds the runner OS and the job into its key, so the
+      # three matrix legs do not share (and corrupt) one target dir.
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+
+      # Why this list, and why it is short:
+      #
+      # Nothing in Cargo.lock links against a system library at build time —
+      # there is no `pkg-config`, `cc`, `cmake`, `system-deps` or `bindgen` crate
+      # anywhere in the graph. winit reaches X11 through x11rb (a pure-Rust
+      # protocol client), xkbcommon and Wayland through dlopen shims
+      # (xkbcommon-dl, wayland-backend's `dlopen` feature), and wgpu reaches
+      # Vulkan through ash, which also dlopens. So a `cargo build` on a bare
+      # ubuntu-latest image should already succeed.
+      #
+      # These are installed anyway because they are eframe's own documented
+      # Linux requirement (eframe 0.35 README), minus libssl-dev — there is no
+      # openssl-sys in this lockfile. They cost ~20s and they mean the first
+      # dependency that *does* want headers fails on a real error rather than on
+      # a missing /usr/include.
+      #
+      # Note: these are build-time packages. Actually *running* the GUI on a
+      # Linux desktop additionally needs a Vulkan or GL driver and a live
+      # X11/Wayland session — CI never launches the app, so it never finds out.
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev
+
+      # NOTE (Linux, expected failure until crates/ catches up): the workspace
+      # takes eframe with `default-features = false`, which drops eframe's `x11`
+      # and `wayland` features. winit 0.30 refuses to compile for a free-unix
+      # target with neither:
+      #
+      #   platform_impl/linux/mod.rs:4:
+      #   compile_error!("Please select a feature to build for unix: `x11`, `wayland`")
+      #
+      # The fix belongs in the workspace manifest, not here — adding
+      # `"x11", "wayland"` to the eframe feature list in the root Cargo.toml.
+      # Both are no-ops on macOS and Windows (winit gates them on the target),
+      # so no per-OS dependency table is needed. This job deliberately runs the
+      # same `cargo build --workspace` as everyone else instead of papering over
+      # it with a Linux-only `--features` flag: CI should build what a
+      # contributor building locally builds.
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      # docs/DEVELOPMENT.md: "builds and clippy stay warning-free" — enforce it,
+      # on every platform. Windows and Linux each have their own dead-code and
+      # unused-import warnings once the `cfg` gating lands, and -D warnings is
+      # what surfaces them.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Formatting is checked in two steps on purpose.
+      #
+      # `cargo fmt --all --check` is currently RED on this repo: pre-existing
+      # drift in crates/terra-app/src/{config,ipc}.rs,
+      # crates/terra-protocol/src/lib.rs and
+      # vendor/egui_term/src/{theme,view,backend/mod}.rs. Those files are all
+      # in-flight work, so this workflow does not reformat them. Instead the
+      # blocking check covers the crates that are clean today, and the
+      # whole-workspace check runs alongside it as a visible warning.
+      #
+      # Note both invocations go through `cargo fmt`, which runs rustfmt per
+      # crate root — so vendor/egui_term/rustfmt.toml (max_width = 80) is
+      # honoured and the vendored crate is not reflowed to the workspace
+      # default. Do not replace these with a bare `rustfmt src/**/*.rs`.
+      #
+      # rustfmt's output does not depend on the host, so both steps run on the
+      # Linux leg only. Running them three times would just give three copies of
+      # the same diff to read.
+      - name: Format check (enforced)
+        if: runner.os == 'Linux'
+        run: cargo fmt -p terra-cli -p terra-palette --check
+
+      # TODO: once the drift above is cleaned up, delete this step and change
+      # the one above to `cargo fmt --all --check`.
+      - name: Format check (whole workspace, advisory)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: cargo fmt --all --check

@@ -1,0 +1,398 @@
+# Tagged release: build macOS, Linux and Windows artifacts and publish them on
+# a GitHub Release.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# macOS (verified platform): one universal (arm64 + x86_64) .dmg, the same
+# universal .app as a tarball, and the `terra` CLI as a tarball.
+# Linux / Windows (build-verified only): one plain archive each, holding both
+# binaries. See the "Artifacts" list in each job — those are the only places to
+# edit if a filename changes.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets you rehearse the whole thing (build + package, no publish) by hand.
+  workflow_dispatch:
+
+# The default GITHUB_TOKEN is read-only; creating a release needs write.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Matches [package.metadata.packager.macos] minimum-system-version in
+  # crates/terra-app/Cargo.toml. Keep the two in sync.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  # cargo-packager passes `--skip-jenkins` to create-dmg when CI=true, which
+  # skips the Finder/AppleScript window styling. That AppleScript fails on a
+  # headless runner, so CI=true is load-bearing. GitHub sets it already; set it
+  # explicitly so a local `act`-style run behaves the same.
+  CI: "true"
+
+jobs:
+  macos:
+    name: macOS (universal)
+    # Pinned rather than macos-latest so a runner-image rollover cannot change
+    # what a re-run of an old tag produces.
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same toolchain action as ci.yml. Both macOS targets are requested here
+      # so the universal merge below has two real slices to lipo together.
+      - name: Install Rust (stable) with both macOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      # egui/eframe/wgpu is a big dependency tree; without this the job spends
+      # most of its time recompiling it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos
+
+      # cargo-packager is not a library dependency, so rust-cache does not
+      # restore it. Pinned: the .app layout and dmg behaviour below were
+      # verified against exactly this version.
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+
+      # Runs before anything is built for release. A tag that ships a broken
+      # build is worse than a failed workflow.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build (aarch64)
+        run: cargo build --release --target aarch64-apple-darwin -p terra-app -p terra-cli
+
+      - name: Build (x86_64)
+        run: cargo build --release --target x86_64-apple-darwin -p terra-app -p terra-cli
+
+      # cargo-packager does not lipo for you: it accepts
+      # `--target universal-apple-darwin` and then simply looks for the binaries
+      # under target/universal-apple-darwin/<profile>/. So we build both real
+      # targets and merge them into that directory ourselves.
+      - name: Merge into universal binaries
+        run: |
+          set -euo pipefail
+          mkdir -p target/universal-apple-darwin/release
+          for bin in terra-app terra; do
+            lipo -create \
+              -output "target/universal-apple-darwin/release/$bin" \
+              "target/aarch64-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin"
+            lipo -info "target/universal-apple-darwin/release/$bin"
+          done
+
+      # Only the .app here — the .dmg is built further down, after signing, so
+      # that the app users drag out of the disk image is the signed one.
+      # (`cargo packager -f dmg` re-creates the .app from scratch first, which
+      # would discard any signature applied in between.)
+      - name: Package .app
+        run: cargo packager -p terra-app --release --target universal-apple-darwin -f app
+
+      # Ad-hoc signature ("-"): no Apple account, no notarisation, and Gatekeeper
+      # still shows the unidentified-developer prompt on first launch. What it
+      # buys us is a stable code identity, so an app updated in place later is
+      # not seen as a different, tampered binary.
+      #
+      # PLACEHOLDER for a real Developer ID signature. Replacing it means:
+      # import a Developer ID Application cert into a temporary keychain, sign
+      # with `--options runtime --timestamp` against that identity, then
+      # `xcrun notarytool submit --wait` and `xcrun stapler staple` the .dmg.
+      - name: Ad-hoc codesign the .app
+        run: |
+          set -euo pipefail
+          APP=target/universal-apple-darwin/release/terra.app
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      # Built by hand rather than by `cargo packager -f dmg` (see above). This
+      # is a plain compressed image: the .app plus the customary /Applications
+      # drop target. No background art or icon layout.
+      - name: Build .dmg from the signed .app
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/dmg"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE" dist
+          cp -R target/universal-apple-darwin/release/terra.app "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create \
+            -volname terra \
+            -srcfolder "$STAGE" \
+            -ov -format UDZO \
+            dist/terra-macos-universal.dmg
+
+      # The GUI is only half of terra: `terra` is a separate binary that users
+      # need on their PATH for `terra ls`, `terra new`, `terra learn`, etc.
+      - name: Stage the CLI and the .app tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf dist/terra-cli-macos-universal.tar.gz \
+            -C target/universal-apple-darwin/release terra
+          tar -czf dist/terra-macos-universal.app.tar.gz \
+            -C target/universal-apple-darwin/release terra.app
+
+      - name: List artifacts
+        run: ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+
+      # ---- Artifacts -----------------------------------------------------
+      # Every filename this workflow publishes is produced above and listed
+      # here. If a name changes, these two places are the only ones to edit.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/terra-macos-universal.dmg
+            dist/terra-cli-macos-universal.tar.gz
+            dist/terra-macos-universal.app.tar.gz
+
+  # =========================================================================
+  # Linux and Windows: plain archives, deliberately NOT installers.
+  #
+  # cargo-packager can produce deb/appimage/pacman and wix/nsis from the same
+  # manifest, and none of them are shipped here. The reason is that terra has
+  # never been *run* on either platform — the port is compile-and-test only. An
+  # installer is a promise: a .deb declares dependencies and drops a desktop
+  # entry, icon and uninstall hook into shared system state; an .msi registers
+  # the product with Windows Installer and owns the repair/uninstall path. Ship
+  # one for a binary that may not open a window and the user is left removing
+  # system state by hand to get back to where they started. A .tar.gz or .zip
+  # they unpack into a directory and delete has no such failure mode, and it is
+  # an honest signal about the maturity of the port.
+  #
+  # Second reason, smaller but real: appimage and wix both make the packaging
+  # step download a toolchain at build time (linuxdeploy, the WiX binaries).
+  # That is more unattended moving parts on a tag push, for output nobody has
+  # opened.
+  #
+  # Revisit both once someone has actually launched terra-app on a Linux
+  # desktop and on Windows and reported back. The `formats` key in
+  # crates/terra-app/Cargo.toml already has the manifest side of this.
+  # =========================================================================
+
+  linux:
+    name: Linux (x86_64)
+    # Pinned, like macos-15 above, so re-running an old tag cannot silently
+    # produce a different artifact. 22.04 rather than 24.04 for the older glibc
+    # floor — a binary built against 2.35 runs on a 2.39 host, not the reverse.
+    # If GitHub retires this image label the job will fail immediately with an
+    # unresolvable runner; switch to ubuntu-latest and accept the higher floor.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux
+
+      # Same list and same reasoning as ci.yml — see the long comment there.
+      # Nothing in Cargo.lock links a system library at build time; these are
+      # eframe's documented Linux requirements, minus libssl-dev.
+      - name: Install Linux GUI build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev
+
+      # A tag that ships a broken build is worse than a failed workflow.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p terra-app -p terra-cli
+
+      # Flat archive: `tar -xzf` gives you ./terra-app and ./terra, both of
+      # which the user is expected to put somewhere on PATH themselves.
+      - name: Stage archive
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf dist/terra-linux-x86_64.tar.gz \
+            -C target/release terra-app terra
+
+      - name: List artifacts
+        run: ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+
+      # ---- Artifacts -----------------------------------------------------
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/terra-linux-x86_64.tar.gz
+
+  windows:
+    name: Windows (x86_64)
+    # Pinned for the same reason as the runners above.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    # Every run block in this job is PowerShell. `shell: pwsh` is set per step
+    # rather than relied on as the Windows default so the syntax is explicit.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --workspace
+
+      - name: Build
+        shell: pwsh
+        run: cargo build --release -p terra-app -p terra-cli
+
+      # $ErrorActionPreference: without it a failing cmdlet writes an error
+      # record and the step still exits 0, which would publish an empty zip.
+      - name: Stage archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Force `
+            -Path target\release\terra-app.exe, target\release\terra.exe `
+            -DestinationPath dist\terra-windows-x86_64.zip
+
+      - name: List artifacts
+        shell: pwsh
+        run: Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*
+
+      # ---- Artifacts -----------------------------------------------------
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/terra-windows-x86_64.zip
+
+  # Runs last, after all three build jobs have uploaded their files, and appends
+  # the platform-support statement to the release notes the macOS job generated.
+  # It is a separate job so that the macOS path above stays exactly as it was.
+  #
+  # `append_body: true` adds to whatever is already there; it is not idempotent,
+  # so re-running the whole workflow on the same tag appends a second copy. That
+  # is a visible, harmless duplicate — delete it in the release UI.
+  support-notes:
+    name: Release notes (platform support)
+    needs: [macos, linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          append_body: true
+          body: |
+            ## Platform support
+
+            **macOS — tested.** This is terra's development and v1 target. The
+            `.dmg` and the `.app` inside it are ad-hoc signed, not notarised, so
+            Gatekeeper shows the unidentified-developer prompt on first launch:
+            right-click the app and choose Open.
+
+            **Linux (x86_64) and Windows (x86_64) — build-verified only.** These
+            archives compile, pass the test suite and pass clippy in CI. Nobody
+            has launched the GUI on either platform. Treat them as a starting
+            point for porting work, not as a release: expect the window, the pty
+            and the CLI-to-app IPC to need real testing. Bug reports welcome.
+
+            Each archive contains two binaries — `terra-app` (the GUI) and
+            `terra` (the CLI, needed for `terra ls`, `terra new`, `terra learn`).
+            Put both somewhere on your `PATH`.
+
+# ---------------------------------------------------------------------------
+# TODO: updater feed (latest.json) — deliberately NOT implemented here.
+#
+# What is already established, from cargo-packager 0.11.8's own source:
+#
+#   * There is no macOS "updater" package format. `cargo packager --help` lists
+#     exactly: all, default, app, dmg, wix, nsis, deb, appimage, pacman.
+#   * The .app.tar.gz that Tauri users expect is produced only as a side effect
+#     of signing. src/lib.rs `sign_outputs()` walks the package outputs and, for
+#     any output that is a directory (i.e. the .app), does
+#     `path.with_additional_extension("tar.gz")`, tars+gzips it, appends it to
+#     the output list, and signs it. With no key passed, no tarball and no
+#     signature are ever written.
+#   * Signing is opt-in via `-k/--private-key` or CARGO_PACKAGER_SIGN_PRIVATE_KEY.
+#     src/sign.rs writes `<file>.sig` containing a minisign signature box that is
+#     then base64-encoded (`STANDARD.encode(signature_box.to_string())`), with a
+#     trusted comment of "timestamp:<unix>\tfile:<filename>".
+#   * So the updater pair on macOS would be:
+#         terra.app.tar.gz  and  terra.app.tar.gz.sig
+#     and the .sig content is base64 text, i.e. the value that goes in the feed's
+#     "signature" field.
+#   * cargo-packager itself never generates latest.json. Nothing in the crate
+#     mentions it; the feed is the consumer's job (see the separate
+#     cargo-packager-updater crate).
+#
+# What is NOT established, and must be answered before writing a feed:
+#
+#   1. What exact JSON schema does cargo-packager-updater expect? Field names and
+#      nesting ("platforms" vs top-level, "url"/"signature"/"version"/"pub_date"),
+#      and the target keys — is a universal build addressed as "darwin-universal",
+#      or must both "darwin-aarch64" and "darwin-x86_64" be listed pointing at the
+#      same universal tarball? Read the cargo-packager-updater source, do not
+#      infer it from Tauri.
+#   2. Does the updater verify the signature against the tarball bytes or against
+#      the base64 wrapper? (Signing here is a two-layer encoding.)
+#   3. The .app above is signed ad-hoc with a throwaway identity. An in-place
+#      update replaces a bundle signed by one ad-hoc identity with one signed by
+#      another — confirm that does not trip Gatekeeper before shipping updates.
+#
+# Wiring it up, once those are answered, means: add a `packager-signing` repo
+# secret holding the key from `cargo packager signer generate` (generated with no
+# password, since the runner cannot type one), pass it as
+# CARGO_PACKAGER_SIGN_PRIVATE_KEY, re-run the packager step with the key so the
+# .app.tar.gz and .sig are produced, then write latest.json and add it to the
+# Artifacts list above.
+#
+# Until then this workflow publishes no feed on purpose. A malformed feed is
+# worse than none: clients would either reject every update or, worse, accept an
+# unverified one.
+# ---------------------------------------------------------------------------

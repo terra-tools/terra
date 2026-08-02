@@ -9,11 +9,17 @@ license = "MIT"
 
 [workspace.dependencies]
 egui = "0.35"
+# x11 + wayland are no-ops off Linux (winit gates them on the target), but
+# without them winit's Linux backend is a hard `compile_error!`, so a bare
+# `cargo build --workspace` on Linux fails before it reaches any terra code.
 eframe = { version = "0.35", default-features = false, features = [
     "default_fonts",
     "wgpu",
+    "x11",
+    "wayland",
 ] }
 egui_term = { path = "vendor/egui_term" }
+toml = "0.9"
 alacritty_terminal = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,6 +43,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSString",
 ] }
+
+# One `sysctl(KERN_PROC_ALL)` to find the program running in a tab (see
+# crates/terra-app/src/procinfo.rs). Already in the tree via winit/eframe, so
+# depending on it directly costs no extra build.
+libc = "0.2"
 
 terra-protocol = { path = "crates/terra-protocol" }
 terra-palette = { path = "crates/terra-palette" }

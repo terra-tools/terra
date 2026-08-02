@@ -1,0 +1,82 @@
+# Builds site/ and publishes it to GitHub Pages.
+#
+# One-time manual step: Settings -> Pages -> "Build and deployment" ->
+# Source: "GitHub Actions". A workflow cannot set that itself; until it is
+# switched, the deploy step fails with "Pages site not found".
+#
+# The site is served from https://terra-tools.github.io/terra/, so the Vite
+# build needs base=/terra/ — passed as BASE_PATH below. If a custom domain is
+# ever configured, change BASE_PATH to "/" and add site/public/CNAME.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  # Lets a human redeploy without pushing (e.g. after flipping the Pages source).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time. `cancel-in-progress: false` so a running deploy is
+# allowed to finish rather than leaving Pages half-updated.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and lint
+        run: |
+          pnpm exec tsc -b --noEmit
+          pnpm lint
+
+      # `configure-pages` exports the resolved site URL; the build only needs
+      # the path, which is pinned here so it is obvious what got deployed.
+      - uses: actions/configure-pages@v5
+
+      - name: Build
+        env:
+          BASE_PATH: /terra/
+        run: pnpm build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/dist
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
