@@ -101,12 +101,10 @@ fn wait_for_any_echo(ctx: &egui::Context, backend: &mut TerminalBackend) -> Stri
     }
 }
 
-/// FAILS until issue #21 is fixed — un-ignore it with the fix.
-///
-/// Today the grid shows `^[[A^[[A^[[A` (alternate-scroll arrows); a terminal
-/// honouring mouse reporting shows SGR wheel reports (`^[[<64;…M`).
+/// The acceptance test for issue #21: before the fix the grid showed `^[OA`
+/// (alternate-scroll arrows); honouring mouse reporting shows SGR wheel
+/// reports (`^[[<64;…M`).
 #[test]
-#[ignore = "reproduces issue #21; un-ignore when the wheel honours MOUSE_MODE"]
 fn wheel_reaches_a_mouse_reporting_program_as_mouse_events() {
     let ctx = egui::Context::default();
     let (mut backend, _events) = mouse_reporting_cat(&ctx);
@@ -133,7 +131,9 @@ fn wheel_reaches_a_mouse_reporting_program_as_mouse_events() {
 
     let text = wait_for_any_echo(&ctx, &mut backend);
     assert!(
-        !["^[[A", "^[[B", "^[OA", "^[OB"].iter().any(|s| text.contains(s)),
+        !["^[[A", "^[[B", "^[OA", "^[OB"]
+            .iter()
+            .any(|s| text.contains(s)),
         "the wheel arrived as arrow keys, not mouse reports: {:?}",
         text.trim_end()
     );

@@ -99,6 +99,18 @@
    `Response::request_focus` every frame, and egui grants no focus on click,
    so the tab bar never took it. Worth upstreaming.
 
+6. view.rs `process_mouse_wheel`: the wheel never consulted the terminal's
+   mouse mode, so a program that enabled mouse tracking (claude code, htop)
+   got alternate-scroll arrow keys — or nothing but a display scroll — instead
+   of the wheel reports it asked for (issue #21). When
+   `TermMode::MOUSE_MODE` is active and Shift is not held, each scrolled line
+   now becomes a `MouseReport` (`ScrollUp`/`ScrollDown` at the pointer's
+   cell), riding the same `BackendCommand::MouseReport` path as clicks, so
+   SGR/normal/UTF-8 encodings all come out right. Shift-scroll keeps the old
+   behaviour (scrollback on the primary screen, arrows on the alt screen), as
+   in every terminal. Guarded by `terra-app/tests/mouse_reporting.rs`. Worth
+   upstreaming.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to
