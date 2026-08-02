@@ -174,13 +174,22 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         state: &mut TerminalViewState,
     ) -> Self {
-        if !layout.has_focus() || !layout.contains_pointer() {
+        if !layout.has_focus() {
             return self;
         }
+        // terra patch: the pointer decides where a *mouse* event lands, never
+        // where a keystroke does. Upstream gated the whole function on
+        // `contains_pointer`, so the focused terminal dropped everything typed
+        // while the pointer sat anywhere else — over the tab bar right after
+        // clicking a tab, or outside the window entirely. See `accepts`.
+        let hovered = layout.contains_pointer();
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
         for event in events {
+            if !accepts(&event, hovered) {
+                continue;
+            }
             let mut input_actions = vec![];
 
             match event {
@@ -503,6 +512,29 @@ impl<'a> TerminalView<'a> {
     }
 }
 
+/// terra patch: whether a focused terminal acts on `event` this frame.
+///
+/// The two input kinds are addressed differently, and conflating them is what
+/// made selecting a tab need a second click: a keystroke belongs to whatever
+/// holds keyboard focus, wherever the pointer happens to be resting, while a
+/// mouse event belongs to whatever is under the pointer. Upstream required
+/// `contains_pointer` for both, so everything typed with the pointer parked
+/// over the tab bar — exactly where it lands after clicking a tab — went
+/// nowhere.
+fn accepts(event: &egui::Event, hovered: bool) -> bool {
+    match event {
+        egui::Event::Text(_)
+        | egui::Event::Key { .. }
+        | egui::Event::Copy
+        | egui::Event::Paste(_) => true,
+        egui::Event::MouseWheel { .. }
+        | egui::Event::PointerButton { .. }
+        | egui::Event::PointerMoved(_) => hovered,
+        // Everything else is ignored by the match below anyway.
+        _ => false,
+    }
+}
+
 fn process_keyboard_event(
     event: egui::Event,
     backend: &TerminalBackend,
@@ -819,6 +851,63 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod accepts_tests {
+    use super::accepts;
+    use egui::{Modifiers, Pos2};
+
+    fn key() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn click() -> egui::Event {
+        egui::Event::PointerButton {
+            pos: Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// The one that matters: a focused terminal is typed into no matter where
+    /// the pointer is resting — over the tab bar just after a tab was picked,
+    /// or off the window entirely.
+    #[test]
+    fn keystrokes_reach_a_focused_terminal_wherever_the_pointer_is() {
+        for hovered in [true, false] {
+            assert!(accepts(&key(), hovered));
+            assert!(accepts(&egui::Event::Text("a".into()), hovered));
+            assert!(accepts(&egui::Event::Copy, hovered));
+            assert!(accepts(&egui::Event::Paste("a".into()), hovered));
+        }
+    }
+
+    /// Mouse events still belong to whatever is under the pointer, so a click
+    /// or a scroll aimed at the tab bar is not also delivered to the grid.
+    #[test]
+    fn mouse_events_are_only_taken_while_the_pointer_is_over_the_grid() {
+        for event in [
+            click(),
+            egui::Event::PointerMoved(Pos2::ZERO),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::Vec2::ZERO,
+                phase: egui::TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ] {
+            assert!(accepts(&event, true));
+            assert!(!accepts(&event, false));
+        }
+    }
 }
 
 #[cfg(test)]

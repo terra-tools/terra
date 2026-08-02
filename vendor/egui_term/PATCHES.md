@@ -87,6 +87,18 @@
    ordered correctly but renders as isolated letterforms — and combining
    marks, which upstream never drew.
 
+5. view.rs `process_input`: upstream returned early unless
+   `layout.has_focus() && layout.contains_pointer()`, so a terminal that held
+   the keyboard still dropped every keystroke while the pointer rested
+   anywhere else — over the tab bar right after a tab was clicked (issue #20),
+   or off the window entirely. The two input kinds are now addressed
+   separately by the new `accepts`: keyboard events (`Text`, `Key`, `Copy`,
+   `Paste`) go to whatever has focus, mouse events (`PointerButton`,
+   `PointerMoved`, `MouseWheel`) still only to what is under the pointer.
+   Focus itself was never the problem — `set_focus(true)` already calls
+   `Response::request_focus` every frame, and egui grants no focus on click,
+   so the tab bar never took it. Worth upstreaming.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to
