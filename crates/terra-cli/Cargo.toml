@@ -14,6 +14,11 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 
+# `terra screenshot --pretty` decodes the app's PNG, composites the card,
+# shadow and gradient with plain pixel arithmetic (src/pretty.rs), and encodes
+# the result. A codec is all that needs — no image framework.
+png = { workspace = true }
+
 # `doctor` and `record` talk to the terminal itself: termios/raw mode,
 # TIOCGWINSZ, forkpty, poll, SIGWINCH. All of it is libc, none of it needs a
 # wrapper crate (see src/record.rs for why not portable-pty).

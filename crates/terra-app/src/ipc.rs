@@ -49,6 +49,7 @@ use interprocess::local_socket::{traits::ListenerExt as _, ListenerOptions, Stre
 use terra_protocol::{Address, Request, Response};
 
 use crate::config::BidiMode;
+use crate::screenshot::Screenshots;
 use crate::tabs::TabManager;
 
 /// Owns the listening address; unlinks the socket file on drop (best effort,
@@ -86,7 +87,11 @@ fn lock(tabs: &Mutex<TabManager>) -> MutexGuard<'_, TabManager> {
 /// Also the single-instance gate: if another terra of a wire-compatible version
 /// already owns the address, this focuses *that* one and exits the process
 /// rather than opening a rival app. See [`hand_over`].
-pub fn start(ctx: egui::Context, tabs: Arc<Mutex<TabManager>>) -> anyhow::Result<IpcServer> {
+pub fn start(
+    ctx: egui::Context,
+    tabs: Arc<Mutex<TabManager>>,
+    shots: Arc<Screenshots>,
+) -> anyhow::Result<IpcServer> {
     let address = terra_protocol::socket_address();
 
     // Windows: an atomic, kernel-owned claim, taken before we touch the pipe.
@@ -116,10 +121,11 @@ pub fn start(ctx: egui::Context, tabs: Arc<Mutex<TabManager>>) -> anyhow::Result
                     Ok(stream) => {
                         failures = 0;
                         let tabs = Arc::clone(&tabs);
+                        let shots = Arc::clone(&shots);
                         let ctx = ctx.clone();
                         let spawned = std::thread::Builder::new()
                             .name("terra-ipc-conn".into())
-                            .spawn(move || serve(stream, &tabs, &ctx));
+                            .spawn(move || serve(stream, &tabs, &shots, &ctx));
                         if let Err(err) = spawned {
                             log::warn!("terra ipc: cannot spawn connection thread: {err}");
                         }
@@ -299,7 +305,7 @@ impl Drop for InstanceLock {
     }
 }
 
-fn serve(stream: Stream, tabs: &Mutex<TabManager>, ctx: &egui::Context) {
+fn serve(stream: Stream, tabs: &Mutex<TabManager>, shots: &Screenshots, ctx: &egui::Context) {
     // `&Stream` implements both `Read` and `Write`, so the two halves come from
     // one borrow — no `try_clone`, which named pipes have no equivalent of.
     let mut out = &stream;
@@ -318,7 +324,7 @@ fn serve(stream: Stream, tabs: &Mutex<TabManager>, ctx: &egui::Context) {
         }
 
         let response = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(request) => dispatch(request, tabs, ctx),
+            Ok(request) => dispatch(request, tabs, shots, ctx),
             Err(err) => Response::err(format!("bad request: {err}")),
         };
 
@@ -334,7 +340,12 @@ fn serve(stream: Stream, tabs: &Mutex<TabManager>, ctx: &egui::Context) {
 
 /// Run one request against the shared tabs and apply its side effects on the
 /// window.
-fn dispatch(request: Request, tabs: &Mutex<TabManager>, ctx: &egui::Context) -> Response {
+fn dispatch(
+    request: Request,
+    tabs: &Mutex<TabManager>,
+    shots: &Screenshots,
+    ctx: &egui::Context,
+) -> Response {
     // Key notation is driven here rather than in `execute` because `{Delay N}`
     // has to wait *without* the tabs mutex held — `execute` runs under it, and
     // sleeping there would stall the UI thread and every other client for the
@@ -347,6 +358,14 @@ fn dispatch(request: Request, tabs: &Mutex<TabManager>, ctx: &egui::Context) -> 
     } = &request
     {
         return send_keys(tabs, ctx, *tab, text, *enter);
+    }
+
+    // Likewise driven here rather than in `execute`: a screenshot touches no
+    // tab at all, and it *waits* — holding the tabs mutex across a wait for the
+    // UI thread would deadlock against the UI thread taking it to draw the very
+    // frame being waited for.
+    if matches!(request, Request::Screenshot) {
+        return screenshot(shots, ctx);
     }
 
     let summon = matches!(request, Request::Select { .. });
@@ -419,6 +438,27 @@ fn send_keys(
 
     ctx.request_repaint();
     Response::ok()
+}
+
+/// Capture the window and hand back a PNG.
+///
+/// The window is summoned first, for the same reason `terra select` does it and
+/// in the same way (the thread-safe `NSRunningApplication`, never from inside
+/// the frame callback — that wedges winit's waker): the pixels asked for are
+/// the ones the GPU draws, and eframe does not run the app at all while the
+/// window is occluded. Bringing it forward turns "no frame will ever happen"
+/// into "a frame happens now" for the ordinary cases — another Space, buried
+/// behind a browser. What it cannot fix is a *minimised* window, or a
+/// compositor that refuses self-activation (Wayland); those end at
+/// `Screenshots::capture`'s timeout with a message that says so.
+fn screenshot(shots: &Screenshots, ctx: &egui::Context) -> Response {
+    crate::macos::activate_app();
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    ctx.request_repaint();
+    match shots.capture(ctx) {
+        Ok(png) => Response::ok_png(&png),
+        Err(err) => Response::err(err),
+    }
 }
 
 /// The whole protocol, in terms of [`TabManager`].
@@ -503,6 +543,9 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
                 },
             }
         }
+        // Answered in `dispatch`, which has the UI context and does not hold
+        // this lock: a screenshot is a frame, not a tab operation.
+        Request::Screenshot => Response::err("internal error: screenshot reached the tab executor"),
         Request::Select { tab } => {
             if tabs.select(tab) {
                 Response::ok()

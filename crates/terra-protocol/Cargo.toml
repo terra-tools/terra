@@ -9,3 +9,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 interprocess = { workspace = true }
+
+# Screenshots ride the JSON wire in base64 (see `encode_png`). Encoding lives
+# here rather than in either endpoint so the two cannot pick different
+# alphabets and silently exchange garbage.
+base64 = { workspace = true }

@@ -11,10 +11,11 @@
 
 mod doctor;
 mod escape;
+mod pretty;
 mod record;
 mod tty;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use terra_protocol::{request, Request, Response, TabInfo};
 
@@ -86,6 +87,15 @@ fn learn_text() -> String {
          case-insensitive, `{{{{` is a literal brace, and a brace group that\n\
          names nothing is sent as written. --enter still appends a CR and\n\
          composes with --keys.\n\n\
+         Pictures of the window\n\
+         ----------------------\n\
+         \x20 terra select \"$id\"; terra screenshot --out shot.png --pretty\n\
+         The rendered window as a PNG (the app captures its own framebuffer),\n\
+         optionally composited ray.so-style: rounded card, macOS traffic\n\
+         lights, drop shadow, diagonal gradient (--bg '#4f46e5,#ec4899' to\n\
+         recolour). The window is brought forward to be drawn, and a window\n\
+         that cannot be drawn fails in 2s rather than hanging. For *reading* a\n\
+         tab, capture below is better in every way.\n\n\
          Reading a tab precisely\n\
          -----------------------\n\
          \x20 terra capture \"$id\" --cells\n\
@@ -211,6 +221,40 @@ enum Command {
         /// Emit the full cell grid with styling as JSON instead of plain text
         #[arg(long)]
         cells: bool,
+    },
+
+    /// Save a PNG of the terra window.
+    ///
+    /// The app captures its own framebuffer, so this is the rendered window —
+    /// fonts, colours, the tab bar, the palette if it is open — rather than the
+    /// text `capture` returns. It shows whatever the window is showing, so pick
+    /// the tab with `terra select` first.
+    ///
+    /// The window is brought forward to be drawn: eframe does not run at all
+    /// while it is occluded, so a screenshot is the one request that needs the
+    /// window in front of you. A minimised window fails after two seconds
+    /// rather than hanging.
+    ///
+    ///     terra screenshot --out shot.png
+    ///     terra screenshot --out shot.png --pretty
+    ///
+    /// `--pretty` composites the window ray.so-style: a rounded card with
+    /// macOS traffic lights and a drop shadow, on a diagonal gradient.
+    Screenshot {
+        /// File to write the PNG to. Required unless --json, which prints the
+        /// image as base64 in the Response instead of writing it anywhere.
+        /// (No `-`: a PNG on a terminal's stdout is not useful to anyone.)
+        #[arg(long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+
+        /// Composite the window on a gradient card with a shadow
+        #[arg(long)]
+        pretty: bool,
+
+        /// Gradient colours for --pretty: one or two CSS hex colours,
+        /// e.g. `--bg '#4f46e5,#ec4899'`. One colour means a flat background.
+        #[arg(long, value_name = "HEX[,HEX]", requires = "pretty")]
+        bg: Option<String>,
     },
 
     /// Set a tab's title
@@ -347,12 +391,34 @@ impl Command {
                 tab: *tab,
                 title: title.clone(),
             },
+            Command::Screenshot { .. } => Request::Screenshot,
             Command::Select { tab } => Request::Select { tab: *tab },
             Command::Bidi { tab, mode } => Request::Bidi {
                 tab: *tab,
                 mode: mode.clone(),
             },
         }
+    }
+}
+
+/// Turn a server-side error into one the reader can act on.
+///
+/// The wire protocol is additive, so a `terra` newer than the running
+/// `terra-app` is a normal state of the world — you upgrade the CLI, or build
+/// it from a checkout, and the installed app is still last week's. serde
+/// answers an unknown `cmd` with "unknown variant `screenshot`", which is
+/// accurate and completely unhelpful about what to do next. Neither side
+/// crashes; only the message needs work.
+fn explain(error: &str) -> String {
+    if error.contains("unknown variant") {
+        format!(
+            "{error}\n\
+             the running terra app does not know this command — it is older than \
+             this CLI. Upgrade it with `just upgrade` (or restart it from a build \
+             of this checkout)."
+        )
+    } else {
+        error.to_string()
     }
 }
 
@@ -405,6 +471,19 @@ fn run() -> Result<()> {
         _ => {}
     }
 
+    // Checked before the request rather than after: taking a screenshot and
+    // only then discovering there is nowhere to put it steals the window's
+    // focus for nothing. clap cannot express it — `--json` is a global flag,
+    // and `required_unless_present` does not see it when it is written before
+    // the subcommand (`terra --json screenshot`).
+    if let Command::Screenshot { out: None, .. } = &cli.command {
+        if !cli.json {
+            anyhow::bail!(
+                "screenshot needs --out <PATH> (or --json, to get the base64 payload instead)"
+            );
+        }
+    }
+
     let req = cli.command.to_request();
     let resp = request(&req)?;
 
@@ -412,15 +491,20 @@ fn run() -> Result<()> {
         println!("{}", serde_json::to_string(&resp)?);
         // A failed operation is still an error for the shell, even in --json mode.
         if let Response::Err { error } = &resp {
-            eprintln!("terra: {error}");
+            eprintln!("terra: {}", explain(error));
             std::process::exit(1);
         }
         return Ok(());
     }
 
     match resp {
-        Response::Err { error } => Err(anyhow::anyhow!(error)),
-        Response::Ok { tabs, text, tab } => {
+        Response::Err { error } => Err(anyhow::anyhow!(explain(&error))),
+        Response::Ok {
+            tabs,
+            text,
+            tab,
+            png,
+        } => {
             match cli.command {
                 Command::Ls => {
                     let tabs = tabs.unwrap_or_default();
@@ -443,6 +527,26 @@ fn run() -> Result<()> {
                             println!();
                         }
                     }
+                }
+                Command::Screenshot { out, pretty, bg } => {
+                    let encoded = png.context(
+                        "the app answered without an image — is it a newer or older terra?",
+                    )?;
+                    let image = terra_protocol::decode_png(&encoded)?;
+                    let image = if pretty {
+                        let bg = match bg.as_deref() {
+                            Some(spec) => pretty::parse_bg(spec)?,
+                            None => pretty::DEFAULT_BG,
+                        };
+                        pretty::encode(&pretty::compose(&pretty::decode(&image)?, bg))?
+                    } else {
+                        image
+                    };
+                    // clap's `required_unless_present = "json"` guarantees this,
+                    // and --json returned long before here.
+                    let out = out.context("--out is required")?;
+                    std::fs::write(&out, &image)
+                        .with_context(|| format!("writing {}", out.display()))?;
                 }
                 Command::Bidi { .. } => {
                     // The app answers both the query and the set with the
@@ -649,6 +753,68 @@ mod tests {
             Request::Capture { scrollback, .. } => assert_eq!(scrollback, 500),
             other => panic!("expected Capture, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn screenshot_maps_to_the_request_and_keeps_its_flags_local() {
+        match Cli::parse_from(["terra", "screenshot", "--out", "shot.png"]).command {
+            Command::Screenshot { out, pretty, bg } => {
+                assert_eq!(out.as_deref(), Some(std::path::Path::new("shot.png")));
+                assert!(!pretty);
+                assert!(bg.is_none());
+            }
+            other => panic!("expected Screenshot, got {other:?}"),
+        }
+        assert!(matches!(
+            Cli::parse_from(["terra", "screenshot", "--out", "a.png"])
+                .command
+                .to_request(),
+            Request::Screenshot
+        ));
+    }
+
+    /// `--out` is how the image gets anywhere, so it is required — except in
+    /// `--json` mode, which prints the payload instead of writing a file.
+    #[test]
+    fn screenshot_needs_somewhere_to_put_the_image() {
+        // The parser accepts it either way — the requirement is `run`'s,
+        // because clap cannot see a global flag written before the subcommand.
+        assert!(Cli::try_parse_from(["terra", "screenshot"]).is_ok());
+        assert!(Cli::try_parse_from(["terra", "--json", "screenshot"]).is_ok());
+        assert!(Cli::try_parse_from(["terra", "screenshot", "--json"]).is_ok());
+        // …and the flag really does land on the parsed command in both spellings.
+        assert!(Cli::parse_from(["terra", "--json", "screenshot"]).json);
+        assert!(Cli::parse_from(["terra", "screenshot", "--json"]).json);
+    }
+
+    /// `--bg` only means anything to the compositor, so asking for it without
+    /// `--pretty` is a mistake worth catching at the parser.
+    #[test]
+    fn a_background_without_pretty_is_rejected() {
+        assert!(
+            Cli::try_parse_from(["terra", "screenshot", "--out", "a.png", "--bg", "#000"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "terra",
+            "screenshot",
+            "--out",
+            "a.png",
+            "--pretty",
+            "--bg",
+            "#000,#fff",
+        ])
+        .is_ok());
+    }
+
+    /// An app older than this CLI answers `screenshot` with serde's "unknown
+    /// variant". That must not be the last word the user reads.
+    #[test]
+    fn an_unknown_verb_error_says_what_to_do_about_it() {
+        let explained = explain("bad request: unknown variant `screenshot`, expected one of …");
+        assert!(explained.contains("older than this CLI"), "{explained}");
+        assert!(explained.contains("just upgrade"), "{explained}");
+        // Everything else is passed through untouched.
+        assert_eq!(explain("no such tab: 7"), "no such tab: 7");
     }
 
     #[test]

@@ -29,6 +29,7 @@ mod ghostty_theme;
 mod ipc;
 mod macos;
 mod procinfo;
+mod screenshot;
 mod scrollbar;
 mod tabs;
 mod ui;
@@ -40,6 +41,7 @@ use egui_term::{PtyEvent, TerminalView};
 use terra_palette::{Palette, PaletteAction, PaletteEvent, PaletteIcon};
 
 use crate::ipc::IpcServer;
+use crate::screenshot::Screenshots;
 use crate::scrollbar::ScrollbarState;
 use crate::tabs::TabManager;
 use crate::ui::AppAction;
@@ -148,6 +150,10 @@ struct App {
     tabs: Option<Arc<Mutex<TabManager>>>,
     palette: Palette,
     ipc: Option<IpcServer>,
+    /// The `terra screenshot` rendezvous, shared with the IPC threads. It is
+    /// the one request they cannot answer alone: the pixels exist only because
+    /// this thread drew them (see `screenshot.rs`).
+    screenshots: Arc<Screenshots>,
     scrollbar: ScrollbarState,
     config: config::ConfigStore,
     /// `config.generation()` that `cached_font` was built from, so the font
@@ -180,6 +186,7 @@ impl App {
             tabs: None,
             palette: Palette::default(),
             ipc: None,
+            screenshots: Arc::default(),
             scrollbar: ScrollbarState::default(),
             cached_config_generation: config.generation(),
             cached_font,
@@ -208,7 +215,11 @@ impl App {
         )));
         self.tabs = Some(Arc::clone(&tabs));
 
-        match ipc::start(ctx.clone(), Arc::clone(&tabs)) {
+        match ipc::start(
+            ctx.clone(),
+            Arc::clone(&tabs),
+            Arc::clone(&self.screenshots),
+        ) {
             Ok(server) => {
                 log::info!("terra: listening on {}", server.socket_path().display());
                 self.ipc = Some(server);
@@ -631,6 +642,16 @@ impl eframe::App for App {
             }
             self.ipc = None;
             return;
+        }
+
+        // Before anything else this frame: the framebuffer readback for a
+        // `terra screenshot` arrives as an input event, and a client thread is
+        // blocked on it. While one is outstanding, keep painting — the capture
+        // lands a frame or two after the one it was asked for, and an idle
+        // terra would park in between and never produce it.
+        self.screenshots.deliver(&ctx);
+        if self.screenshots.pending() {
+            ctx.request_repaint();
         }
 
         self.drain_pty_events();

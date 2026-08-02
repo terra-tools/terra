@@ -67,6 +67,7 @@ terra send <tab> "text" [--keys] [--enter]  # --enter appends CR (like tmux send
 terra capture <tab> [--scrollback N] [--cells]  # text, or the styled grid as JSON
 terra rename <tab> "new title"
 terra select <tab>
+terra screenshot --out F [--pretty] [--bg hex1,hex2]  # PNG of the window
 terra bidi <tab> [off|on|auto]    # per-tab RTL reordering; prints the mode
 terra learn                       # self-teaching prompt for agents
 terra doctor                      # probe the terminal this CLI runs inside
@@ -83,6 +84,16 @@ without it reaches the PTY byte for byte. `--cells` returns run-length-encoded
 runs carrying `fg`/`bg`/`flags` plus the cursor, with colours left as the
 program named them (`{"indexed":236}`, `{"named":"Background"}`, `"#3a3a3a"`)
 rather than resolved against the theme.
+
+`screenshot` is the only request answered *by the UI thread*: the pixels exist
+because a frame was drawn. The IPC thread summons the window (the same
+`activate_app` + `Focus` that `select` uses), posts
+`ViewportCommand::Screenshot`, and blocks on a rendezvous
+(`terra-app/src/screenshot.rs`) until the frame's `Event::Screenshot` reaches
+`App::ui`, or 2s pass — an occluded window that will not come forward has to
+fail with a message rather than hang. The app encodes PNG; the CLI decodes it
+and, for `--pretty`, composites a rounded card, traffic lights, drop shadow and
+gradient in pure pixel arithmetic (`terra-cli/src/pretty.rs`).
 
 `doctor` and `record` never open the socket: they talk to the terminal the CLI
 is running inside, so the same binary run under terra and under any other

@@ -242,6 +242,13 @@ pub enum Request {
     Rename { tab: u64, title: String },
     /// Focus/activate a tab.
     Select { tab: u64 },
+    /// Capture the app window's framebuffer as a PNG.
+    ///
+    /// Window-wide rather than per-tab: this is the *rendered* pixels, so what
+    /// it can show is whatever the window is showing — the active tab, the tab
+    /// bar and the palette included. Use [`Request::Select`] first to choose
+    /// the tab. The reply is [`Response::Ok`]'s `png` field, base64.
+    Screenshot,
     /// Get or set a tab's right-to-left reordering mode.
     Bidi {
         tab: u64,
@@ -268,6 +275,16 @@ pub enum Response {
         text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tab: Option<u64>,
+        /// A PNG image, base64 (standard alphabet, padded) — the reply to
+        /// [`Request::Screenshot`].
+        ///
+        /// Additive and defaulted like every field above it: it is absent from
+        /// every other reply's JSON, so an older client parsing a newer
+        /// server's answer sees exactly the bytes it saw before. Binary rides
+        /// in base64 because the transport is one JSON object per line and a
+        /// PNG contains both newlines and invalid UTF-8; see [`encode_png`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        png: Option<String>,
     },
     Err {
         error: String,
@@ -280,6 +297,7 @@ impl Response {
             tabs: None,
             text: None,
             tab: None,
+            png: None,
         }
     }
     pub fn ok_tab(id: u64) -> Self {
@@ -287,6 +305,7 @@ impl Response {
             tabs: None,
             text: None,
             tab: Some(id),
+            png: None,
         }
     }
     pub fn ok_tabs(tabs: Vec<TabInfo>) -> Self {
@@ -294,6 +313,7 @@ impl Response {
             tabs: Some(tabs),
             text: None,
             tab: None,
+            png: None,
         }
     }
     pub fn ok_text(text: String) -> Self {
@@ -301,6 +321,17 @@ impl Response {
             tabs: None,
             text: Some(text),
             tab: None,
+            png: None,
+        }
+    }
+    /// A PNG reply. `png` is the encoded file, *not* base64 — the encoding is
+    /// applied here so the two sides cannot disagree about the alphabet.
+    pub fn ok_png(png: &[u8]) -> Self {
+        Response::Ok {
+            tabs: None,
+            text: None,
+            tab: None,
+            png: Some(encode_png(png)),
         }
     }
     pub fn err(e: impl std::fmt::Display) -> Self {
@@ -308,6 +339,27 @@ impl Response {
             error: e.to_string(),
         }
     }
+}
+
+/// Base64-encode a PNG for [`Response::Ok`]'s `png` field.
+///
+/// The wire format is one JSON object per line, so an image cannot travel
+/// as-is: a PNG is not UTF-8 and contains `\n` bytes in its own right. Standard
+/// alphabet, padded — the default `serde_json` and `base64 --decode` both
+/// expect, so `terra screenshot --json | jq -r .png | base64 -d > shot.png`
+/// works from a shell with no terra code involved.
+pub fn encode_png(png: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(png)
+}
+
+/// Inverse of [`encode_png`]. Fails on anything that is not valid base64;
+/// whether the bytes are a *PNG* is the caller's problem.
+pub fn decode_png(encoded: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .context("the screenshot payload is not valid base64")
 }
 
 /// Blocking client used by the CLI: connect, send one request, read one
@@ -438,6 +490,66 @@ mod tests {
             Request::Capture { cells, .. } => assert!(cells),
             other => panic!("expected Capture, got {other:?}"),
         }
+    }
+
+    // --- screenshot -------------------------------------------------------
+
+    #[test]
+    fn a_screenshot_request_is_just_its_verb() {
+        let json = serde_json::to_string(&Request::Screenshot).unwrap();
+        assert_eq!(json, r#"{"cmd":"screenshot"}"#);
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"screenshot"}"#).unwrap(),
+            Request::Screenshot
+        ));
+    }
+
+    /// The `png` field is additive: it appears only in a screenshot reply, so
+    /// every other response is byte-identical to what shipped before it.
+    #[test]
+    fn the_png_field_is_only_serialised_when_present() {
+        assert_eq!(
+            serde_json::to_string(&Response::ok()).unwrap(),
+            r#"{"status":"ok"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::ok_png(b"\x89PNG")).unwrap(),
+            r#"{"status":"ok","png":"iVBORw=="}"#
+        );
+    }
+
+    /// …and an older server's reply, which has no `png` at all, still parses.
+    #[test]
+    fn a_response_without_a_png_still_deserialises() {
+        let resp: Response = serde_json::from_str(r#"{"status":"ok","text":"hi"}"#).unwrap();
+        match resp {
+            Response::Ok { text, png, .. } => {
+                assert_eq!(text.as_deref(), Some("hi"));
+                assert!(png.is_none());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn png_payloads_round_trip_through_base64() {
+        let bytes: Vec<u8> = (0u8..=255).chain(b"\n\r\0\xff".iter().copied()).collect();
+        let encoded = encode_png(&bytes);
+        assert!(!encoded.contains('\n'), "the payload must fit on one line");
+        assert_eq!(decode_png(&encoded).unwrap(), bytes);
+        assert!(decode_png("not base64!!").is_err());
+    }
+
+    /// A `screenshot` sent to a terra that predates it must come back as a
+    /// readable error, not a panic or a hang, on either side. This is the
+    /// server half: an unknown `cmd` is a deserialisation failure, and the
+    /// server answers it (see `ipc::serve`) with `bad request: <that>`.
+    #[test]
+    fn an_unknown_verb_is_an_error_that_names_itself() {
+        let err = serde_json::from_str::<Request>(r#"{"cmd":"teleport"}"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("teleport"), "{msg}");
+        assert!(msg.contains("unknown variant"), "{msg}");
     }
 
     // --- addressing -------------------------------------------------------

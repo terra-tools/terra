@@ -34,6 +34,15 @@ anyhow = "1"
 # feature is deliberately left off — terra has no async runtime.
 interprocess = "=2.4.3"
 clap = { version = "4", features = ["derive"] }
+
+# `terra screenshot`: the app encodes the framebuffer, the CLI decodes it again
+# to composite `--pretty`. Both crates are already in the tree at these exact
+# versions (png via eframe/arboard's `image`, base64 via alacritty_terminal),
+# so naming them adds no lockfile entry and no extra compilation. png is a
+# codec, not an image framework — no colour management, no resizing, no formats
+# terra does not use.
+png = "0.18"
+base64 = "0.22"
 log = "0.4"
 env_logger = "0.11"
 

@@ -24,6 +24,10 @@ log = { workspace = true }
 env_logger = { workspace = true }
 raw-window-handle = { workspace = true }
 
+# `terra screenshot`: encodes the framebuffer egui hands back. Already built
+# for this crate (eframe -> arboard -> image -> png), so it is free here.
+png = { workspace = true }
+
 # eframe is pulled in with `default-features = false` (see the workspace
 # manifest), which leaves winit with no windowing backend on Linux — it fails
 # to compile with "the platform you're compiling for is not supported".
