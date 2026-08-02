@@ -3,13 +3,33 @@
 ## Everyday tasks (justfile)
 
 ```sh
-just restart      # kill any running terra-app, rebuild debug, relaunch
-just t <args>     # run the CLI against the live app, e.g. `just t ls`
+just run          # launch the debug build (dev socket, beside your daily terra)
+just restart      # kill the running *dev* app, rebuild debug, relaunch
+just t <args>     # run the CLI against the dev app, e.g. `just t ls`
 just pre-commit   # fmt + clippy + tests — run before committing
 just test / lint / fmt / check
 just log          # tail the running app's log (/tmp/terra-app.log)
 just bundle       # release build + cargo-packager (.app / .dmg)
 ```
+
+## Developing inside terra
+
+On macOS the control socket *is* the single-instance claim: a launch that finds
+`~/.terra/terra.sock` answering focuses that instance and exits. So the debug
+build gets its own address — `just run`, `just restart` and `just t` all set
+`TERRA_SOCKET=~/.terra/terra-dev.sock` — and the dev window opens beside the
+terra you are working in rather than handing over to it. Consequences:
+
+- The dev window's title carries a ` (dev)` suffix, so the two are never
+  confused. It appears whenever `TERRA_SOCKET` is set; `TERRA_DEV=1` forces it
+  on and `TERRA_DEV=0` off (`dev_suffix` in `terra-app/src/main.rs`).
+- `just t` drives the **dev** instance; plain `terra` in your shell still drives
+  the installed one. Nothing in the code changed — only the environment the
+  justfile exports.
+- `just restart`'s `pkill` pattern is `target/debug/terra-app`, which the
+  installed bundle (`terra.app/Contents/MacOS/terra-app`) cannot match, so
+  iterating never kills your daily driver. `just install` does kill the
+  installed app — it is replacing the bundle — but not the dev one.
 
 Note: run `cargo build --release` before `cargo packager` if invoking the
 packager by hand — it does not build the binary itself.

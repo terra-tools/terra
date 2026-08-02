@@ -77,6 +77,38 @@ fn terminal_font(cfg: &config::FontConfig) -> egui_term::TerminalFont {
     })
 }
 
+/// Suffix appended to the window title so a development build is not mistaken
+/// for the installed one. Pure, so the rules can be tested without touching the
+/// process environment.
+///
+/// `just run`/`just restart` put the debug build on its own socket
+/// (`TERRA_SOCKET=~/.terra/terra-dev.sock`) so it can live next to the release
+/// the user works in all day — the socket *is* the single-instance claim. A
+/// custom socket is therefore the signal that this window is not the daily
+/// driver. `TERRA_DEV` overrides that guess in both directions: set it to mark
+/// a window that uses the default socket, or to `0`/`false`/empty to suppress
+/// the mark on a relocated one (e.g. a real second install).
+fn dev_suffix(dev: Option<&str>, socket: Option<&str>) -> &'static str {
+    const MARK: &str = " (dev)";
+    match dev.map(str::trim) {
+        Some("0" | "false" | "no" | "off" | "") => "",
+        Some(_) => MARK,
+        None if socket.is_some_and(|s| !s.trim().is_empty()) => MARK,
+        None => "",
+    }
+}
+
+/// [`dev_suffix`] for this process, read once — the environment cannot change
+/// under us, and `sync_window_title` would otherwise ask on every rename.
+fn dev_mark() -> &'static str {
+    static MARK: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    MARK.get_or_init(|| {
+        let dev = std::env::var("TERRA_DEV").ok();
+        let socket = std::env::var("TERRA_SOCKET").ok();
+        dev_suffix(dev.as_deref(), socket.as_deref())
+    })
+}
+
 /// The window/taskbar icon. (The Dock icon on macOS comes from the .app
 /// bundle's `terra.icns` instead — see `just bundle`.)
 fn app_icon() -> egui::IconData {
@@ -96,7 +128,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([480.0, 320.0])
-            .with_title("terra")
+            .with_title(format!("terra{}", dev_mark()))
             .with_icon(app_icon()),
         ..Default::default()
     };
@@ -205,7 +237,12 @@ impl App {
         if title == self.last_window_title {
             return; // nothing moved — don't stat the disk on every frame
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+        // The mark decorates only what the titlebar shows: `last_window_title`
+        // stays the tab's own title, which `title_path` below parses as a cwd.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "{title}{}",
+            dev_mark()
+        )));
         self.last_window_title = title;
 
         // The title doubles as the cwd (`~/src/terra`), which is exactly what
@@ -665,6 +702,45 @@ impl eframe::App for App {
         if self.quitting || empty {
             self.ipc = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dev_suffix;
+
+    /// The daily driver — default socket, no override — is unmarked.
+    #[test]
+    fn the_installed_build_keeps_a_plain_title() {
+        assert_eq!(dev_suffix(None, None), "");
+        assert_eq!(dev_suffix(None, Some("  ")), "");
+    }
+
+    /// `just run` sets only TERRA_SOCKET, and that alone must mark the window.
+    #[test]
+    fn a_relocated_socket_marks_the_window() {
+        assert_eq!(
+            dev_suffix(None, Some("/home/ada/.terra/terra-dev.sock")),
+            " (dev)"
+        );
+    }
+
+    #[test]
+    fn terra_dev_marks_the_window_on_the_default_socket() {
+        assert_eq!(dev_suffix(Some("1"), None), " (dev)");
+    }
+
+    /// …and switches the mark off for a second *installed* build that merely
+    /// happens to use its own socket.
+    #[test]
+    fn terra_dev_can_suppress_the_mark() {
+        for off in ["0", "false", "no", "off", "", " "] {
+            assert_eq!(
+                dev_suffix(Some(off), Some("/tmp/other.sock")),
+                "",
+                "{off:?}"
+            );
         }
     }
 }

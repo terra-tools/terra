@@ -2,6 +2,19 @@
 
 set quiet
 
+# The socket the *development* build binds. On macOS the socket is the
+# single-instance claim: a launch that finds the default `~/.terra/terra.sock`
+# alive focuses that instance and exits. Giving the debug build its own address
+# is what lets it open beside the terra you actually work in all day — and it is
+# also what puts " (dev)" in its title bar (see `dev_suffix` in
+# crates/terra-app/src/main.rs). Nothing in the code changes: plain `terra` and
+# /Applications/terra.app still use the default socket.
+dev-socket := env('HOME', '/tmp') / '.terra/terra-dev.sock'
+
+# Pattern that matches the dev app and *only* the dev app. The installed build
+# runs from `terra.app/Contents/MacOS/terra-app`, so it can never match this.
+dev-pattern := 'target/debug/terra-app'
+
 default:
     just --list
 
@@ -13,16 +26,16 @@ build:
 release:
     cargo build --release
 
-# Run the GUI app (debug build)
+# Run the GUI app (debug build) beside the installed release
 run:
-    cargo run -p terra-app
+    TERRA_SOCKET='{{dev-socket}}' cargo run -p terra-app
 
-# Kill any running terra-app and start a fresh debug build
+# Kill the running *dev* app (never the installed one) and start a fresh debug build
 restart: build
-    -pkill -f 'target/(debug|release)/terra-app'
+    -pkill -f '{{dev-pattern}}'
     sleep 1
-    (nohup ./target/debug/terra-app > /tmp/terra-app.log 2>&1 &)
-    echo "terra-app restarted (log: /tmp/terra-app.log)"
+    (TERRA_SOCKET='{{dev-socket}}' nohup ./target/debug/terra-app > /tmp/terra-app.log 2>&1 &)
+    echo "terra-app (dev) restarted on {{dev-socket}} (log: /tmp/terra-app.log)"
 
 # Type-check the whole workspace
 check:
@@ -43,9 +56,10 @@ fmt:
 # fmt + clippy + tests — run before committing
 pre-commit: fmt lint test
 
-# Use the CLI against the running app, e.g. `just t ls`, `just t new -- htop`
+# Plain `terra` in your shell still talks to the installed release.
+# Use the CLI against the running *dev* app, e.g. `just t ls`, `just t new -- htop`
 t *args:
-    cargo run -q -p terra-cli -- {{args}}
+    TERRA_SOCKET='{{dev-socket}}' cargo run -q -p terra-cli -- {{args}}
 
 # Cross-platform bundles via cargo-packager (.app + .dmg on macOS)
 bundle: release
@@ -62,6 +76,8 @@ install force="" bin="/usr/local/bin":
     fi
     just bundle
     codesign --force --deep --sign - target/release/terra.app
+    # Deliberate: the bundle being replaced has to let go of the app first. The
+    # pattern is bundle-only, so `just run`'s dev instance keeps running.
     pkill -f 'terra.app/Contents/MacOS/terra-app' 2>/dev/null || true
     rm -rf "$dest"
     cp -R target/release/terra.app "$dest"
