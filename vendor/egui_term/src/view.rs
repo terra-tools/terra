@@ -15,6 +15,7 @@ use egui::{Id, PointerButton};
 
 use crate::backend::BackendCommand;
 use crate::backend::TerminalBackend;
+use crate::emoji;
 use crate::backend::{LinkAction, MouseButton, SelectionType};
 use crate::bidi::{self, BidiBase};
 use crate::bindings::Binding;
@@ -405,6 +406,39 @@ impl<'a> TerminalView<'a> {
                 let glyph = row_map.map_or(indexed.c, |map| {
                     map.display_char(logical_col, indexed.c)
                 });
+                // terra patch (#19): emoji paint as colour bitmaps from the
+                // system emoji font, composited as textured quads — epaint's
+                // glyph path is outlines-only and cannot carry colour. A
+                // character the font has no art for falls through to text.
+                let vs16 = indexed
+                    .zerowidth()
+                    .is_some_and(|z| z.contains(&'\u{FE0F}'));
+                if emoji::wants_color(glyph, vs16) {
+                    let side = cell_width.min(cell_height);
+                    let px = (side
+                        * layout.ctx.pixels_per_point())
+                    .round() as u32;
+                    if let Some(tex) =
+                        emoji::texture(&layout.ctx, glyph, px)
+                    {
+                        shapes.push(Shape::image(
+                            tex.id(),
+                            Rect::from_center_size(
+                                Pos2::new(
+                                    x + cell_width / 2.0,
+                                    y + cell_height / 2.0,
+                                ),
+                                Vec2::splat(side),
+                            ),
+                            Rect::from_min_max(
+                                Pos2::ZERO,
+                                Pos2::new(1.0, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        ));
+                        continue;
+                    }
+                }
                 shapes.push(painter.fonts_mut(|c| {
                     // terra patch: center the glyph vertically inside the
                     // (possibly line-height-inflated) cell.

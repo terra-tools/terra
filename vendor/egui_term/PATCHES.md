@@ -111,6 +111,18 @@
    in every terminal. Guarded by `terra-app/tests/mouse_reporting.rs`. Worth
    upstreaming.
 
+7. emoji.rs (new) + view.rs + Cargo.toml (`skrifa`, `png`): colour emoji in
+   the grid (issue #19). epaint's glyph path is outline-coverage-masks only —
+   it never reads sbix/CBDT/COLR — so emoji cells are composited as textured
+   quads instead: the system emoji font's sbix strikes are embedded PNGs,
+   read with `skrifa`, decoded once per (char, pixel size) and cached as egui
+   textures in the context. Pictograph planes always qualify; the legacy
+   symbol blocks only behind a zero-width U+FE0F. Anything the font has no
+   art for — including ZWJ sequences, flags and keycaps, which need shaping —
+   falls through to the monochrome text path, as does every platform without
+   `/System/Library/Fonts/Apple Color Emoji.ttc`. The tab bar and palette
+   still go through epaint and stay monochrome.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to

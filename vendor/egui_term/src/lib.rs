@@ -3,6 +3,7 @@
 
 mod backend;
 mod bidi;
+mod emoji;
 mod bindings;
 mod font;
 mod theme;

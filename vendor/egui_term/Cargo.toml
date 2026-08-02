@@ -16,3 +16,6 @@ anyhow = "1"
 open = "5.3.2"
 # terra patch: UAX #9 BiDi reordering (see src/bidi.rs).
 unicode-bidi = "0.3"
+# terra patch (#19): colour emoji from the system font's sbix bitmaps.
+skrifa = "0.45"
+png = "0.17"
