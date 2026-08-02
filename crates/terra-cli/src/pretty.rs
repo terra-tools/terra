@@ -391,45 +391,42 @@ pub fn compose(shot: &Image, bg: (Rgb, Rgb)) -> Image {
         }
     }
 
-    // A Retina framebuffer is 2-3x physical pixels, which would make the
-    // export two or three times the size ray.so hands out. Composited at
-    // full resolution for crisp AA, then brought back to logical size.
-    let scale = (shot.width.min(shot.height) as f32 / 720.0).clamp(1.0, 4.0);
-    if scale > 1.0 {
-        downscale(&canvas, scale)
+    // A Retina framebuffer is an exact integer multiple of the logical size
+    // (2x, sometimes 3x), which would make the export two or three times the
+    // size ray.so hands out. Composited at full resolution for crisp AA, then
+    // brought back to logical size. The factor is snapped to that integer:
+    // a fractional resample would smear every glyph across cell boundaries,
+    // while an exact n×n block average keeps text crisp.
+    let factor = (shot.width.min(shot.height) as f32 / 720.0)
+        .clamp(1.0, 4.0)
+        .round() as usize;
+    if factor > 1 {
+        downscale(&canvas, factor)
     } else {
         canvas
     }
 }
 
-/// Shrink by `factor` with box (area-average) sampling — the right filter for
-/// a downscale: every source pixel contributes once, so thin AA edges dim
-/// smoothly instead of shimmering the way point sampling would.
-fn downscale(src: &Image, factor: f32) -> Image {
-    let width = (src.width as f32 / factor).round().max(1.0) as usize;
-    let height = (src.height as f32 / factor).round().max(1.0) as usize;
+/// Shrink by an integer `factor`: each output pixel is the exact average of
+/// its n×n source block. For a Retina shot this is a pixel-perfect return to
+/// logical resolution — no resample kernel, nothing to smear.
+fn downscale(src: &Image, factor: usize) -> Image {
+    let width = (src.width / factor).max(1);
+    let height = (src.height / factor).max(1);
     let mut out = Image::filled(width, height);
+    let n = (factor * factor) as u32;
     for y in 0..height {
-        let y0 = (y as f32 * factor) as usize;
-        let y1 = (((y + 1) as f32 * factor).ceil() as usize).min(src.height);
         for x in 0..width {
-            let x0 = (x as f32 * factor) as usize;
-            let x1 = (((x + 1) as f32 * factor).ceil() as usize).min(src.width);
-            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
-            for sy in y0..y1.max(y0 + 1) {
-                for sx in x0..x1.max(x0 + 1) {
-                    let p = src.pixel(sx.min(src.width - 1), sy.min(src.height - 1));
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            for sy in y * factor..(y + 1) * factor {
+                for sx in x * factor..(x + 1) * factor {
+                    let p = src.pixel(sx, sy);
                     r += u32::from(p.0);
                     g += u32::from(p.1);
                     b += u32::from(p.2);
-                    n += 1;
                 }
             }
-            out.set(
-                x,
-                y,
-                Rgb((r / n) as u8, (g / n) as u8, (b / n) as u8),
-            );
+            out.set(x, y, Rgb((r / n) as u8, (g / n) as u8, (b / n) as u8));
         }
     }
     out
