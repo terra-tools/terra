@@ -21,6 +21,21 @@ use egui::{
     Modifiers, Order, Pos2, Rect, Sense, Shadow, Stroke, TextEdit, Vec2,
 };
 
+/// Glyph drawn in an action's leading tile. Painted from primitives rather
+/// than typeset, so it never depends on a font shipping the codepoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteIcon {
+    Plus,
+    Cross,
+    Pencil,
+    ArrowRight,
+    ArrowLeft,
+    /// A `>_` prompt — used for "go to tab".
+    Terminal,
+    Power,
+    Dot,
+}
+
 #[derive(Debug, Clone)]
 pub struct PaletteAction {
     /// Stable identifier returned on selection, e.g. "tab.new".
@@ -29,6 +44,11 @@ pub struct PaletteAction {
     pub label: String,
     /// Optional right-aligned keybinding hint, e.g. "⌘T".
     pub shortcut: Option<String>,
+    /// Optional group heading, e.g. "Tabs". Actions sharing a section are
+    /// rendered together under one header and share an accent colour.
+    pub section: Option<String>,
+    /// Optional leading icon.
+    pub icon: Option<PaletteIcon>,
 }
 
 impl PaletteAction {
@@ -37,7 +57,21 @@ impl PaletteAction {
             id: id.into(),
             label: label.into(),
             shortcut: shortcut.map(|s| s.to_string()),
+            section: None,
+            icon: None,
         }
+    }
+
+    /// Place this action under a group heading.
+    pub fn in_section(mut self, section: impl Into<String>) -> Self {
+        self.section = Some(section.into());
+        self
+    }
+
+    /// Give this action a leading icon tile.
+    pub fn with_icon(mut self, icon: PaletteIcon) -> Self {
+        self.icon = Some(icon);
+        self
     }
 }
 
@@ -81,6 +115,10 @@ const PANEL_RADIUS: u8 = 14;
 
 const ROW_HEIGHT: f32 = 38.0;
 const MAX_VISIBLE_ROWS: usize = 9;
+/// Height of a group heading row.
+const SECTION_HEIGHT: f32 = 26.0;
+/// Extra breathing room above a heading that is not the first thing in the list.
+const SECTION_GAP_TOP: f32 = 6.0;
 /// Vertical breathing room above and below the result list.
 const LIST_PAD_Y: f32 = 6.0;
 /// Rows are inset from the panel edge so their fill reads as a floating pill.
@@ -95,38 +133,75 @@ const INPUT_PAD_X: i8 = 16;
 const FONT_INPUT: f32 = 19.0;
 const FONT_ROW: f32 = 14.5;
 const FONT_SHORTCUT: f32 = 11.0;
+const FONT_SECTION: f32 = 10.5;
 const FONT_PROMPT: f32 = 12.5;
 const FONT_EMPTY: f32 = 13.5;
+
+/// Leading icon tile.
+const ICON_TILE: f32 = 18.0;
+const ICON_TILE_RADIUS: u8 = 5;
+const ICON_STROKE: f32 = 1.5;
+/// Space between the icon tile and the label.
+const ICON_GAP: f32 = 10.0;
 
 /// Translucent white, premultiplied (the `const` form of `from_white_alpha`).
 const fn white(alpha: u8) -> Color32 {
     Color32::from_rgba_premultiplied(alpha, alpha, alpha, alpha)
 }
 
-const BG_PANEL: Color32 = Color32::from_rgb(0x20, 0x21, 0x26);
-/// 8% white hairline around the floating layer.
-const PANEL_BORDER: Color32 = white(20);
+/// The panel is *semi-transparent*: the terminal behind it stays faintly
+/// visible through the fill, which (over the scrim) is what reads as glass.
+/// egui has no backdrop blur, so the illusion is carried entirely by this
+/// alpha plus the highlight/border layering in `show_panel`.
+///
+/// Premultiplied form of `rgb(0x20,0x21,0x26)` at 86% opacity.
+const BG_PANEL: Color32 = Color32::from_rgba_premultiplied(0x1b, 0x1c, 0x20, 0xdc);
+/// 12% white hairline around the floating layer — brighter than an opaque
+/// panel would need, because a glass edge is what sells the material.
+const PANEL_BORDER: Color32 = white(30);
+/// A 1px inner highlight along the top edge, as if lit from above.
+const PANEL_HIGHLIGHT: Color32 = white(22);
 /// 6% white rule under the input.
 const DIVIDER: Color32 = white(15);
 /// 7% / 4% white — soft, Raycast-style, never a saturated bar.
-const BG_SELECTED: Color32 = white(18);
-const BG_HOVER: Color32 = white(10);
+const BG_SELECTED: Color32 = white(20);
+const BG_HOVER: Color32 = white(11);
+/// Hairline inside the selected row, so it reads as a raised pill.
+const SELECTED_STROKE: Color32 = white(12);
 /// 5% white kbd chip.
 const CHIP_FILL: Color32 = white(13);
+
+/// Accent colours cycled across sections, in declaration order. Keying off
+/// the section (not the action) means every command in a group shares a
+/// colour, so the eye can chunk the list without reading it.
+const SECTION_TINTS: [Color32; 4] = [
+    Color32::from_rgb(0x7d, 0xd3, 0xa0), // green
+    Color32::from_rgb(0x8a, 0xb4, 0xf8), // blue
+    Color32::from_rgb(0xf0, 0xa8, 0x68), // orange
+    Color32::from_rgb(0xc4, 0xa2, 0xf5), // purple
+];
+/// Tint for actions that belong to no section.
+const TINT_NEUTRAL: Color32 = Color32::from_rgb(0x9a, 0x9f, 0xa8);
 
 const FG_INPUT: Color32 = Color32::from_rgb(0xf2, 0xf2, 0xf4);
 const FG_ROW_SELECTED: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xec);
 const FG_ROW: Color32 = Color32::from_rgb(0xc9, 0xc9, 0xcf);
 const FG_MUTED: Color32 = Color32::from_rgb(0x7a, 0x7f, 0x87);
+const FG_SECTION: Color32 = Color32::from_rgb(0x82, 0x88, 0x91);
 const FG_PROMPT: Color32 = Color32::from_rgb(0x8a, 0x8f, 0x97);
 const FG_SHORTCUT: Color32 = Color32::from_rgb(0xa0, 0xa5, 0xad);
 const CARET: Color32 = Color32::from_rgb(0x4a, 0x90, 0xd9);
-const SCRIM: Color32 = Color32::from_black_alpha(90);
+/// Lighter than an opaque panel would want: the terminal has to stay legible
+/// *through* the glass for the material to register at all.
+const SCRIM: Color32 = Color32::from_black_alpha(70);
 
 /// Shortcut chip metrics.
 const CHIP_HEIGHT: f32 = 19.0;
-const CHIP_PAD_X: f32 = 6.0;
+const CHIP_PAD_X: f32 = 6.5;
 const CHIP_RADIUS: u8 = 6;
+/// Extra space inserted between the glyphs of a shortcut, so `⌘T` does not
+/// set the letter flush against the symbol.
+const CHIP_TRACKING: f32 = 1.5;
 
 fn prop(size: f32) -> FontId {
     FontId::proportional(size)
@@ -147,17 +222,148 @@ fn divider(ui: &mut egui::Ui) {
     ui.painter().rect_filled(rect, CornerRadius::ZERO, DIVIDER);
 }
 
+/// Points along a circle from `start_deg` to `end_deg` (screen coords, so
+/// angles run clockwise and -90° is straight up).
+fn arc_points(center: Pos2, radius: f32, start_deg: f32, end_deg: f32, steps: usize) -> Vec<Pos2> {
+    (0..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            let a = (start_deg + (end_deg - start_deg) * t).to_radians();
+            Pos2::new(center.x + radius * a.cos(), center.y + radius * a.sin())
+        })
+        .collect()
+}
+
+/// Shaft plus chevron. `dir` is +1 for right, -1 for left.
+fn paint_arrow(p: &egui::Painter, c: Pos2, r: f32, s: Stroke, dir: f32) {
+    let tip = Pos2::new(c.x + r * dir, c.y);
+    p.line_segment([Pos2::new(c.x - r * dir, c.y), tip], s);
+    p.line_segment([tip, Pos2::new(c.x + r * 0.4 * dir, c.y - r * 0.55)], s);
+    p.line_segment([tip, Pos2::new(c.x + r * 0.4 * dir, c.y + r * 0.55)], s);
+}
+
+/// Paint a tinted rounded tile with `icon` stroked inside it.
+fn paint_icon(p: &egui::Painter, tile: Rect, icon: PaletteIcon, tint: Color32) {
+    p.rect_filled(
+        tile,
+        CornerRadius::same(ICON_TILE_RADIUS),
+        tint.gamma_multiply(0.18),
+    );
+    let c = tile.center();
+    let r = tile.width() * 0.26;
+    let s = Stroke::new(ICON_STROKE, tint);
+    match icon {
+        PaletteIcon::Plus => {
+            p.line_segment([Pos2::new(c.x - r, c.y), Pos2::new(c.x + r, c.y)], s);
+            p.line_segment([Pos2::new(c.x, c.y - r), Pos2::new(c.x, c.y + r)], s);
+        }
+        PaletteIcon::Cross => {
+            let d = r * 0.85;
+            p.line_segment(
+                [Pos2::new(c.x - d, c.y - d), Pos2::new(c.x + d, c.y + d)],
+                s,
+            );
+            p.line_segment(
+                [Pos2::new(c.x + d, c.y - d), Pos2::new(c.x - d, c.y + d)],
+                s,
+            );
+        }
+        PaletteIcon::Pencil => {
+            // A bare diagonal reads as a slash, not a pencil. What makes it
+            // legible at 18px is the pairing: a solid nib at the tip plus the
+            // rule it writes on.
+            let tip = Pos2::new(c.x - r * 0.75, c.y + r * 0.35);
+            let butt = Pos2::new(c.x + r * 0.95, c.y - r * 1.05);
+            p.line_segment([tip, butt], Stroke::new(ICON_STROKE * 1.15, tint));
+            // Nib: a small filled wedge pointing down-left past the shaft.
+            let nib = r * 0.42;
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(tip.x - nib, tip.y + nib),
+                    Pos2::new(tip.x + nib * 0.55, tip.y - nib * 0.15),
+                    Pos2::new(tip.x + nib * 0.15, tip.y + nib * 0.55),
+                ],
+                tint,
+                Stroke::NONE,
+            ));
+            // The rule being written on.
+            p.line_segment(
+                [
+                    Pos2::new(c.x - r * 0.95, c.y + r * 1.05),
+                    Pos2::new(c.x + r * 0.95, c.y + r * 1.05),
+                ],
+                Stroke::new(ICON_STROKE, tint.gamma_multiply(0.75)),
+            );
+        }
+        PaletteIcon::ArrowRight => paint_arrow(p, c, r, s, 1.0),
+        PaletteIcon::ArrowLeft => paint_arrow(p, c, r, s, -1.0),
+        PaletteIcon::Terminal => {
+            // A `>_` prompt.
+            let elbow = Pos2::new(c.x - r * 0.1, c.y - r * 0.15);
+            p.line_segment([Pos2::new(c.x - r, c.y - r * 0.85), elbow], s);
+            p.line_segment([elbow, Pos2::new(c.x - r, c.y + r * 0.55)], s);
+            p.line_segment(
+                [
+                    Pos2::new(c.x + r * 0.15, c.y + r * 0.8),
+                    Pos2::new(c.x + r, c.y + r * 0.8),
+                ],
+                s,
+            );
+        }
+        PaletteIcon::Power => {
+            // Ring with a gap at the top, plus the stem through the gap.
+            p.add(egui::Shape::line(arc_points(c, r, -60.0, 240.0, 18), s));
+            p.line_segment(
+                [
+                    Pos2::new(c.x, c.y - r * 1.1),
+                    Pos2::new(c.x, c.y - r * 0.15),
+                ],
+                s,
+            );
+        }
+        PaletteIcon::Dot => {
+            p.circle_filled(c, r * 0.45, tint);
+        }
+    }
+}
+
 /// Paint a macOS-style kbd chip whose right edge sits at `right_center`.
+///
+/// Two details this does not get for free from a single `layout_no_wrap`:
+///
+/// * **Font.** The modifier glyphs live in a narrow slice of Unicode
+///   (`⇧` U+21E7, `⌘` U+2318, `⌥` U+2325, `⌃` U+2303). egui's default
+///   *proportional* stack does not cover all of them and renders the misses
+///   as tofu, while the monospace face the terminal already ships does.
+/// * **Tracking.** `⌘T` typeset normally sets the letter hard against the
+///   glyph, because the symbol has no side bearing to speak of. Laying each
+///   character out separately lets us open the tracking back up.
 fn shortcut_chip(painter: &egui::Painter, right_center: Pos2, text: &str) {
-    let galley = painter.layout_no_wrap(text.to_string(), prop(FONT_SHORTCUT), FG_SHORTCUT);
-    let size = Vec2::new(galley.size().x + CHIP_PAD_X * 2.0, CHIP_HEIGHT);
+    let font = FontId::monospace(FONT_SHORTCUT);
+    let glyphs: Vec<_> = text
+        .chars()
+        .map(|ch| painter.layout_no_wrap(ch.to_string(), font.clone(), FG_SHORTCUT))
+        .collect();
+    if glyphs.is_empty() {
+        return;
+    }
+
+    let text_w: f32 =
+        glyphs.iter().map(|g| g.size().x).sum::<f32>() + CHIP_TRACKING * (glyphs.len() - 1) as f32;
+    let size = Vec2::new(text_w + CHIP_PAD_X * 2.0, CHIP_HEIGHT);
     let rect = Rect::from_min_size(
         Pos2::new(right_center.x - size.x, right_center.y - size.y * 0.5),
         size,
     );
     painter.rect_filled(rect, CornerRadius::same(CHIP_RADIUS), CHIP_FILL);
-    let text_pos = rect.center() - galley.size() * 0.5;
-    painter.galley(text_pos, galley, FG_SHORTCUT);
+
+    let mut x = rect.left() + CHIP_PAD_X;
+    for g in glyphs {
+        let w = g.size().x;
+        let h = g.size().y;
+        painter.galley(Pos2::new(x, rect.center().y - h * 0.5), g, FG_SHORTCUT);
+        x += w + CHIP_TRACKING;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +444,67 @@ fn filter_actions(actions: &[PaletteAction], query: &str) -> Vec<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// Sectioning (pure, unit-tested)
+// ---------------------------------------------------------------------------
+
+/// Section names in declaration order, deduplicated. The position of a name
+/// in here is what picks its accent colour, so colours stay put while the
+/// user types instead of shuffling with the filtered results.
+fn section_order(actions: &[PaletteAction]) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for a in actions {
+        if let Some(s) = a.section.as_deref() {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// The filtered list, reordered so each section's members sit together.
+struct Grouped {
+    /// Indices into `actions`, in display order.
+    order: Vec<usize>,
+    /// `headers[i]` is the section index whose heading is drawn *above*
+    /// `order[i]`, or `None` when no heading breaks there.
+    headers: Vec<Option<usize>>,
+}
+
+/// Group `matches` by section while preserving relevance.
+///
+/// Sections appear in the order their best-scoring member appears in
+/// `matches`, so the top hit is always in the first group (and therefore is
+/// the initially selected row); within a group, `matches` order is kept.
+/// Sectionless actions form one leading group with no heading.
+fn group_matches(actions: &[PaletteAction], matches: &[usize]) -> Grouped {
+    let names = section_order(actions);
+    // `None` = the sectionless bucket, which always leads.
+    let mut buckets: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+    for &m in matches {
+        let key = actions[m]
+            .section
+            .as_deref()
+            .and_then(|s| names.iter().position(|n| *n == s));
+        match buckets.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(m),
+            None => buckets.push((key, vec![m])),
+        }
+    }
+    buckets.sort_by_key(|(k, _)| k.is_some()); // sectionless first, else stable
+
+    let mut order = Vec::with_capacity(matches.len());
+    let mut headers = Vec::with_capacity(matches.len());
+    for (key, items) in buckets {
+        for (i, m) in items.into_iter().enumerate() {
+            headers.push(if i == 0 { key } else { None });
+            order.push(m);
+        }
+    }
+    Grouped { order, headers }
+}
+
+// ---------------------------------------------------------------------------
 // Widget
 // ---------------------------------------------------------------------------
 
@@ -296,7 +563,17 @@ impl Palette {
             return None;
         };
 
-        let mut matches = filter_actions(actions, query);
+        let tints = section_order(actions)
+            .iter()
+            .enumerate()
+            .map(|(i, _)| SECTION_TINTS[i % SECTION_TINTS.len()])
+            .collect::<Vec<_>>();
+        let names: Vec<String> = section_order(actions)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        let mut grouped = group_matches(actions, &filter_actions(actions, query));
 
         if keys.escape {
             self.close();
@@ -304,8 +581,8 @@ impl Palette {
         }
 
         let mut scroll_to_selected = false;
-        if !matches.is_empty() {
-            let n = matches.len();
+        if !grouped.order.is_empty() {
+            let n = grouped.order.len();
             if *selected >= n {
                 *selected = 0;
             }
@@ -318,7 +595,7 @@ impl Palette {
                 scroll_to_selected = true;
             }
             if keys.enter {
-                let action_id = actions[matches[*selected]].id.clone();
+                let action_id = actions[grouped.order[*selected]].id.clone();
                 self.close();
                 return Some(PaletteEvent::ActionChosen { action_id });
             }
@@ -356,16 +633,13 @@ impl Palette {
 
                 if *query != before {
                     *selected = 0;
-                    matches = filter_actions(actions, query);
-                    if matches.is_empty() {
-                        *selected = 0;
-                    }
+                    grouped = group_matches(actions, &filter_actions(actions, query));
                 }
 
                 divider(ui);
                 ui.add_space(LIST_PAD_Y);
 
-                if matches.is_empty() {
+                if grouped.order.is_empty() {
                     let (rect, _) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), ROW_HEIGHT + 16.0),
                         Sense::hover(),
@@ -378,13 +652,36 @@ impl Palette {
                         FG_MUTED,
                     );
                 } else {
-                    let max_height = ROW_HEIGHT * MAX_VISIBLE_ROWS as f32;
+                    // Budget for headings too, so a sectioned list still shows
+                    // MAX_VISIBLE_ROWS worth of actual commands.
+                    let headings = grouped.headers.iter().filter(|h| h.is_some()).count() as f32;
+                    let max_height = ROW_HEIGHT * MAX_VISIBLE_ROWS as f32
+                        + (SECTION_HEIGHT + SECTION_GAP_TOP) * headings.min(4.0);
                     egui::ScrollArea::vertical()
                         .max_height(max_height)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            for (row, &action_idx) in matches.iter().enumerate() {
+                            for (row, &action_idx) in grouped.order.iter().enumerate() {
+                                // Group heading, when this row starts a section.
+                                if let Some(sec) = grouped.headers[row] {
+                                    if row > 0 {
+                                        ui.add_space(SECTION_GAP_TOP);
+                                    }
+                                    let (hrect, _) = ui.allocate_exact_size(
+                                        Vec2::new(ui.available_width(), SECTION_HEIGHT),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().text(
+                                        hrect.left_center()
+                                            + Vec2::new(ROW_INSET_X + ROW_PAD_X, 0.0),
+                                        Align2::LEFT_CENTER,
+                                        names[sec].to_uppercase(),
+                                        prop(FONT_SECTION),
+                                        FG_SECTION,
+                                    );
+                                }
+
                                 let action = &actions[action_idx];
                                 let is_sel = row == *selected;
                                 let (rect, resp) = ui.allocate_exact_size(
@@ -408,9 +705,34 @@ impl Palette {
                                 if let Some(bg) = bg {
                                     ui.painter().rect_filled(inset, CornerRadius::same(8), bg);
                                 }
+                                if is_sel {
+                                    ui.painter().rect_stroke(
+                                        inset,
+                                        CornerRadius::same(8),
+                                        Stroke::new(1.0, SELECTED_STROKE),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+
                                 let p = ui.painter();
+                                let mut text_x = ROW_PAD_X;
+                                if let Some(icon) = action.icon {
+                                    let tint = grouped.headers[..=row]
+                                        .iter()
+                                        .rev()
+                                        .find_map(|h| *h)
+                                        .and_then(|s| tints.get(s).copied())
+                                        .unwrap_or(TINT_NEUTRAL);
+                                    let tile = Rect::from_center_size(
+                                        inset.left_center()
+                                            + Vec2::new(ROW_PAD_X + ICON_TILE * 0.5, 0.0),
+                                        Vec2::splat(ICON_TILE),
+                                    );
+                                    paint_icon(p, tile, icon, tint);
+                                    text_x += ICON_TILE + ICON_GAP;
+                                }
                                 p.text(
-                                    inset.left_center() + Vec2::new(ROW_PAD_X, 0.0),
+                                    inset.left_center() + Vec2::new(text_x, 0.0),
                                     Align2::LEFT_CENTER,
                                     &action.label,
                                     prop(FONT_ROW),
@@ -592,7 +914,21 @@ fn show_panel(ctx: &Context, add_contents: impl FnOnce(&mut egui::Ui)) -> Rect {
                 .rect
         });
 
-    inner.inner
+    // Inner top highlight, painted after the frame so it sits over the fill.
+    // A translucent panel with only an outer border reads as flat; the lit
+    // top edge is what makes it read as a pane of glass.
+    let panel = inner.inner;
+    let highlight = Rect::from_min_max(
+        Pos2::new(panel.left() + f32::from(PANEL_RADIUS), panel.top() + 1.0),
+        Pos2::new(panel.right() - f32::from(PANEL_RADIUS), panel.top() + 2.0),
+    );
+    ctx.layer_painter(LayerId::new(
+        Order::Foreground,
+        Id::new("terra_palette_panel"),
+    ))
+    .rect_filled(highlight, CornerRadius::ZERO, PANEL_HIGHLIGHT);
+
+    panel
 }
 
 /// True when the user clicked outside the palette panel this frame.
@@ -705,6 +1041,103 @@ mod tests {
     fn score_ordering_is_total_and_sane() {
         assert!(MatchScore { class: 0, pos: 9 } < MatchScore { class: 1, pos: 0 });
         assert!(MatchScore { class: 0, pos: 1 } < MatchScore { class: 0, pos: 2 });
+    }
+
+    /// `[(label, section)]` -> actions.
+    fn sectioned(rows: &[(&str, Option<&str>)]) -> Vec<PaletteAction> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, (l, s))| {
+                let a = PaletteAction::new(format!("id.{i}"), *l, None);
+                match s {
+                    Some(s) => a.in_section(*s),
+                    None => a,
+                }
+            })
+            .collect()
+    }
+
+    fn grouped_labels(actions: &[PaletteAction], query: &str) -> Vec<String> {
+        let g = group_matches(actions, &filter_actions(actions, query));
+        g.order
+            .iter()
+            .zip(&g.headers)
+            .map(|(&i, h)| match h {
+                Some(s) => format!("[{}] {}", section_order(actions)[*s], actions[i].label),
+                None => actions[i].label.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn section_order_dedupes_and_keeps_declaration_order() {
+        let a = sectioned(&[
+            ("New", Some("Tabs")),
+            ("Next", Some("Navigate")),
+            ("Close", Some("Tabs")),
+            ("Quit", None),
+        ]);
+        assert_eq!(section_order(&a), vec!["Tabs", "Navigate"]);
+    }
+
+    #[test]
+    fn grouping_collects_each_section_together() {
+        let a = sectioned(&[
+            ("New Tab", Some("Tabs")),
+            ("Next Tab", Some("Navigate")),
+            ("Close Tab", Some("Tabs")),
+            ("Quit terra", Some("Application")),
+        ]);
+        // Declaration order interleaves Tabs/Navigate; display must not.
+        assert_eq!(
+            grouped_labels(&a, ""),
+            vec![
+                "[Tabs] New Tab",
+                "Close Tab",
+                "[Navigate] Next Tab",
+                "[Application] Quit terra",
+            ]
+        );
+    }
+
+    #[test]
+    fn sectionless_actions_lead_without_a_heading() {
+        let a = sectioned(&[("Alpha", Some("Group")), ("Loose", None)]);
+        assert_eq!(grouped_labels(&a, ""), vec!["Loose", "[Group] Alpha"]);
+    }
+
+    #[test]
+    fn best_match_stays_first_so_it_is_the_default_selection() {
+        let a = sectioned(&[
+            ("New Tab", Some("Tabs")),
+            ("Quit terra", Some("Application")),
+        ]);
+        // "quit" only hits the second section -- that section must lead, or
+        // Enter would fire the wrong command.
+        let g = group_matches(&a, &filter_actions(&a, "quit"));
+        assert_eq!(a[g.order[0]].label, "Quit terra");
+        assert_eq!(grouped_labels(&a, "quit"), vec!["[Application] Quit terra"]);
+    }
+
+    #[test]
+    fn grouping_preserves_relevance_within_a_section() {
+        let a = sectioned(&[
+            ("Zoom Tab", Some("Tabs")),
+            ("Tab Bar", Some("Tabs")),
+            ("Unrelated", Some("Other")),
+        ]);
+        // "tab" at pos 0 beats pos 5, same as the ungrouped ranking.
+        assert_eq!(
+            grouped_labels(&a, "tab"),
+            vec!["[Tabs] Tab Bar", "Zoom Tab"]
+        );
+    }
+
+    #[test]
+    fn every_row_has_a_header_slot() {
+        let a = sectioned(&[("A", Some("X")), ("B", Some("Y"))]);
+        let g = group_matches(&a, &filter_actions(&a, ""));
+        assert_eq!(g.order.len(), g.headers.len());
     }
 
     #[test]
