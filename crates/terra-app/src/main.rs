@@ -979,10 +979,15 @@ impl TreeFrame<'_> {
             self.actions.push(AppAction::FocusGroup(group));
         }
 
+        // Salted by the leaf's stable id, not its DFS index: a split
+        // renumbers every group after it, and any egui state hanging off
+        // this ui (scroll fades, terminal view state) would jump to a
+        // neighbour's column.
+        let leaf = self.tabs.group_leaf_id(group).unwrap_or(u64::MAX);
         let mut col_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(column)
-                .id_salt(("terra_group_column", group)),
+                .id_salt(("terra_group_column", leaf)),
         );
         col_ui.set_clip_rect(column);
         ui::tab_bar(

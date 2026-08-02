@@ -1106,7 +1106,11 @@ pub fn tab_bar(
     icons: &IconCache,
     actions: &mut Vec<AppAction>,
 ) {
-    let state_id = Id::new(("terra_tab_bar_state", group));
+    // Identity by stable leaf id, not DFS index: a split renumbers every
+    // group after it, and index-keyed state would hand each of those bars a
+    // neighbour's animations — one drop visibly nudging every other bar.
+    let leaf = tabs.group_leaf_id(group).unwrap_or(u64::MAX);
+    let state_id = Id::new(("terra_tab_bar_state", leaf));
     if !bar_visible(tabs.group_tabs(group).len(), tabs.group_count()) {
         // Nothing on screen to continue from: drop the animations so the bar
         // comes back settled rather than mid-flight from minutes ago.
@@ -1123,12 +1127,15 @@ pub fn tab_bar(
     let panel = Rect::from_min_size(column.min, Vec2::new(column.width(), TAB_BAR_HEIGHT));
     ui.painter().rect_filled(panel, 0.0, BAR_BG);
     {
-        // Salted per group: every interact id below hangs off `ui.id()`, and
+        // Salted per leaf: every interact id below hangs off `ui.id()`, and
         // two groups' bars must not collide on ids like `terra_new_tab`.
+        // The leaf id (not the DFS index) keeps hover/active fades and the
+        // open popup attached to *this* bar when a split elsewhere
+        // renumbers the groups.
         let ui = &mut ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(panel)
-                .id_salt(("terra_tab_bar", group)),
+                .id_salt(("terra_tab_bar", leaf)),
         );
         ui.set_clip_rect(panel);
         {
@@ -1311,14 +1318,15 @@ pub fn tab_bar(
             // The `⌄` hangs off this group's `+` right edge, Windows-Terminal
             // style. The bar is the only thing deciding *where*; the button
             // itself is anchor-agnostic (see [`chevron_menu`]), so every group
-            // gets its own, salted by leaf index so two bars' popups and
-            // interact ids never collide.
+            // gets its own, salted by leaf id so two bars' popups and
+            // interact ids never collide (and an open popup stays this
+            // bar's when a split renumbers the groups).
             let chevron = Rect::from_min_size(
                 egui::pos2(chevron_left, bar.top()),
                 Vec2::new(CHEVRON_WIDTH, bar.height()),
             );
             let entries = new_tab_entries(tabs.profiles().values());
-            if let Some(action) = chevron_menu(ui, chevron, group, &entries) {
+            if let Some(action) = chevron_menu(ui, chevron, leaf, &entries) {
                 // The menu's rows open a tab in *this* group. `open` targets
                 // the focused group, so say which one that is first rather
                 // than leaning on the click having landed inside the column
