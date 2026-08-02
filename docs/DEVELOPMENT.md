@@ -3,92 +3,63 @@
 ## Everyday tasks (justfile)
 
 ```sh
-just run          # launch the debug build (dev socket, beside your daily terra)
-just restart      # kill the running *dev* app, rebuild debug, relaunch
-just t <args>     # run the CLI against the dev app, e.g. `just t ls`
-just pre-commit   # fmt + clippy + tests — run before committing
-just test / lint / fmt / check
-just log          # tail the running app's log (/tmp/terra-app.log)
-just bundle       # release build + cargo-packager (.app / .dmg)
+just run / restart   # debug build on the dev socket, beside your daily terra
+just t <args>        # CLI against the dev app, e.g. `just t ls`
+just pre-commit      # fmt + clippy + tests
+just log             # tail /tmp/terra-app.log
+just bundle          # release build + cargo-packager (.app / .dmg)
+just upgrade         # replace /Applications/terra.app and relaunch it
 ```
 
-## Developing inside terra
+## Dev instance vs daily instance
 
-On macOS the control socket *is* the single-instance claim: a launch that finds
-`~/.terra/terra.sock` answering focuses that instance and exits. So the debug
-build gets its own address — `just run`, `just restart` and `just t` all set
-`TERRA_SOCKET=~/.terra/terra-dev.sock` — and the dev window opens beside the
-terra you are working in rather than handing over to it. Consequences:
+The control socket is the single-instance claim, so `just run`/`restart`/`t`
+export `TERRA_SOCKET=~/.terra/terra-dev.sock` and the debug build opens beside
+the terra you are working in. The dev window is titled `… (dev)` (`TERRA_DEV=1/0`
+forces the mark); plain `terra` still drives the installed app. `just restart`
+pkills only `target/debug/terra-app` — it can never hit the installed bundle.
+`just upgrade` is the one command that intentionally closes the daily instance.
 
-- The dev window's title carries a ` (dev)` suffix, so the two are never
-  confused. It appears whenever `TERRA_SOCKET` is set; `TERRA_DEV=1` forces it
-  on and `TERRA_DEV=0` off (`dev_suffix` in `terra-app/src/main.rs`).
-- `just t` drives the **dev** instance; plain `terra` in your shell still drives
-  the installed one. Nothing in the code changed — only the environment the
-  justfile exports.
-- `just restart`'s `pkill` pattern is `target/debug/terra-app`, which the
-  installed bundle (`terra.app/Contents/MacOS/terra-app`) cannot match, so
-  iterating never kills your daily driver. `just install` does kill the
-  installed app — it is replacing the bundle — but not the dev one.
-- When an iteration is finished and you want to *live* with it: `just upgrade`
-  rebuilds, replaces `/Applications/terra.app`, and relaunches it. This is the
-  one command that intentionally closes the daily instance.
-
-Note: run `cargo build --release` before `cargo packager` if invoking the
-packager by hand — it does not build the binary itself.
+Note: `cargo packager` does not build; run `cargo build --release` first when
+invoking it by hand.
 
 ## Layout
 
-- `crates/terra-app` — egui/eframe GUI (tabs, palette, IPC server, scrollbar)
+- `crates/terra-app` — egui/eframe GUI (tabs, palette, IPC server)
 - `crates/terra-cli` — the `terra` command (`terra learn` is self-teaching)
-- `crates/terra-protocol` — shared wire types, socket path, blocking client
+- `crates/terra-protocol` — wire types, socket path, blocking client
 - `crates/terra-palette` — reusable command-palette widget
-- `crates/terra-app/src/config.rs` — `~/.terra/config.toml`; see
-  `docs/config.example.toml` for every key
-- `vendor/egui_term` — vendored terminal widget with terra patches (see its `PATCHES.md`)
-- `crates/terra-app/assets/icon/` — `terra.svg` is the icon source of truth;
-  PNGs and `terra.icns` are rendered from it (`rsvg-convert` + `iconutil`)
-- `plans/` — git-ignored scratch: reference clones (ghostty, harmonics-cli) and
-  the `logo-concepts*.html` design galleries that led to the icon
+- `crates/terra-app/src/config.rs` — `~/.terra/config.toml`
+  (`docs/config.example.toml` lists every key)
+- `vendor/egui_term` — vendored terminal widget; every terra patch is logged
+  in its `PATCHES.md`
+- `crates/terra-app/assets/icon/` — `terra.svg` is the source of truth
+- `plans/` — git-ignored scratch (reference clones, design galleries)
 
-## Debugging a rendering or terminal-behaviour difference
+## Debugging "looks wrong in terra, right in Ghostty"
 
-"It looks wrong in terra but right in Ghostty" is three separate questions, and
-each has a command that answers it without a screenshot:
+Three questions, each answered without a screenshot:
 
-- **What did the program actually draw?** `terra capture <tab> --cells` — the
-  grid as JSON, run-length encoded by style, with colours left as the program
-  named them and the cursor position included. If the styling you expect is not
-  in there, the program never asked for it and the renderer is innocent.
-- **What does this terminal advertise?** `diff <(terra doctor) <(ssh box terra
-  doctor)` — env, size, colour count and decoded DA1/DA2/XTVERSION/DECRQM/CPR
-  replies, sorted and free of run-to-run noise, so the diff is the difference.
-- **What did the program say and hear?** `terra record --out t.jsonl -- prog` in
-  each terminal, then `terra record --decode` both and diff. This is the only
-  one of the three that shows the terminal→program direction, which is usually
-  where the divergence lives.
+- **What did the program draw?** `terra capture <tab> --cells` — styled grid
+  as JSON. If the styling isn't there, the program never emitted it.
+- **What does this terminal advertise?** `diff <(terra doctor) <(ssh box
+  terra doctor)`.
+- **What did the program say and hear?** `terra record --out t.jsonl -- prog`
+  in each terminal, `--decode`, diff. The only view of the terminal→program
+  direction — usually where the divergence lives (e.g. Codex derives its
+  composer shade from an OSC 10/11 reply terra once failed to send).
 
-Worked example: Codex's composer background was missing in terra. `capture
---cells` showed zero non-default backgrounds, so nothing was being dropped in
-rendering — Codex simply never emitted the colour. Diffing a `record` taken in
-terra against one taken in Terminal.app showed why: Codex queries the terminal's
-foreground and background with OSC 10/11 and derives the composer shade from the
-answer, and terra never replied, so it fell back to no shading. The bug was a
-missing reply, invisible from the output direction alone.
+For pixels: `terra screenshot --out f.png` (add `--pretty` for a shareable
+card).
 
 ## Conventions
 
-- Rust 2021, `cargo fmt` defaults; builds and clippy stay warning-free
-- macOS is the v1 target; AppKit-specific code lives in `terra-app/src/macos.rs`
-  behind `cfg(target_os = "macos")` with no-op fallbacks
-- The wire protocol (terra-protocol) is frozen — extend it, don't break it;
-  `terra learn`'s command map is generated from clap so it can't drift
-- Config loading never fails. A missing, unreadable or malformed
-  `config.toml` yields the compiled-in defaults plus a warning — a GUI that
-  refuses to start over a typo is a GUI that appears to do nothing. Defaults
-  are pinned by test to the values terra hardcoded before config existed.
-- Runtime settings are a session layer over the file layer, and are never
-  written back; see the module docs in `config.rs` for why.
-- Hard-won gotchas are documented where they bit: egui_term patches in
-  `vendor/egui_term/PATCHES.md`, the winit-waker warning in `ipc.rs`,
-  the epaint color-emoji limitation in `fonts.rs`
+- Rust 2021; builds and clippy stay warning-free; macOS is the v1 target
+  (AppKit code in `terra-app/src/macos.rs` behind `cfg`, no-op fallbacks).
+- The wire protocol is frozen — extend, don't break; `terra learn`'s command
+  map is generated from clap so it can't drift.
+- Config loading never fails: missing/malformed `config.toml` yields the
+  compiled-in defaults plus a warning. Runtime settings are a session layer
+  over the file layer, never written back (see `config.rs` module docs).
+- Gotchas are documented where they bit: `vendor/egui_term/PATCHES.md`, the
+  winit-waker warning in `ipc.rs`, the epaint colour-emoji notes in `fonts.rs`.
