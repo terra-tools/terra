@@ -256,8 +256,7 @@ mod imp {
         bail!(UNSUPPORTED)
     }
 
-    const UNSUPPORTED: &str =
-        "terra needs a Unix controlling terminal (/dev/tty) for this; \
+    const UNSUPPORTED: &str = "terra needs a Unix controlling terminal (/dev/tty) for this; \
          the Windows console API is not wired up yet";
 }
 
