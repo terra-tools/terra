@@ -34,6 +34,10 @@ invoking it by hand.
 - `vendor/egui_term` — vendored terminal widget; every terra patch is logged
   in its `PATCHES.md`
 - `crates/terra-app/assets/icon/` — `terra.svg` is the source of truth
+- `crates/terra-app/assets/tab-icons/` — the per-tab logos in the tab bar
+  (`src/tab_icon.rs`). SVGs are the sources, the checked-in 64px PNGs next to
+  them are what ships; that directory's `LICENSE.md` has the provenance and the
+  `rsvg-convert` line that regenerates them
 - `plans/` — git-ignored scratch (reference clones, design galleries)
 
 ## Debugging "looks wrong in terra, right in Ghostty"

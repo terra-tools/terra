@@ -34,7 +34,9 @@
 //! The file is parsed to a `toml::Table` first and each section is
 //! deserialized independently, so a bad `[font]` costs you the font defaults
 //! and nothing else. Unknown keys are ignored — and reported — rather than
-//! rejected.
+//! rejected. `[profile.<name>]` goes one level further and is deserialized
+//! *per profile*, so one broken profile costs you that profile and leaves the
+//! others working.
 
 use egui_term::BidiBase;
 use serde::Deserialize;
@@ -63,6 +65,15 @@ pub const DEFAULT_LINE_HEIGHT: f32 = 1.3;
 /// predictable default plus an explicit per-application table (`BidiQuirks`)
 /// is wrong never.
 pub const DEFAULT_BIDI: BidiMode = BidiMode::Off;
+/// Show a per-tab icon in the tab bar.
+///
+/// On by default: an icon is how a row of pills stops being read and starts
+/// being recognised. It is a switch rather than a fixed behaviour because the
+/// primary detection source is a walk of the process table, and a user who
+/// wants terra to look at nothing outside its own tabs — or who simply finds
+/// logos in chrome noisy — should be able to say so. Off costs the walk too:
+/// nothing polls when this is false.
+pub const DEFAULT_TAB_ICONS: bool = true;
 /// Autodetect the paragraph direction per row.
 ///
 /// `Ltr` keeps a shell prompt provably immobile, but it strands RTL sentence
@@ -228,10 +239,127 @@ const LINE_HEIGHT_RANGE: (f32, f32) = (0.5, 3.0);
 /// walk below sees: a direct key of `[text]` that happens to hold a table.
 /// Its own keys are deliberately *not* enumerable — any command basename is
 /// legal — so nothing descends into it, and `resolve` polices its values.
+///
+/// `[profile]` is absent on purpose: it is a table *of* tables whose names are
+/// arbitrary, so [`report_unknown_keys`] descends into it by hand and checks
+/// each profile's keys against [`PROFILE_KEYS`] instead.
 const KNOWN: &[(&str, &[&str])] = &[
     ("font", &["size", "line_height"]),
     ("text", &["bidi", "bidi_base", "bidi_quirks"]),
+    ("tabs", &["icons"]),
 ];
+
+/// The section holding the named ways to open a tab: `[profile.<name>]`.
+const PROFILE_SECTION: &str = "profile";
+
+/// Every key a `[profile.<name>]` table may carry.
+const PROFILE_KEYS: &[&str] = &["command", "cwd", "title"];
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+/// A named way to open a tab — `[profile.htop]` and friends.
+///
+/// Resolved from [`ProfileFile`]: the one difference is `command`, which is a
+/// *string* in the file (so it reads like the command you would type) and an
+/// argv here, because that is what `terra new -- cmd` and
+/// `TabManager::open` take. Going through the same argv means a profile and a
+/// `--` command are the same code path, quoting included, rather than two.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Profile {
+    /// The name in the section header, kept so a resolved profile can name
+    /// itself in a menu, a palette entry or an error.
+    pub name: String,
+    /// Program + args. Empty means "just the default shell".
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+}
+
+/// Split a profile's `command` into argv the way a shell splits a command
+/// line: whitespace separates words, `'…'` and `"…"` group them.
+///
+/// Deliberately *not* a shell: no expansion, no escapes, no operators. A
+/// profile names a program to run, and anything needing a pipeline can name a
+/// shell explicitly. `None` for an unterminated quote, which is the one input
+/// that has no sensible reading at all.
+fn split_command(line: &str) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut word = String::new();
+    // Tracked separately from `word.is_empty()` so `""` stays an argument.
+    let mut started = false;
+    let mut quote: Option<char> = None;
+
+    for c in line.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                started = true;
+            }
+            None if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            None => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        out.push(word);
+    }
+    Some(out)
+}
+
+/// Expand a leading `~` to `home`. Only the leading one, and only when it is
+/// the whole path or is followed by a separator, so `~user` and a file
+/// literally called `~` are left alone rather than silently repointed.
+fn expand_tilde(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return path.to_owned();
+    };
+    match path {
+        "~" => home.to_owned(),
+        _ => match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+            Some(rest) => format!("{}/{rest}", home.trim_end_matches(['/', '\\'])),
+            None => path.to_owned(),
+        },
+    }
+}
+
+/// Look a profile up by name, or say which names there are.
+///
+/// The error is the whole point: a typo'd `terra new --profile htpo` must not
+/// silently open a plain shell, and the fix is one `ls` away only if the reply
+/// carries it.
+pub fn resolve_profile<'a>(
+    profiles: &'a BTreeMap<String, Profile>,
+    name: &str,
+) -> Result<&'a Profile, String> {
+    if let Some(profile) = profiles.get(name) {
+        return Ok(profile);
+    }
+    if profiles.is_empty() {
+        return Err(format!(
+            "unknown profile {name:?}; no [profile.<name>] sections are defined in your terra config"
+        ));
+    }
+    let known: Vec<&str> = profiles.keys().map(String::as_str).collect();
+    Err(format!(
+        "unknown profile {name:?}; known profiles: {}",
+        known.join(", ")
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // Wire types — mirror the TOML exactly; every field optional
@@ -244,6 +372,24 @@ const KNOWN: &[(&str, &[&str])] = &[
 pub struct ConfigFile {
     pub font: FontFile,
     pub text: TextFile,
+    pub tabs: TabsFile,
+    /// `[profile.<name>]`, keyed on the name in the section header. Filled by
+    /// [`parse`] one profile at a time; always empty in the session layer,
+    /// which has no runtime toggle that could write a profile.
+    pub profiles: BTreeMap<String, ProfileFile>,
+}
+
+/// One `[profile.<name>]` table, exactly as written.
+///
+/// `command` is a single string rather than an array because that is how a
+/// command is written everywhere else the user meets one — in a shell, in
+/// `terra new -- htop -d 5`. [`split_command`] turns it into argv.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProfileFile {
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -267,6 +413,16 @@ pub struct TextFile {
     pub bidi_quirks: Option<BTreeMap<String, String>>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TabsFile {
+    /// Typed as `bool` rather than free-form: unlike `bidi`, there is no
+    /// vocabulary to get wrong here, and TOML's own `true`/`false` is the only
+    /// spelling. A non-boolean costs the `[tabs]` section its defaults and
+    /// warns, which `section` already does.
+    pub icons: Option<bool>,
+}
+
 // ---------------------------------------------------------------------------
 // Resolved types — what the app reads; no Options, no egui
 // ---------------------------------------------------------------------------
@@ -275,6 +431,11 @@ pub struct TextFile {
 pub struct Config {
     pub font: FontConfig,
     pub text: TextConfig,
+    pub tabs: TabsConfig,
+    /// The named ways to open a tab, by name. A `BTreeMap` so every consumer —
+    /// the chevron menu, the palette, the unknown-profile error — lists them
+    /// alphabetically without sorting again.
+    pub profiles: BTreeMap<String, Profile>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -296,6 +457,12 @@ pub struct TextConfig {
     pub quirks: BidiQuirks,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabsConfig {
+    /// Whether the tab bar draws a per-tab icon. See [`DEFAULT_TAB_ICONS`].
+    pub icons: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -308,6 +475,10 @@ impl Default for Config {
                 bidi_base: DEFAULT_BIDI_BASE,
                 quirks: BidiQuirks::default(),
             },
+            tabs: TabsConfig {
+                icons: DEFAULT_TAB_ICONS,
+            },
+            profiles: BTreeMap::new(),
         }
     }
 }
@@ -373,6 +544,21 @@ where
 /// but silence would leave the user staring at a setting that does nothing.
 fn report_unknown_keys(root: &toml::Table, warnings: &mut Vec<String>) {
     for (table, value) in root {
+        // `[profile]` holds one sub-table per profile, and the profile names
+        // are the user's own words — so the check is one level deeper.
+        if table == PROFILE_SECTION {
+            for (name, profile) in value.as_table().into_iter().flatten() {
+                let Some(keys) = profile.as_table() else {
+                    continue; // reported by `profiles_section`
+                };
+                for key in keys.keys() {
+                    if !PROFILE_KEYS.contains(&key.as_str()) {
+                        warnings.push(format!("unknown key `profile.{name}.{key}`"));
+                    }
+                }
+            }
+            continue;
+        }
         let Some(known) = KNOWN.iter().find(|(n, _)| n == table) else {
             warnings.push(format!("unknown section [{table}]"));
             continue;
@@ -403,8 +589,40 @@ pub fn parse(text: &str) -> (ConfigFile, Vec<String>) {
     let file = ConfigFile {
         font: section(&root, "font", &mut warnings),
         text: section(&root, "text", &mut warnings),
+        tabs: section(&root, "tabs", &mut warnings),
+        profiles: profiles_section(&root, &mut warnings),
     };
     (file, warnings)
+}
+
+/// Deserialize `[profile.<name>]` one profile at a time.
+///
+/// [`section`] would take the whole table down over a single `command = 5`,
+/// and losing every profile because one of them has a typo is exactly the
+/// failure mode this module exists to avoid.
+fn profiles_section(
+    root: &toml::Table,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, ProfileFile> {
+    let mut out = BTreeMap::new();
+    let Some(value) = root.get(PROFILE_SECTION) else {
+        return out;
+    };
+    let Some(table) = value.as_table() else {
+        warnings.push(
+            "[profile] must hold one [profile.<name>] table per profile; ignoring it".to_owned(),
+        );
+        return out;
+    };
+    for (name, profile) in table {
+        match profile.clone().try_into::<ProfileFile>() {
+            Ok(parsed) => {
+                out.insert(name.clone(), parsed);
+            }
+            Err(e) => warnings.push(format!("[profile.{name}]: {e}; skipping this profile")),
+        }
+    }
+    out
 }
 
 /// Clamp `value` into `range`, warning under the key's name if it moved.
@@ -476,6 +694,12 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
         })
         .unwrap_or(DEFAULT_BIDI);
 
+    let icons = session
+        .tabs
+        .icons
+        .or(file.tabs.icons)
+        .unwrap_or(DEFAULT_TAB_ICONS);
+
     Config {
         font: FontConfig { size, line_height },
         text: TextConfig {
@@ -483,7 +707,52 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
             bidi_base,
             quirks: quirks(file, session, warnings),
         },
+        tabs: TabsConfig { icons },
+        profiles: profiles(file, warnings),
     }
+}
+
+/// Turn the parsed `[profile.<name>]` tables into resolved [`Profile`]s.
+///
+/// Only the file layer has profiles: the session layer exists for runtime
+/// toggles, and there is no toggle that invents a profile. One unusable
+/// profile is dropped with a warning, exactly as one unusable quirk is.
+fn profiles(file: &ConfigFile, warnings: &mut Vec<String>) -> BTreeMap<String, Profile> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
+    let mut out = BTreeMap::new();
+    for (name, profile) in &file.profiles {
+        if name.trim().is_empty() {
+            warnings.push("a profile with an empty name cannot be opened; ignoring it".to_owned());
+            continue;
+        }
+        let command = match profile.command.as_deref() {
+            None => Vec::new(),
+            Some(line) => match split_command(line) {
+                Some(argv) => argv,
+                None => {
+                    warnings.push(format!(
+                        "`profile.{name}.command` {line:?} has an unterminated quote; skipping this profile"
+                    ));
+                    continue;
+                }
+            },
+        };
+        out.insert(
+            name.clone(),
+            Profile {
+                name: name.clone(),
+                command,
+                cwd: profile
+                    .cwd
+                    .as_deref()
+                    .map(|cwd| expand_tilde(cwd, home.as_deref())),
+                title: profile.title.clone(),
+            },
+        );
+    }
+    out
 }
 
 /// Merge the quirks tables: shipped defaults first, then the file, then the
@@ -985,6 +1254,179 @@ mod tests {
             resolve_path(None, None),
             PathBuf::from("/tmp/.terra/config.toml")
         );
+    }
+
+    // --- profiles ---------------------------------------------------------
+
+    #[test]
+    fn a_profile_carries_its_command_cwd_and_title() {
+        let c = resolved(
+            "[profile.htop]\ncommand = \"htop -d 5\"\ncwd = \"/tmp\"\ntitle = \"system\"\n",
+        );
+        let p = c.profiles.get("htop").expect("htop is defined");
+        assert_eq!(p.name, "htop");
+        assert_eq!(p.command, vec!["htop", "-d", "5"]);
+        assert_eq!(p.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(p.title.as_deref(), Some("system"));
+        assert!(warnings_for("[profile.htop]\ncommand = \"htop\"\n").is_empty());
+    }
+
+    /// Every key is optional, including `command` — a profile that only names
+    /// a directory is a perfectly good "open a shell over there".
+    #[test]
+    fn a_profile_may_name_only_a_directory_or_a_title() {
+        let c = resolved("[profile.docs]\ncwd = \"/tmp/docs\"\n");
+        let p = c.profiles.get("docs").unwrap();
+        assert!(p.command.is_empty(), "no command means the default shell");
+        assert_eq!(p.cwd.as_deref(), Some("/tmp/docs"));
+        assert!(p.title.is_none());
+    }
+
+    #[test]
+    fn an_empty_config_has_no_profiles() {
+        assert!(resolved("").profiles.is_empty());
+        assert!(resolved("[font]\nsize = 12.0\n").profiles.is_empty());
+    }
+
+    /// The reason profiles are deserialized one at a time: a typo in one must
+    /// not take away the others.
+    #[test]
+    fn a_malformed_profile_is_skipped_and_the_rest_survive() {
+        let text = "[profile.bad]\ncommand = 5\n\n[profile.good]\ncommand = \"htop\"\n";
+        let c = resolved(text);
+        assert!(!c.profiles.contains_key("bad"), "dropped");
+        assert_eq!(c.profiles.get("good").unwrap().command, vec!["htop"]);
+
+        let w = warnings_for(text);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("profile.bad"), "the warning names it: {w:?}");
+    }
+
+    /// The other way a profile can be unusable: a command line that does not
+    /// close its quote has no reading at all.
+    #[test]
+    fn an_unterminated_quote_in_a_command_skips_only_that_profile() {
+        let text = "[profile.bad]\ncommand = \"echo 'hi\"\n\n[profile.ok]\ncommand = \"ls\"\n";
+        let c = resolved(text);
+        assert!(!c.profiles.contains_key("bad"));
+        assert!(c.profiles.contains_key("ok"));
+        let w = warnings_for(text);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("unterminated"), "{w:?}");
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_profile_is_reported_but_the_profile_still_works() {
+        let text = "[profile.p]\ncommand = \"ls\"\nshel = \"fish\"\n";
+        assert_eq!(
+            resolved(text).profiles.get("p").unwrap().command,
+            vec!["ls"]
+        );
+        let w = warnings_for(text);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("profile.p.shel"), "{w:?}");
+    }
+
+    /// `[profile]` given as anything but a table of tables.
+    #[test]
+    fn a_profile_section_of_the_wrong_shape_is_reported_not_fatal() {
+        let text = "profile = 3\n\n[font]\nsize = 20.0\n";
+        let c = resolved(text);
+        assert!(c.profiles.is_empty());
+        assert_eq!(c.font.size, 20.0, "the rest of the file survived");
+        assert_eq!(warnings_for(text).len(), 1);
+    }
+
+    /// A command string is split the way a shell splits one, so a profile and
+    /// `terra new -- …` reach `TabManager::open` in exactly the same shape.
+    #[test]
+    fn a_command_string_splits_into_argv_honouring_quotes() {
+        assert_eq!(split_command("htop"), Some(vec!["htop".to_owned()]));
+        assert_eq!(
+            split_command("  ls   -la  "),
+            Some(vec!["ls".to_owned(), "-la".to_owned()])
+        );
+        assert_eq!(
+            split_command("git commit -m 'two words'"),
+            Some(vec![
+                "git".to_owned(),
+                "commit".to_owned(),
+                "-m".to_owned(),
+                "two words".to_owned()
+            ])
+        );
+        assert_eq!(
+            split_command(r#"say "it's fine""#),
+            Some(vec!["say".to_owned(), "it's fine".to_owned()])
+        );
+        // An empty quoted word is still a word.
+        assert_eq!(
+            split_command("echo ''"),
+            Some(vec!["echo".to_owned(), String::new()])
+        );
+        assert_eq!(split_command(""), Some(Vec::new()));
+        assert_eq!(split_command("   "), Some(Vec::new()));
+        // The one input with no sensible reading.
+        assert_eq!(split_command("echo 'hi"), None);
+        assert_eq!(split_command(r#"echo "hi"#), None);
+    }
+
+    #[test]
+    fn a_leading_tilde_in_a_profile_cwd_expands_to_home() {
+        assert_eq!(expand_tilde("~/src", Some("/home/ada")), "/home/ada/src");
+        assert_eq!(expand_tilde("~", Some("/home/ada")), "/home/ada");
+        // Not a home reference: left exactly as written.
+        assert_eq!(expand_tilde("~ada/src", Some("/home/ada")), "~ada/src");
+        assert_eq!(expand_tilde("/tmp/~", Some("/home/ada")), "/tmp/~");
+        // No HOME to expand against.
+        assert_eq!(expand_tilde("~/src", None), "~/src");
+        assert_eq!(expand_tilde("~/src", Some("")), "~/src");
+    }
+
+    /// An unknown name must never quietly open a plain shell, and the reply
+    /// has to carry the fix.
+    #[test]
+    fn resolving_an_unknown_profile_names_the_known_ones() {
+        let profiles =
+            resolved("[profile.htop]\n\n[profile.build]\ncommand = \"cargo build\"\n").profiles;
+        assert_eq!(resolve_profile(&profiles, "htop").unwrap().name, "htop");
+
+        let err = resolve_profile(&profiles, "htpo").unwrap_err();
+        assert!(err.contains("htpo"), "{err}");
+        // Alphabetical, because the map is a BTreeMap.
+        assert!(err.contains("build, htop"), "{err}");
+
+        let err = resolve_profile(&BTreeMap::new(), "htop").unwrap_err();
+        assert!(err.contains("no [profile."), "{err}");
+    }
+
+    /// Tab icons are on unless the file says otherwise — a file that says
+    /// nothing about them must not disable them.
+    #[test]
+    fn tab_icons_default_on_and_are_switchable_off() {
+        assert!(Config::default().tabs.icons);
+        assert!(resolved("").tabs.icons);
+        assert!(resolved("[font]\nsize = 12.0\n").tabs.icons);
+        assert!(!resolved("[tabs]\nicons = false\n").tabs.icons);
+        assert!(resolved("[tabs]\nicons = true\n").tabs.icons);
+    }
+
+    /// The fault-isolation contract, applied to the new section: a `[tabs]`
+    /// that will not deserialize costs you tab icons, not your font.
+    #[test]
+    fn a_non_boolean_icons_value_warns_and_keeps_the_default() {
+        let text = "[font]\nsize = 12.0\n\n[tabs]\nicons = \"yes\"\n";
+        assert!(resolved(text).tabs.icons);
+        assert_eq!(resolved(text).font.size, 12.0);
+        let warnings = warnings_for(text);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[tabs]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_unknown_key_under_tabs_is_reported() {
+        let warnings = warnings_for("[tabs]\nicon = true\n");
+        assert_eq!(warnings, vec!["unknown key `tabs.icon`".to_string()]);
     }
 
     /// Every key named in the shipped example must be one terra understands,

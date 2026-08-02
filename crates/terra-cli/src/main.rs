@@ -125,8 +125,19 @@ fn learn_text() -> String {
          Config\n\
          ------\n\
          ~/.terra/config.toml: [font] size, line_height; [text] bidi,\n\
-         bidi_base, [text.bidi_quirks]. Every key optional; a broken file\n\
-         yields defaults plus a warning. Template: docs/config.example.toml.\n\n\
+         bidi_base, [text.bidi_quirks]; [profile.<name>] command, cwd, title.\n\
+         Every key optional; a broken file yields defaults plus a warning.\n\
+         Template: docs/config.example.toml.\n\n\
+         Profiles\n\
+         --------\n\
+         \x20 terra new --profile htop\n\
+         Opens the tab a [profile.htop] section describes — its command, cwd\n\
+         and title. --title/--cwd still override it; a trailing -- cmd is\n\
+         refused, because a profile already is the command. The app resolves\n\
+         the name against *its* config, so this works over an ssh-forwarded\n\
+         socket where the CLI has no config file at all; an unknown name comes\n\
+         back as an error listing the profiles that do exist. The same\n\
+         profiles are in the tab bar's ⌄ menu and the palette.\n\n\
          Transport\n\
          ---------\n\
          Unix socket: {socket} (override: TERRA_SOCKET). terra-app must be\n\
@@ -181,6 +192,12 @@ enum Command {
         /// Working directory for the new tab
         #[arg(long)]
         cwd: Option<String>,
+
+        /// Open a `[profile.<name>]` from the app's config (its command, cwd
+        /// and title). --title and --cwd still override it. Mutually exclusive
+        /// with a trailing command: a profile *is* the command.
+        #[arg(long, value_name = "NAME", conflicts_with = "command")]
+        profile: Option<String>,
 
         /// Program and arguments to run instead of the default shell
         #[arg(last = true, allow_hyphen_values = true, value_name = "CMD")]
@@ -360,11 +377,13 @@ impl Command {
             Command::New {
                 title,
                 cwd,
+                profile,
                 command,
             } => Request::New {
                 title: title.clone(),
                 command: command.clone(),
                 cwd: cwd.clone(),
+                profile: profile.clone(),
             },
             Command::Kill { tab } => Request::Kill { tab: *tab },
             Command::Send {
@@ -657,13 +676,80 @@ mod tests {
                 title,
                 command,
                 cwd,
+                profile,
             } => {
                 assert_eq!(title.as_deref(), Some("build"));
                 assert_eq!(cwd.as_deref(), Some("/tmp"));
                 assert_eq!(command, vec!["cargo".to_string(), "test".to_string()]);
+                assert!(profile.is_none());
             }
             other => panic!("expected New, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn new_forwards_a_profile_name() {
+        match Cli::parse_from(["terra", "new", "--profile", "htop"])
+            .command
+            .to_request()
+        {
+            Request::New {
+                profile,
+                command,
+                title,
+                cwd,
+            } => {
+                assert_eq!(profile.as_deref(), Some("htop"));
+                assert!(command.is_empty());
+                assert!(title.is_none(), "the app fills these in from the profile");
+                assert!(cwd.is_none());
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    /// `--title` and `--cwd` are refinements of a profile, not rivals of it —
+    /// the app lets an explicit one win.
+    #[test]
+    fn a_profile_composes_with_title_and_cwd() {
+        match Cli::parse_from([
+            "terra",
+            "new",
+            "--profile",
+            "htop",
+            "--title",
+            "top",
+            "--cwd",
+            "/tmp",
+        ])
+        .command
+        .to_request()
+        {
+            Request::New {
+                profile,
+                title,
+                cwd,
+                ..
+            } => {
+                assert_eq!(profile.as_deref(), Some("htop"));
+                assert_eq!(title.as_deref(), Some("top"));
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    /// A profile *is* the command, so naming both is a mistake clap must
+    /// catch rather than something the app has to guess at.
+    #[test]
+    fn a_profile_and_an_explicit_command_are_mutually_exclusive() {
+        let err = Cli::try_parse_from(["terra", "new", "--profile", "htop", "--", "vim"])
+            .expect_err("--profile with a trailing command must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("profile"), "{msg}");
+        // Each on its own is still fine.
+        assert!(Cli::try_parse_from(["terra", "new", "--profile", "htop"]).is_ok());
+        assert!(Cli::try_parse_from(["terra", "new", "--", "vim"]).is_ok());
     }
 
     #[test]
@@ -687,10 +773,12 @@ mod tests {
                 title,
                 command,
                 cwd,
+                profile,
             } => {
                 assert!(title.is_none());
                 assert!(cwd.is_none());
                 assert!(command.is_empty());
+                assert!(profile.is_none());
             }
             other => panic!("expected New, got {other:?}"),
         }
@@ -960,6 +1048,17 @@ mod tests {
         assert!(text.contains("terra doctor"), "{text}");
         assert!(text.contains("terra record"), "{text}");
         assert!(text.contains("[--out]"), "{text}");
+    }
+
+    /// The command map is generated from clap, so `--profile` has to appear
+    /// in `terra learn` without anyone editing prose — and the prose that does
+    /// exist has to teach the config section it reads from.
+    #[test]
+    fn the_learn_text_teaches_profiles() {
+        let text = learn_text();
+        assert!(text.contains("[--profile]"), "{text}");
+        assert!(text.contains("[profile.<name>]"), "{text}");
+        assert!(text.contains("terra new --profile htop"), "{text}");
     }
 
     #[test]

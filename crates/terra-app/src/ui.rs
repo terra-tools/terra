@@ -10,6 +10,14 @@
 //! Everything that moves is animated: tab widths grow in and shrink out, and
 //! tabs slide to their slot instead of jumping there (see [`BarState`]), while
 //! the hover fill and the `×` fade with the pointer rather than snapping.
+//!
+//! A drag that leaves its own bar goes cross-group, VS Code style: the pill
+//! turns into a floating ghost under the pointer, another group's bar accepts
+//! it as a move, and any of the four halves of a terminal (left/right for a
+//! side-by-side split, top/bottom for a stacked one) accepts it as a split —
+//! see
+//! [`tab_drag_overlay`], which `main.rs` runs once per frame over the whole
+//! window after the columns are laid out.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,6 +27,7 @@ use egui::{
     Rect, Sense, Stroke, Ui, Vec2,
 };
 
+use crate::tab_icon::{IconCache, TabIcon};
 use crate::tabs::TabManager;
 
 /// Outer height of the tab bar panel.
@@ -35,6 +44,10 @@ const TAB_GAP: f32 = 0.0;
 const PLUS_GAP: f32 = 6.0;
 /// Fixed width reserved at the far right for the `+` button.
 const PLUS_WIDTH: f32 = 28.0;
+/// Fixed width reserved to the right of `+` for the `⌄` profile menu.
+/// Narrower than `+`: it is a disclosure affordance hanging off the button
+/// next to it, the way Windows Terminal's is, not a peer of it.
+const CHEVRON_WIDTH: f32 = 20.0;
 /// Tabs never shrink below this, even if that means the row overflows (clipped).
 const MIN_TAB_WIDTH: f32 = 44.0;
 /// A tab only shows its `⌘n` hint when it is at least this wide.
@@ -49,6 +62,21 @@ const CORNER: u8 = 12;
 /// body relative to egui's default, so this reads no larger than the old 12px.
 const FONT_SIZE: f32 = 13.0;
 const HINT_FONT_SIZE: f32 = 10.0;
+
+/// Side of the square a tab icon is drawn in — the title's own size, so the
+/// logo reads as part of the label rather than as a bullet next to it.
+const ICON_SIZE: f32 = 13.0;
+/// Gap between the icon and the first letter of the title.
+const ICON_GAP: f32 = 5.0;
+/// How far back the generic `>_` glyph is faded relative to the title.
+///
+/// It carries no information — it is what terra draws when it has nothing to
+/// say — so it holds the title's position without competing with the tabs that
+/// do say something.
+const GENERIC_ICON_ALPHA: f32 = 0.5;
+/// How far back a brand icon is faded on an *inactive* pill. Colour already
+/// makes these loud; the active tab keeps them at full strength.
+const IDLE_ICON_ALPHA: f32 = 0.8;
 
 /// The title font, in one place. The active tab is set a weight heavier, as
 /// macOS does — `medium` picks [`fonts::UI_MEDIUM_FAMILY`], which only really
@@ -121,6 +149,17 @@ const HOVER_FADE_TIME: f32 = 0.11;
 /// Below this the `×` is too faint to be worth hit-testing on its own.
 const CLOSE_HIT_ALPHA: f32 = 0.5;
 
+/// How far above/below its bar a drag may stray and still count as an in-bar
+/// reorder. Past this the pill detaches into a floating ghost and the drop
+/// targets (other bars, terminal halves) take over.
+const BAR_DRAG_SLACK: f32 = 14.0;
+/// Width of the floating ghost pill that follows the pointer mid-drag.
+const GHOST_WIDTH: f32 = 150.0;
+/// VS Code's `editorGroup.dropBackground`: a translucent blue wash over the
+/// half of the terminal the drop would split into.
+const DROP_ZONE_FILL: Color32 = Color32::from_rgba_premultiplied(0x14, 0x24, 0x3c, 0x50);
+const DROP_ZONE_EDGE: Color32 = Color32::from_rgb(0x3d, 0x6e, 0xc7);
+
 /// Something the user asked for via keyboard, tab bar or palette.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
@@ -131,14 +170,44 @@ pub enum AppAction {
     SelectNth(usize),
     NextTab,
     PrevTab,
+    /// Focus a group (column); its active tab becomes the globally active tab.
+    /// Pushed by any click that lands inside the group's column.
+    FocusGroup(usize),
+    /// Split the active tab into a new group to the right of its own.
+    SplitRight,
+    /// Split the active tab into a new group to the left of its own.
+    SplitLeft,
+    /// Split the active tab into a new group below its own.
+    SplitDown,
+    /// Split the active tab into a new group above its own.
+    SplitUp,
+    /// Focus the next group in DFS order (wrapping).
+    NextGroup,
+    /// Focus the previous group in DFS order (wrapping).
+    PrevGroup,
     OpenPalette,
     RenameActive,
     /// Flip UAX #9 right-to-left reordering for the session.
     ToggleBidi,
     /// Cycle the BiDi paragraph direction: auto -> ltr -> rtl.
     CycleBidiBase,
+    /// Open a tab from a named `[profile.<name>]` in the config.
+    NewTabProfile(String),
     /// Nudge the terminal font size for the session. `+1.0` / `-1.0`.
     NudgeFontSize(i8),
+    /// Drop a dragged tab onto another group's bar: move it there, at `index`.
+    MoveTab {
+        id: u64,
+        group: usize,
+        index: usize,
+    },
+    /// Drop a dragged tab onto a half of group `group`'s terminal: split that
+    /// group towards `dir`, with the tab as the new leaf.
+    SplitTab {
+        id: u64,
+        group: usize,
+        dir: SplitDir,
+    },
     /// Drop every session override, returning to what the file says.
     ResetSession,
     /// Re-read `~/.terra/config.toml`, keeping session overrides on top.
@@ -147,12 +216,27 @@ pub enum AppAction {
     Quit,
 }
 
+/// Which side of a leaf a drop (or a split action) targets. Left/Right make
+/// side-by-side columns (a `Horizontal` split in the model), Up/Down stack
+/// rows (`Vertical`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 const fn cmd(key: Key) -> KeyboardShortcut {
     KeyboardShortcut::new(Modifiers::COMMAND, key)
 }
 
 fn cmd_shift(key: Key) -> KeyboardShortcut {
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), key)
+}
+
+fn cmd_alt(key: Key) -> KeyboardShortcut {
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), key)
 }
 
 const DIGITS: [Key; 9] = [
@@ -186,6 +270,24 @@ pub fn consume_shortcuts(ui: &mut Ui) -> Vec<AppAction> {
         if i.consume_shortcut(&cmd_shift(Key::B)) {
             actions.push(AppAction::ToggleBidi);
         }
+        // VS Code's group keys: ⌘\ splits, ⌥⌘ arrows move focus between
+        // groups — ←/↑ to the previous leaf in DFS order, →/↓ to the next
+        // (order-based, not spatial). Checked before the plain-Cmd bindings
+        // for the same reason as Cmd+Shift: an extra held modifier must not
+        // fall through to them.
+        for key in [Key::ArrowLeft, Key::ArrowUp] {
+            if i.consume_shortcut(&cmd_alt(key)) {
+                actions.push(AppAction::PrevGroup);
+            }
+        }
+        for key in [Key::ArrowRight, Key::ArrowDown] {
+            if i.consume_shortcut(&cmd_alt(key)) {
+                actions.push(AppAction::NextGroup);
+            }
+        }
+        if i.consume_shortcut(&cmd(Key::Backslash)) {
+            actions.push(AppAction::SplitRight);
+        }
         // Both `=` and `+` so the shortcut works without reaching for Shift.
         for key in [Key::Plus, Key::Equals] {
             if i.consume_shortcut(&cmd(key)) {
@@ -213,7 +315,7 @@ pub fn consume_shortcuts(ui: &mut Ui) -> Vec<AppAction> {
     actions
 }
 
-/// Width of a single tab: the bar minus the `+` zone, split evenly.
+/// Width of a single tab: the bar minus the `+` and `⌄` zone, split evenly.
 ///
 /// `n` is the number of tabs. The result is clamped to [`MIN_TAB_WIDTH`], in
 /// which case the row overflows and is clipped instead of collapsing to slivers.
@@ -222,7 +324,7 @@ fn tab_width(bar_width: f32, n: usize) -> f32 {
         return 0.0;
     }
     let n_f = n as f32;
-    let usable = bar_width - PLUS_WIDTH - PLUS_GAP;
+    let usable = bar_width - PLUS_WIDTH - CHEVRON_WIDTH - PLUS_GAP;
     let per = (usable - TAB_GAP * (n_f - 1.0)) / n_f;
     per.max(MIN_TAB_WIDTH)
 }
@@ -269,28 +371,50 @@ enum Track {
 struct Ghost {
     id: u64,
     title: String,
+    /// The icon it had when it closed. Carried so a tab shrinking away keeps
+    /// its face for the two frames it is still visible.
+    icon: Option<TabIcon>,
     /// Slot it occupied when it disappeared; where it keeps shrinking.
     index: usize,
 }
 
-/// The tab currently held by the pointer.
+/// The tab currently held by the pointer. One per window, not per bar — a drag
+/// crosses group boundaries, so every bar (and the drop overlay) reads the same
+/// state, kept in egui's temp data under [`drag_state_id`].
 #[derive(Clone, Copy)]
-struct Drag {
+struct TabDrag {
     id: u64,
     /// Pointer offset inside the tab when the drag started, so the tab does not
     /// jump to centre itself under the cursor.
     grab: f32,
 }
 
+fn drag_state_id() -> Id {
+    Id::new("terra_tab_drag")
+}
+
+fn current_drag(ctx: &egui::Context) -> Option<TabDrag> {
+    ctx.data(|d| d.get_temp(drag_state_id()))
+}
+
+fn set_drag(ctx: &egui::Context, drag: Option<TabDrag>) {
+    ctx.data_mut(|d| match drag {
+        Some(drag) => {
+            d.insert_temp(drag_state_id(), drag);
+        }
+        None => d.remove::<TabDrag>(drag_state_id()),
+    });
+}
+
 /// Everything the bar remembers between frames, kept in egui's temporary data.
 #[derive(Clone, Default)]
 struct BarState {
     anims: HashMap<(Track, u64), Anim>,
-    /// Tabs drawn last frame, in order, with their titles — the baseline for
-    /// spotting opens (grow in) and closes (leave a [`Ghost`] behind).
-    live: Vec<(u64, String)>,
+    /// Tabs drawn last frame, in order, with everything a [`Ghost`] would need
+    /// to keep drawing them — the baseline for spotting opens (grow in) and
+    /// closes (leave a ghost behind).
+    live: Vec<Slot>,
     ghosts: Vec<Ghost>,
-    drag: Option<Drag>,
 }
 
 impl BarState {
@@ -338,11 +462,13 @@ impl BarState {
 // ---------------------------------------------------------------------------
 
 /// Lay out `text`, shortening it in the middle with `…` until it fits `max_width`.
-fn middle_truncated(ui: &Ui, text: &str, font: FontId, max_width: f32) -> (Arc<Galley>, bool) {
-    let layout = |s: String| {
-        ui.painter()
-            .layout_no_wrap(s, font.clone(), Color32::PLACEHOLDER)
-    };
+fn middle_truncated(
+    painter: &egui::Painter,
+    text: &str,
+    font: FontId,
+    max_width: f32,
+) -> (Arc<Galley>, bool) {
+    let layout = |s: String| painter.layout_no_wrap(s, font.clone(), Color32::PLACEHOLDER);
 
     let full = layout(text.to_owned());
     if full.size().x <= max_width {
@@ -400,6 +526,8 @@ struct TabVisual<'a> {
     /// Visual position, for the `⌘n` hint.
     index: usize,
     title: &'a str,
+    /// Logo for whatever is running here, or `None` with icons switched off.
+    icon: Option<TabIcon>,
     active: bool,
     dragged: bool,
     /// Draw the segmented-control hairline on this tab's right edge.
@@ -447,13 +575,32 @@ fn paint_tab(ui: &Ui, v: &TabVisual<'_>, hover_t: f32, active_t: f32) -> bool {
 
     let fg = mix(TITLE_IDLE, TITLE_ACTIVE, active_t);
 
-    // Centred, middle-truncated title.
-    let max_text = (v.rect.width() - TITLE_RESERVE * 2.0).max(8.0);
-    let (galley, truncated) = middle_truncated(ui, v.title, title_font(v.active), max_text);
-    let pos = egui::pos2(
-        v.rect.center().x - galley.size().x / 2.0,
-        v.rect.center().y - galley.size().y / 2.0,
-    );
+    // Centred, middle-truncated title, with the icon and its gap treated as
+    // part of it: the pair is centred together, and the icon eats into the
+    // width the title may use rather than overhanging it.
+    let lead = if v.icon.is_some() {
+        ICON_SIZE + ICON_GAP
+    } else {
+        0.0
+    };
+    let max_text = (v.rect.width() - TITLE_RESERVE * 2.0 - lead).max(8.0);
+    let (galley, truncated) = middle_truncated(painter, v.title, title_font(v.active), max_text);
+    let left = v.rect.center().x - (galley.size().x + lead) / 2.0;
+    let pos = egui::pos2(left + lead, v.rect.center().y - galley.size().y / 2.0);
+    if let Some(icon) = v.icon {
+        let alpha = if icon.is_generic() {
+            GENERIC_ICON_ALPHA
+        } else {
+            // Brand icons only fade *out* to the idle level, and follow the
+            // same crossfade as the title so nothing pops on tab switch.
+            IDLE_ICON_ALPHA + (1.0 - IDLE_ICON_ALPHA) * active_t
+        };
+        let rect = Rect::from_min_size(
+            egui::pos2(left, v.rect.center().y - ICON_SIZE / 2.0),
+            Vec2::splat(ICON_SIZE),
+        );
+        crate::tab_icon::paint(ui, icon, rect, fg.gamma_multiply(alpha));
+    }
     if v.active && !crate::fonts::has_real_ui_medium() {
         paint_faux_medium(painter, pos, &galley, fg);
     }
@@ -615,11 +762,128 @@ fn plus_button(ui: &mut Ui, rect: Rect, actions: &mut Vec<AppAction>) {
     }
 }
 
-/// Whether the bar is worth showing at all: like Ghostty, a lone tab gets no
-/// chrome and the terminal owns the full window height.
-pub fn bar_visible(tab_count: usize) -> bool {
-    tab_count >= 2
+/// Whether a group's bar is worth showing at all: like Ghostty, a lone tab in
+/// the only group gets no chrome and the terminal owns the full column height.
+/// The moment there is a second group, every group shows its bar — otherwise
+/// a single-tab column would be indistinguishable from its neighbour.
+pub fn bar_visible(tab_count: usize, group_count: usize) -> bool {
+    group_count >= 2 || tab_count >= 2
 }
+
+// ---------------------------------------------------------------------------
+// The `⌄` dropdown
+// ---------------------------------------------------------------------------
+
+/// One row of a dropdown: what it says, and what choosing it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuEntry {
+    pub label: String,
+    pub action: AppAction,
+}
+
+impl MenuEntry {
+    pub fn new(label: impl Into<String>, action: AppAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+        }
+    }
+}
+
+/// The entries the `⌄` next to a `+` offers: the default shell, then one row
+/// per profile in name order.
+///
+/// Split out from the drawing so the list is testable without a `Ui`, and so
+/// whoever re-anchors the button only has to decide *where* it goes.
+pub fn new_tab_entries<'a>(profiles: impl IntoIterator<Item = &'a str>) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::new("New Tab", AppAction::NewTab)];
+    entries.extend(
+        profiles
+            .into_iter()
+            .map(|name| MenuEntry::new(name, AppAction::NewTabProfile(name.to_owned()))),
+    );
+    entries
+}
+
+/// A `⌄` disclosure button and the menu it opens: `ui` + a rect + a list of
+/// actions in, the chosen action out.
+///
+/// Deliberately knows nothing about the tab bar. Everything positional arrives
+/// as `rect`, and everything offered arrives as `entries`, so re-anchoring the
+/// same menu next to a per-group `+` is a matter of passing a different rect
+/// and a different `salt` — no state of its own crosses frames beyond the
+/// popup's own open flag, which egui keys on the button's id.
+///
+/// Escape and a click outside close the popup: that is egui's default
+/// `PopupCloseBehavior` for a menu, and choosing a row closes it explicitly.
+pub fn chevron_menu(
+    ui: &mut Ui,
+    rect: Rect,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    entries: &[MenuEntry],
+) -> Option<AppAction> {
+    let id = ui.id().with(("terra_new_tab_menu", salt));
+    let response = ui
+        .interact(rect, id, Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("New tab from a profile");
+
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        // Same visual language as the `+`: a dark rounded fill on hover, the
+        // glyph itself drawn rather than typeset so no font has to have it.
+        if response.hovered() || open {
+            painter.rect_filled(
+                Rect::from_center_size(rect.center(), Vec2::new(rect.width(), CHEVRON_HEIGHT)),
+                CornerRadius::same(CHEVRON_CORNER),
+                PLUS_HOVER_BG,
+            );
+        }
+        let c = rect.center();
+        let color = if response.hovered() || open {
+            TEXT_ACTIVE
+        } else {
+            TEXT_IDLE
+        };
+        let stroke = Stroke::new(1.3, color);
+        // A `⌄`: two strokes meeting below centre, so it reads as pointing at
+        // the menu that drops out of it.
+        let (w, h) = (CHEVRON_ARM, CHEVRON_ARM * 0.6);
+        painter.line_segment(
+            [egui::pos2(c.x - w, c.y - h), egui::pos2(c.x, c.y + h)],
+            stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(c.x, c.y + h), egui::pos2(c.x + w, c.y - h)],
+            stroke,
+        );
+    }
+
+    let mut chosen = None;
+    egui::Popup::menu(&response)
+        .align(egui::RectAlign::BOTTOM_END)
+        .gap(4.0)
+        .show(|ui| {
+            ui.set_min_width(MENU_MIN_WIDTH);
+            for entry in entries {
+                if ui.button(&entry.label).clicked() {
+                    chosen = Some(entry.action.clone());
+                    ui.close();
+                }
+            }
+        });
+    chosen
+}
+
+/// Height of the chevron's hover fill — a little short of the tab height, so
+/// it reads as a small button inside the bar rather than a tab.
+const CHEVRON_HEIGHT: f32 = 21.0;
+const CHEVRON_CORNER: u8 = 6;
+/// Half-width of the `⌄` glyph.
+const CHEVRON_ARM: f32 = 4.0;
+/// Keeps the menu from collapsing to the width of "New Tab".
+const MENU_MIN_WIDTH: f32 = 150.0;
 
 /// Which slot index a tab dragged to `x` wants, given the pitch of the row.
 fn drop_index(x: f32, bar_left: f32, pitch: f32, count: usize) -> usize {
@@ -631,9 +895,11 @@ fn drop_index(x: f32, bar_left: f32, pitch: f32, count: usize) -> usize {
 }
 
 /// One row entry: a live tab, or a ghost of one that just closed.
+#[derive(Clone)]
 struct Slot {
     id: u64,
     title: String,
+    icon: Option<TabIcon>,
     ghost: bool,
 }
 
@@ -646,14 +912,31 @@ fn slot_title(tabs: &TabManager, id: u64) -> String {
     }
 }
 
-/// Draw the top tab bar. Appends any user interaction to `actions`.
+/// Draw one group's tab bar across the top of `ui`'s available rect (the
+/// group's column), allocating [`TAB_BAR_HEIGHT`]. Appends any user
+/// interaction to `actions`.
 ///
-/// With fewer than two tabs nothing is drawn and no space is taken, so the
-/// terminal below simply grows into the whole viewport. Keyboard shortcuts are
-/// handled by [`consume_shortcuts`] and keep working with the bar hidden.
-pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
-    let state_id = Id::new("terra_tab_bar_state");
-    if !bar_visible(tabs.ids().len()) {
+/// With a single group holding fewer than two tabs nothing is drawn and no
+/// space is taken, so the terminal below simply grows into the whole column.
+/// Keyboard shortcuts are handled by [`consume_shortcuts`] and keep working
+/// with the bar hidden. `focused` gates the `⌘n` hints, which act on the
+/// focused group only.
+///
+/// `icons` is read, never refreshed: deciding what is running in a tab is a
+/// syscall on a clock, which belongs with the app's other per-frame work and
+/// not inside a paint routine. One cache serves every group. An empty cache —
+/// which is what the `[tabs] icons = false` kill-switch produces — simply
+/// draws the bar terra drew before icons existed.
+pub fn tab_bar(
+    ui: &mut Ui,
+    tabs: &TabManager,
+    group: usize,
+    focused: bool,
+    icons: &IconCache,
+    actions: &mut Vec<AppAction>,
+) {
+    let state_id = Id::new(("terra_tab_bar_state", group));
+    if !bar_visible(tabs.group_tabs(group).len(), tabs.group_count()) {
         // Nothing on screen to continue from: drop the animations so the bar
         // comes back settled rather than mid-flight from minutes ago.
         ui.ctx().data_mut(|d| d.remove::<BarState>(state_id));
@@ -665,55 +948,53 @@ pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
         .data_mut(|d| d.get_temp(state_id))
         .unwrap_or_default();
 
-    let frame = egui::Frame::NONE
-        .fill(BAR_BG)
-        .inner_margin(egui::Margin {
-            left: PAD_X,
-            right: PAD_X,
-            top: PAD_Y,
-            bottom: PAD_Y,
-        })
-        .stroke(Stroke::NONE);
-
-    egui::Panel::top("terra_tab_bar")
-        .exact_size(TAB_BAR_HEIGHT)
-        .show_separator_line(false)
-        .frame(frame)
-        .show(ui, |ui| {
-            let bar = ui.available_rect_before_wrap();
-            ui.allocate_rect(bar, Sense::hover());
-            ui.set_clip_rect(bar);
+    let column = ui.available_rect_before_wrap();
+    let panel = Rect::from_min_size(column.min, Vec2::new(column.width(), TAB_BAR_HEIGHT));
+    ui.painter().rect_filled(panel, 0.0, BAR_BG);
+    {
+        // Salted per group: every interact id below hangs off `ui.id()`, and
+        // two groups' bars must not collide on ids like `terra_new_tab`.
+        let ui = &mut ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(panel)
+                .id_salt(("terra_tab_bar", group)),
+        );
+        ui.set_clip_rect(panel);
+        {
+            let bar = panel.shrink2(Vec2::new(f32::from(PAD_X), f32::from(PAD_Y)));
             let now = ui.input(|i| i.time);
-            let plus_left = bar.right() - PLUS_WIDTH;
+            let chevron_left = bar.right() - CHEVRON_WIDTH;
+            let plus_left = chevron_left - PLUS_WIDTH;
             let tabs_right = plus_left - PLUS_GAP;
-            let width = tab_width(bar.width(), tabs.ids().len());
+            let width = tab_width(bar.width(), tabs.group_tabs(group).len());
 
             // 1. Carry an in-progress drag first, so the rest of the frame lays
             //    out the order the pointer is asking for, with no lag.
-            let drag_x = drive_drag(ui, tabs, &mut state, bar, tabs_right, width);
+            let drag_x = drive_drag(ui, tabs, group, panel, bar, tabs_right, width);
 
             // 2. Tabs that vanished since last frame linger as shrinking ghosts.
-            let ids = tabs.ids();
-            let live: Vec<(u64, String)> =
-                ids.iter().map(|id| (*id, slot_title(tabs, *id))).collect();
-            for (index, (id, title)) in state.live.iter().enumerate() {
-                if !ids.contains(id) && !state.ghosts.iter().any(|g| g.id == *id) {
+            let ids = tabs.group_tabs(group);
+            let live: Vec<Slot> = ids
+                .iter()
+                .map(|id| Slot {
+                    id: *id,
+                    title: slot_title(tabs, *id),
+                    icon: icons.get(*id),
+                    ghost: false,
+                })
+                .collect();
+            for (index, slot) in state.live.iter().enumerate() {
+                if !ids.contains(&slot.id) && !state.ghosts.iter().any(|g| g.id == slot.id) {
                     state.ghosts.push(Ghost {
-                        id: *id,
-                        title: title.clone(),
+                        id: slot.id,
+                        title: slot.title.clone(),
+                        icon: slot.icon,
                         index,
                     });
                 }
             }
 
-            let mut slots: Vec<Slot> = live
-                .iter()
-                .map(|(id, title)| Slot {
-                    id: *id,
-                    title: title.clone(),
-                    ghost: false,
-                })
-                .collect();
+            let mut slots: Vec<Slot> = live.clone();
             let mut ghosts = state.ghosts.clone();
             ghosts.sort_by_key(|g| g.index);
             for ghost in &ghosts {
@@ -723,6 +1004,7 @@ pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
                     Slot {
                         id: ghost.id,
                         title: ghost.title.clone(),
+                        icon: ghost.icon,
                         ghost: true,
                     },
                 );
@@ -736,7 +1018,7 @@ pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
             let mut cursor = bar.left();
             for slot in &slots {
                 let target_w = if slot.ghost { 0.0 } else { width };
-                let is_new = !slot.ghost && !state.live.iter().any(|(id, _)| *id == slot.id);
+                let is_new = !slot.ghost && !state.live.iter().any(|live| live.id == slot.id);
                 if is_new {
                     // Born at its slot with no width at all, then grows.
                     state.seed((Track::Width, slot.id), 0.0, now);
@@ -766,8 +1048,10 @@ pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
 
             // 4. Paint. Inactive tabs first so the active capsule and the
             //    dragged tab overlap them rather than the other way round.
-            let active = tabs.active_id();
-            let dragged = state.drag.map(|d| d.id);
+            //    "Active" is the *group's* active tab: every group's bar
+            //    highlights the tab whose terminal it shows.
+            let active = tabs.group_active(group);
+            let dragged = current_drag(ui.ctx()).map(|d| d.id);
             let is_plain = |i: usize| {
                 !slots[i].ghost && Some(slots[i].id) != active && Some(slots[i].id) != dragged
             };
@@ -801,8 +1085,15 @@ pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
                 let visual = TabVisual {
                     rect,
                     id: slot.id,
-                    index: live_index.get(&slot.id).copied().unwrap_or(usize::MAX),
+                    // ⌘n selects within the *focused* group, so only its bar
+                    // shows the hints.
+                    index: if focused {
+                        live_index.get(&slot.id).copied().unwrap_or(usize::MAX)
+                    } else {
+                        usize::MAX
+                    },
                     title: &slot.title,
+                    icon: slot.icon,
                     active: Some(slot.id) == active,
                     dragged: Some(slot.id) == dragged,
                     separator: is_plain(i) && slots.get(i + 1).is_some_and(|_| is_plain(i + 1)),
@@ -816,7 +1107,7 @@ pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
                 let response = tab(ui, &visual, actions);
                 if response.drag_started_by(PointerButton::Primary) {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        started_drag = Some(Drag {
+                        started_drag = Some(TabDrag {
                             id: slot.id,
                             grab: pos.x - rect.left(),
                         });
@@ -825,7 +1116,7 @@ pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
             }
             if let Some(drag) = started_drag {
                 actions.push(AppAction::SelectTab(drag.id));
-                state.drag = Some(drag);
+                set_drag(ui.ctx(), Some(drag));
             }
 
             // 5. Retire ghosts that have shrunk away, and remember this frame.
@@ -845,76 +1136,384 @@ pub fn tab_bar(ui: &mut Ui, tabs: &TabManager, actions: &mut Vec<AppAction>) {
                 Vec2::new(PLUS_WIDTH, bar.height()),
             );
             plus_button(ui, plus, actions);
-        });
 
+            // The `⌄` hangs off this group's `+` right edge, Windows-Terminal
+            // style. The bar is the only thing deciding *where*; the button
+            // itself is anchor-agnostic (see [`chevron_menu`]), so every group
+            // gets its own, salted by leaf index so two bars' popups and
+            // interact ids never collide.
+            let chevron = Rect::from_min_size(
+                egui::pos2(chevron_left, bar.top()),
+                Vec2::new(CHEVRON_WIDTH, bar.height()),
+            );
+            let names: Vec<&str> = tabs.profiles().keys().map(String::as_str).collect();
+            if let Some(action) = chevron_menu(ui, chevron, group, &new_tab_entries(names)) {
+                // The menu's rows open a tab in *this* group. `open` targets
+                // the focused group, so say which one that is first rather
+                // than leaning on the click having landed inside the column
+                // (the popup is a separate layer and may not).
+                if !focused {
+                    actions.push(AppAction::FocusGroup(group));
+                }
+                actions.push(action);
+            }
+        }
+    }
+
+    // Advance the column's cursor past the bar, so the caller lays the
+    // terminal out below it.
+    ui.allocate_rect(panel, Sense::hover());
     ui.ctx().data_mut(|d| d.insert_temp(state_id, state));
 
     // Hairline under the bar, drawn on top of the terminal's own background.
-    let bar_bottom = ui.max_rect().top();
-    ui.painter().hline(
-        ui.max_rect().x_range(),
-        bar_bottom,
-        Stroke::new(1.0, BAR_LINE),
-    );
+    ui.painter()
+        .hline(panel.x_range(), panel.bottom(), Stroke::new(1.0, BAR_LINE));
 }
 
-/// Advance a drag started on an earlier frame: follow the pointer, reorder the
-/// tabs it crosses, and end when the button comes up. Returns where the dragged
-/// tab should be painted this frame.
+/// Advance a drag started on an earlier frame *while it stays in its own bar*:
+/// follow the pointer and reorder the tabs it crosses within their group.
+/// Returns where the dragged tab should be painted this frame.
+///
+/// Only the position is owned here. The drag's life ends in
+/// [`tab_drag_overlay`], which also takes over the moment the pointer strays
+/// past [`BAR_DRAG_SLACK`] — from there the pill is a floating ghost and this
+/// returns `None`, so the in-bar pill animates back to its slot.
 fn drive_drag(
     ui: &Ui,
     tabs: &TabManager,
-    state: &mut BarState,
+    group: usize,
+    panel: Rect,
     bar: Rect,
     tabs_right: f32,
     width: f32,
 ) -> Option<(u64, f32)> {
-    let drag = state.drag?;
-    if tabs.index_of(drag.id).is_none() {
-        // The tab was closed under the pointer.
-        state.drag = None;
+    let drag = current_drag(ui.ctx())?;
+    if tabs.group_of(drag.id) != Some(group) {
+        // Some other group's bar owns this drag.
         return None;
     }
     let down = ui.input(|i| i.pointer.primary_down());
-    let pointer = ui.input(|i| i.pointer.interact_pos()).map(|p| p.x);
-    let (true, Some(pointer_x)) = (down, pointer) else {
-        // Released: the tab animates from wherever it is to its slot.
-        state.drag = None;
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    let (true, Some(pointer)) = (down, pointer) else {
+        // Released: the overlay pass performs the drop and clears the state;
+        // the tab animates from wherever it is to its slot.
         return None;
     };
+    if !panel
+        .expand2(Vec2::new(0.0, BAR_DRAG_SLACK))
+        .contains(pointer)
+    {
+        // Left the bar: the cross-group ghost has it now.
+        return None;
+    }
 
     let max_x = (tabs_right - width).max(bar.left());
-    let x = (pointer_x - drag.grab).clamp(bar.left(), max_x);
-    let count = tabs.ids().len();
-    tabs.move_tab(drag.id, drop_index(x, bar.left(), width + TAB_GAP, count));
+    let x = (pointer.x - drag.grab).clamp(bar.left(), max_x);
+    let count = tabs.group_tabs(group).len();
+    tabs.move_tab(
+        drag.id,
+        group,
+        drop_index(x, bar.left(), width + TAB_GAP, count),
+    );
     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     Some((drag.id, x))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-group drag & drop
+// ---------------------------------------------------------------------------
+
+/// Where one group's column sits this frame, for routing a cross-group drag.
+/// `main.rs` collects one per group as it lays the columns out.
+pub struct GroupGeometry {
+    /// The bar strip across the top of the column ([`Rect::NOTHING`] while the
+    /// bar is hidden, i.e. a lone tab in a lone group).
+    pub bar: Rect,
+    /// The terminal area below the bar, whose four halves (nearest edge
+    /// wins) are the split drop zones.
+    pub terminal: Rect,
+}
+
+/// What the pointer is over mid-drag.
+enum DropTarget {
+    /// A group's tab bar: drop moves the tab there, at `index`.
+    Bar { group: usize, index: usize },
+    /// A half of a group's terminal: drop splits that group towards `dir`.
+    /// `zone` is the half itself, for the hover overlay.
+    Split {
+        group: usize,
+        dir: SplitDir,
+        zone: Rect,
+    },
+}
+
+/// Which of the four halves of `rect` the pointer is in: whichever edge it
+/// is proportionally closest to wins (VS Code's quadrant rule), so the rect
+/// is cut along its diagonals. Ties go to the horizontal sides.
+fn split_zone(rect: Rect, pointer: egui::Pos2) -> (SplitDir, Rect) {
+    let dx = (pointer.x - rect.center().x) / rect.width().max(1.0);
+    let dy = (pointer.y - rect.center().y) / rect.height().max(1.0);
+    let dir = if dx.abs() >= dy.abs() {
+        if dx >= 0.0 {
+            SplitDir::Right
+        } else {
+            SplitDir::Left
+        }
+    } else if dy >= 0.0 {
+        SplitDir::Down
+    } else {
+        SplitDir::Up
+    };
+    let zone = match dir {
+        SplitDir::Left => rect.split_left_right_at_fraction(0.5).0,
+        SplitDir::Right => rect.split_left_right_at_fraction(0.5).1,
+        SplitDir::Up => rect.split_top_bottom_at_fraction(0.5).0,
+        SplitDir::Down => rect.split_top_bottom_at_fraction(0.5).1,
+    };
+    (dir, zone)
+}
+
+/// Insertion slot for a tab dropped at `x` on a *foreign* bar: unlike
+/// [`drop_index`] (which reorders `count` existing tabs), a foreign drop may
+/// also land *after* the last tab, so this clamps to `count`, not `count - 1`.
+fn insertion_index(x: f32, bar_left: f32, pitch: f32, count: usize) -> usize {
+    if pitch <= 0.0 {
+        return count;
+    }
+    let raw = ((x - bar_left) / pitch).round().max(0.0) as usize;
+    raw.min(count)
+}
+
+/// The drop target under `pointer`, if it is a *valid* one for `drag`:
+/// splitting a group towards itself when the tab is alone in it would be pure
+/// churn (the model refuses it too), so that half reads as no target at all.
+fn drop_target(
+    pointer: egui::Pos2,
+    tabs: &TabManager,
+    drag: TabDrag,
+    geoms: &[GroupGeometry],
+) -> Option<DropTarget> {
+    let src_group = tabs.group_of(drag.id)?;
+    for (group, geom) in geoms.iter().enumerate() {
+        if geom.bar.contains(pointer) {
+            let inner = geom
+                .bar
+                .shrink2(Vec2::new(f32::from(PAD_X), f32::from(PAD_Y)));
+            let count = tabs.group_tabs(group).len();
+            let width = tab_width(inner.width(), count);
+            return Some(DropTarget::Bar {
+                group,
+                index: insertion_index(pointer.x, inner.left(), width + TAB_GAP, count),
+            });
+        }
+        if geom.terminal.contains(pointer) {
+            if group == src_group && tabs.group_tabs(src_group).len() < 2 {
+                return None;
+            }
+            let (dir, zone) = split_zone(geom.terminal, pointer);
+            return Some(DropTarget::Split { group, dir, zone });
+        }
+    }
+    None
+}
+
+/// The floating pill that follows the pointer once a drag has left its bar.
+/// Painted on the tooltip layer, so it rides above every column.
+fn paint_ghost(
+    ctx: &egui::Context,
+    tabs: &TabManager,
+    icons: &IconCache,
+    drag: TabDrag,
+    pointer: egui::Pos2,
+) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        Id::new("terra_tab_drag_ghost"),
+    ));
+    let height = TAB_BAR_HEIGHT - 2.0 * f32::from(PAD_Y);
+    let rect = Rect::from_min_size(
+        egui::pos2(
+            pointer.x - drag.grab.clamp(0.0, GHOST_WIDTH),
+            pointer.y - height / 2.0,
+        ),
+        Vec2::new(GHOST_WIDTH, height),
+    );
+    let radius = CornerRadius::same(CORNER);
+    painter.rect_filled(rect, radius, TAB_ACTIVE_BG.gamma_multiply(0.9));
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, TAB_ACTIVE_EDGE),
+        egui::StrokeKind::Inside,
+    );
+    let title = slot_title(tabs, drag.id);
+    // The ghost is the pill, so it carries the pill's icon too — the tab keeps
+    // its face all the way across the window.
+    let icon = icons.get(drag.id);
+    let lead = if icon.is_some() {
+        ICON_SIZE + ICON_GAP
+    } else {
+        0.0
+    };
+    let (galley, _) = middle_truncated(
+        &painter,
+        &title,
+        title_font(true),
+        rect.width() - TITLE_RESERVE - lead,
+    );
+    let left = rect.center().x - (galley.size().x + lead) / 2.0;
+    let pos = egui::pos2(left + lead, rect.center().y - galley.size().y / 2.0);
+    if let Some(icon) = icon {
+        crate::tab_icon::paint_on(
+            ctx,
+            &painter,
+            icon,
+            Rect::from_min_size(
+                egui::pos2(left, rect.center().y - ICON_SIZE / 2.0),
+                Vec2::splat(ICON_SIZE),
+            ),
+            TITLE_ACTIVE,
+        );
+    }
+    painter.galley(pos, galley, TITLE_ACTIVE);
+}
+
+/// The cross-group half of a tab drag, run once per frame after every column
+/// (bar + terminal) has been laid out — it needs the whole window's geometry,
+/// which no single group's bar has.
+///
+/// While the button is down: paints the translucent split zone under the
+/// pointer and, once the drag has left its own bar, the floating ghost. On
+/// release: turns the drop target into an action —
+/// [`AppAction::MoveTab`] for a foreign bar, [`AppAction::SplitTab`] for a
+/// terminal half — and ends the drag. Anywhere else the release is a no-op and
+/// the pill simply animates back to its slot.
+pub fn tab_drag_overlay(
+    ui: &Ui,
+    tabs: &TabManager,
+    icons: &IconCache,
+    geoms: &[GroupGeometry],
+    actions: &mut Vec<AppAction>,
+) {
+    let ctx = ui.ctx().clone();
+    let Some(drag) = current_drag(&ctx) else {
+        return;
+    };
+    let Some(src_group) = tabs.group_of(drag.id) else {
+        // Closed under the pointer (⌘W, `terra kill`, shell exit).
+        set_drag(&ctx, None);
+        return;
+    };
+    let pointer = ctx.input(|i| i.pointer.interact_pos());
+    let down = ctx.input(|i| i.pointer.primary_down());
+    // While the pointer stays in its own bar's band the drag is an in-bar
+    // reorder ([`drive_drag`]) and nothing here may compete with it — the
+    // band's overhang into the terminal must not read as a split target.
+    let in_own_bar = |p: egui::Pos2| {
+        geoms
+            .get(src_group)
+            .is_some_and(|g| g.bar.expand2(Vec2::new(0.0, BAR_DRAG_SLACK)).contains(p))
+    };
+    let target = pointer
+        .filter(|p| !in_own_bar(*p))
+        .and_then(|p| drop_target(p, tabs, drag, geoms));
+
+    if !down {
+        match target {
+            Some(DropTarget::Bar { group, index }) if group != src_group => {
+                actions.push(AppAction::MoveTab {
+                    id: drag.id,
+                    group,
+                    index,
+                });
+            }
+            Some(DropTarget::Split { group, dir, .. }) => {
+                actions.push(AppAction::SplitTab {
+                    id: drag.id,
+                    group,
+                    dir,
+                });
+            }
+            // Own bar (the in-bar reorder already happened live) or thin air:
+            // nothing to do, the pill snaps back on its own.
+            _ => {}
+        }
+        set_drag(&ctx, None);
+        return;
+    }
+
+    let Some(pointer) = pointer else { return };
+    if let Some(DropTarget::Split { zone, .. }) = target {
+        // VS Code's drop shade: a blue wash over the half the split would take.
+        ui.painter().rect_filled(zone, 0.0, DROP_ZONE_FILL);
+        ui.painter().rect_stroke(
+            zone,
+            0.0,
+            Stroke::new(1.0, DROP_ZONE_EDGE),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if !in_own_bar(pointer) {
+        // Inside its own bar the live pill *is* the drag feedback.
+        paint_ghost(&ctx, tabs, icons, drag, pointer);
+    }
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    ctx.request_repaint();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The `+` and the `⌄` next to it both come out of the tabs' share, or the
+    /// last tab would slide under them.
     #[test]
-    fn tabs_share_the_bar_minus_the_plus_zone() {
-        // 800 wide bar, 4 tabs: 800 - 28 - 6 = 766 usable, split evenly.
+    fn tabs_share_the_bar_minus_the_plus_and_chevron_zone() {
+        // 800 wide bar, 4 tabs: 800 - 28 - 20 - 6 = 746 usable, split evenly.
         let w = tab_width(800.0, 4);
-        assert!((w - (766.0 - 3.0 * TAB_GAP) / 4.0).abs() < 0.01);
-        // Tabs plus gaps plus the `+` zone exactly fill the bar.
-        assert!((4.0 * w + 3.0 * TAB_GAP + PLUS_GAP + PLUS_WIDTH - 800.0).abs() < 0.01);
+        assert!((w - (746.0 - 3.0 * TAB_GAP) / 4.0).abs() < 0.01);
+        // Tabs plus gaps plus both buttons exactly fill the bar.
+        assert!(
+            (4.0 * w + 3.0 * TAB_GAP + PLUS_GAP + PLUS_WIDTH + CHEVRON_WIDTH - 800.0).abs() < 0.01
+        );
     }
 
     #[test]
     fn a_single_tab_takes_the_whole_bar() {
         let w = tab_width(400.0, 1);
-        assert!((w + PLUS_GAP + PLUS_WIDTH - 400.0).abs() < 0.01);
+        assert!((w + PLUS_GAP + PLUS_WIDTH + CHEVRON_WIDTH - 400.0).abs() < 0.01);
+    }
+
+    /// The menu always offers a plain new tab first, then the profiles in the
+    /// order they arrive — which is the config's `BTreeMap` order, i.e.
+    /// alphabetical.
+    #[test]
+    fn the_chevron_menu_lists_the_default_shell_then_every_profile() {
+        let bare = new_tab_entries(std::iter::empty());
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0], MenuEntry::new("New Tab", AppAction::NewTab));
+
+        let entries = new_tab_entries(["build", "htop"]);
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["New Tab", "build", "htop"]);
+        assert_eq!(
+            entries[1].action,
+            AppAction::NewTabProfile("build".to_owned())
+        );
+        assert_eq!(
+            entries[2].action,
+            AppAction::NewTabProfile("htop".to_owned())
+        );
     }
 
     #[test]
-    fn the_bar_hides_for_a_lone_tab() {
-        assert!(!bar_visible(0));
-        assert!(!bar_visible(1));
-        assert!(bar_visible(2));
+    fn the_bar_hides_for_a_lone_tab_in_a_lone_group() {
+        assert!(!bar_visible(0, 1));
+        assert!(!bar_visible(1, 1));
+        assert!(bar_visible(2, 1));
+        // With a second group every column shows its bar, tabs or not.
+        assert!(bar_visible(1, 2));
+        assert!(bar_visible(0, 2));
     }
 
     #[test]
@@ -936,6 +1535,56 @@ mod tests {
         assert_eq!(drop_index(-9000.0, 0.0, pitch, 4), 0);
         assert_eq!(drop_index(160.0, 10.0, pitch, 4), 2);
         assert_eq!(drop_index(10.0, 0.0, 0.0, 4), 0);
+    }
+
+    /// A tab dropped on a *foreign* bar may land after the last tab, so the
+    /// insertion slot clamps to `count`, one past what [`drop_index`] allows.
+    #[test]
+    fn a_foreign_drop_can_land_after_the_last_tab() {
+        let pitch = 100.0;
+        assert_eq!(insertion_index(0.0, 0.0, pitch, 3), 0);
+        assert_eq!(insertion_index(151.0, 0.0, pitch, 3), 2);
+        assert_eq!(insertion_index(260.0, 0.0, pitch, 3), 3);
+        assert_eq!(insertion_index(9000.0, 0.0, pitch, 3), 3);
+        assert_eq!(insertion_index(-9000.0, 0.0, pitch, 3), 0);
+        // A degenerate pitch appends rather than dividing by zero.
+        assert_eq!(insertion_index(50.0, 0.0, 0.0, 3), 3);
+    }
+
+    /// A drop splits towards whichever edge the pointer is proportionally
+    /// closest to — the rect is cut along its diagonals into four zones, and
+    /// the highlighted half is the one the new leaf would take.
+    #[test]
+    fn the_four_drop_zones_are_cut_along_the_diagonals() {
+        let rect = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 200.0));
+        let at = |x: f32, y: f32| split_zone(rect, egui::pos2(x, y));
+
+        let (dir, zone) = at(40.0, 100.0); // deep in the left wedge
+        assert_eq!(dir, SplitDir::Left);
+        assert_eq!(
+            zone,
+            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 200.0))
+        );
+        let (dir, zone) = at(360.0, 100.0);
+        assert_eq!(dir, SplitDir::Right);
+        assert_eq!(zone.min.x, 200.0);
+        let (dir, zone) = at(200.0, 20.0); // top wedge, centred horizontally
+        assert_eq!(dir, SplitDir::Up);
+        assert_eq!(
+            zone,
+            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 100.0))
+        );
+        let (dir, zone) = at(200.0, 180.0);
+        assert_eq!(dir, SplitDir::Down);
+        assert_eq!(zone.min.y, 100.0);
+
+        // Proportional, not absolute: in a wide rect a point 30% across but
+        // 40% down is *relatively* nearer the left edge than the top one.
+        let (dir, _) = at(120.0, 80.0);
+        assert_eq!(dir, SplitDir::Left);
+        // The exact centre ties; the horizontal sides win ties.
+        let (dir, _) = at(200.0, 100.0);
+        assert_eq!(dir, SplitDir::Right);
     }
 
     /// The hover fill travels from idle to hover and stops at both ends, so a

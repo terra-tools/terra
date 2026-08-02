@@ -14,6 +14,26 @@ size = 15.0
 # 0.5 – 3.0.
 line_height = 1.3
 
+[tabs]
+# Show a small icon on each tab, to the left of its title, for whatever the tab
+# is running: claude, zsh, bash, fish, python, node, docker, git, htop, vim,
+# neovim, tmux, cargo. Anything else gets a dim `>_`, so the titles in a row
+# stay aligned instead of shifting as programs come and go.
+#
+# Icons keep their brand colour — recognising a logo at a glance is the point —
+# except the generic `>_`, which is tinted to the tab's own text colour.
+#
+# terra works out what to draw the same way it works out `text.bidi_quirks`
+# below: by walking the process tree down from the tab's shell to whatever is
+# actually running in it, about once a second. Failing that (or before the
+# first walk on a brand-new tab) it falls back to matching whole words in the
+# tab's title and the command it was opened with.
+#
+# Set this to false if you would rather terra not read the process table at
+# all, or simply find logos in chrome noisy. Off skips the poll too, not just
+# the drawing.
+icons = true
+
 [text]
 # Reorder right-to-left text (Hebrew, Arabic, …) for display, per the Unicode
 # Bidirectional Algorithm, UAX #9: https://unicode.org/reports/tr9/
@@ -82,3 +102,42 @@ bidi_base = "auto"
 claude = "off"
 # Emits logical order and expects the terminal to reorder.
 codex = "on"
+
+# ---------------------------------------------------------------------------
+# Profiles — named ways to open a tab
+# ---------------------------------------------------------------------------
+#
+# Each [profile.<name>] adds one entry to the ⌄ menu next to the tab bar's +
+# button, one command-palette action ("New Tab: <name>", id tab.new.<name>),
+# and one CLI spelling: `terra new --profile <name>`.
+#
+# Every key is optional:
+#
+#   command — what to run, written as you would type it. It is split into
+#             words the way a shell splits a command line ('…' and "…" group
+#             words), and then run exactly as `terra new -- …` runs a command:
+#             typed into your normal login shell, so your prompt renders, the
+#             command line is visible in the scrollback, and the shell is
+#             still there when the program exits. Omit it for a plain shell.
+#   cwd     — where the tab starts. A leading ~ is expanded.
+#   title   — the tab's title, which the shell can no longer change.
+#
+# A profile that is malformed — a `command` with an unterminated quote, a key
+# of the wrong type — is skipped with a warning; the other profiles are
+# unaffected. `terra new --profile` with a name that is not here fails with an
+# error listing the names that are, rather than quietly opening a shell.
+#
+# These are examples; delete them.
+
+[profile.htop]
+command = "htop"
+title = "system"
+
+[profile.logs]
+command = "tail -f /var/log/system.log"
+cwd = "~"
+title = "logs"
+
+[profile.home]
+# No command at all: just a shell, over there.
+cwd = "~"
