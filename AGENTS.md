@@ -36,6 +36,11 @@ tasks (`just pre-commit` before committing).
   only when the *approach* is still unsolved — not because the change is
   large or touches many files. Transforming working, tested code along a
   written spec is mid-tier work.
+- Parallel subagents share one tree only when their file sets are disjoint.
+  Otherwise isolate each in a git worktree (branched from HEAD — uncommitted
+  work is not in it) and merge when they land. Every live-verifying agent
+  gets its own socket (`TERRA_SOCKET=~/.terra/terra-<task>.sock`) and kills
+  only its own app pid — never a shared `pkill` pattern.
 
 ## ETA
 
