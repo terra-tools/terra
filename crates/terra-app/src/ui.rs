@@ -584,7 +584,8 @@ fn paint_tab(ui: &Ui, v: &TabVisual<'_>, hover_t: f32, active_t: f32) -> bool {
         0.0
     };
     let max_text = (v.rect.width() - TITLE_RESERVE * 2.0 - lead).max(8.0);
-    let (galley, truncated) = middle_truncated(painter, v.title, title_font(v.active), max_text);
+    let shown = crate::tab_icon::display_title(v.title, v.icon);
+    let (galley, truncated) = middle_truncated(painter, shown, title_font(v.active), max_text);
     let left = v.rect.center().x - (galley.size().x + lead) / 2.0;
     let pos = egui::pos2(left + lead, v.rect.center().y - galley.size().y / 2.0);
     if let Some(icon) = v.icon {
@@ -1357,7 +1358,7 @@ fn paint_ghost(
     };
     let (galley, _) = middle_truncated(
         &painter,
-        &title,
+        crate::tab_icon::display_title(&title, icon),
         title_font(true),
         rect.width() - TITLE_RESERVE - lead,
     );

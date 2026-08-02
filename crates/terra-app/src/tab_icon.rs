@@ -359,6 +359,27 @@ pub fn resolve(foreground: Option<&str>, text: &str) -> TabIcon {
     }
 }
 
+/// The title as the pill should draw it. TUIs that predate the icons prefix
+/// their titles with a status glyph doing an icon's job — claude code's
+/// `✳ Claude Code` spinner is the canonical case — and next to a real brand
+/// icon that reads as two icons. When the pill wears a brand icon, one
+/// leading symbol character (anything from the arrows/dingbats planes up,
+/// never a letter, digit or ASCII mark) plus its trailing space is dropped.
+/// Paint-time only: capture, rename, `ls` and the window title keep the
+/// original string.
+pub fn display_title<'a>(title: &'a str, icon: Option<TabIcon>) -> &'a str {
+    if !icon.is_some_and(|i| !i.is_generic()) {
+        return title;
+    }
+    let mut chars = title.chars();
+    match (chars.next(), chars.next()) {
+        (Some(marker), Some(' ')) if (marker as u32) >= 0x2190 && !marker.is_alphanumeric() => {
+            chars.as_str()
+        }
+        _ => title,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-tab cache
 // ---------------------------------------------------------------------------
@@ -969,5 +990,38 @@ mod tests {
         );
         assert_eq!(cache.get(1), Some(TabIcon::Htop));
         assert_eq!(cache.get(2), Some(TabIcon::Terminal));
+    }
+}
+
+#[cfg(test)]
+mod display_title_tests {
+    use super::*;
+
+    #[test]
+    fn a_status_glyph_yields_to_a_brand_icon() {
+        assert_eq!(
+            display_title("✳ Claude Code", Some(TabIcon::Claude)),
+            "Claude Code"
+        );
+        assert_eq!(
+            display_title("✻ Display random emojis", Some(TabIcon::Claude)),
+            "Display random emojis"
+        );
+    }
+
+    #[test]
+    fn without_a_brand_icon_the_title_is_untouched() {
+        assert_eq!(display_title("✳ Claude Code", None), "✳ Claude Code");
+        assert_eq!(
+            display_title("✳ Claude Code", Some(TabIcon::Terminal)),
+            "✳ Claude Code"
+        );
+    }
+
+    #[test]
+    fn ordinary_titles_never_lose_their_first_word() {
+        assert_eq!(display_title("~ home", Some(TabIcon::Zsh)), "~ home");
+        assert_eq!(display_title("[1] build", Some(TabIcon::Git)), "[1] build");
+        assert_eq!(display_title("א שלום", Some(TabIcon::Claude)), "א שלום");
     }
 }
