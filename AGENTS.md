@@ -27,6 +27,15 @@ tasks (`just pre-commit` before committing).
   fmt only the crates you touched (match CI's gate).
 - Every `vendor/egui_term` change gets an entry in its `PATCHES.md`.
 
+## Orchestration
+
+- Delegate implementation to background subagents so the main agent stays
+  free to talk and review; plain subagents usually beat a workflow — reach
+  for workflows only when staged fan-out genuinely pays.
+- Subagents default to the mid-tier model, not the frontier one. Escalate a
+  single subagent to the frontier tier only when its task is genuinely hard
+  (structural refactors, gnarly debugging).
+
 ## ETA
 
 Don't deliberate — one formula:
