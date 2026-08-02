@@ -30,6 +30,9 @@ terra you are working in rather than handing over to it. Consequences:
   installed bundle (`terra.app/Contents/MacOS/terra-app`) cannot match, so
   iterating never kills your daily driver. `just install` does kill the
   installed app — it is replacing the bundle — but not the dev one.
+- When an iteration is finished and you want to *live* with it: `just upgrade`
+  rebuilds, replaces `/Applications/terra.app`, and relaunches it. This is the
+  one command that intentionally closes the daily instance.
 
 Note: run `cargo build --release` before `cargo packager` if invoking the
 packager by hand — it does not build the binary itself.

@@ -86,6 +86,13 @@ install force="" bin="/usr/local/bin":
         || sudo install -m 755 target/release/terra "{{bin}}/terra"
     echo "installed $dest and {{bin}}/terra — first launch: right-click the app -> Open"
 
+# Replace the installed app with a fresh build and relaunch it.
+# Closes the running daily instance (its tabs die) — run when you're done for the iteration.
+upgrade:
+    just install 1
+    open /Applications/terra.app
+    echo "terra upgraded and relaunched"
+
 # Remove build artifacts
 clean:
     cargo clean
