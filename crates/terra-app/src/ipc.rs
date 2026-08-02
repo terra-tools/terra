@@ -516,12 +516,19 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the Unix-gated stale-socket test calls a `Listener` method.
+    #[cfg(unix)]
     use interprocess::local_socket::traits::Listener as _;
 
     /// The stale-socket path is the one piece of `bind` that is exercisable
     /// without a GUI: a socket file with nothing behind it must be removed and
     /// the bind must then succeed, and a *live* listener on the same address
     /// must not be displaced.
+    // Unix only: the address is a filesystem path there. A Windows named
+    // pipe has no file to go stale — the kernel reclaims the name when the
+    // last handle closes — so this branch of `bind` is unreachable on
+    // Windows by construction, not merely untested.
+    #[cfg(unix)]
     #[test]
     fn a_socket_file_with_nothing_behind_it_is_reclaimed() {
         let dir = std::env::temp_dir().join(format!("terra-ipc-test-{}", std::process::id()));
