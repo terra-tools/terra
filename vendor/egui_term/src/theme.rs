@@ -146,6 +146,31 @@ impl TerminalTheme {
     }
 
     /// terra patch: color of the cursor beam.
+    /// terra patch: the palette in the order alacritty's colour queries use
+    /// — the 256 ANSI entries, then foreground, background and cursor.
+    ///
+    /// Answering OSC 4/10/11/12 is what lets a program derive a shade that
+    /// contrasts with the actual theme instead of guessing or, as Codex
+    /// does, skipping the styling entirely.
+    pub fn reported_colors(&self) -> Vec<ansi::Rgb> {
+        let to_rgb = |c: Color32| ansi::Rgb {
+            r: c.r(),
+            g: c.g(),
+            b: c.b(),
+        };
+        let mut colors: Vec<ansi::Rgb> = (0..256)
+            .map(|i| to_rgb(self.get_color(ansi::Color::Indexed(i as u8))))
+            .collect();
+        colors.push(to_rgb(
+            self.get_color(ansi::Color::Named(NamedColor::Foreground)),
+        ));
+        colors.push(to_rgb(
+            self.get_color(ansi::Color::Named(NamedColor::Background)),
+        ));
+        colors.push(to_rgb(self.cursor_color()));
+        colors
+    }
+
     pub fn cursor_color(&self) -> Color32 {
         let color = &self.palette.cursor_color;
         hex_to_color(color)

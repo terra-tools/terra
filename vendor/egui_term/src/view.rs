@@ -1,3 +1,5 @@
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::Column;
 use alacritty_terminal::index::Point as TerminalGridPoint;
 use alacritty_terminal::term::cell;
 use alacritty_terminal::term::TermMode;
@@ -14,6 +16,7 @@ use egui::{Id, PointerButton};
 use crate::backend::BackendCommand;
 use crate::backend::TerminalBackend;
 use crate::backend::{LinkAction, MouseButton, SelectionType};
+use crate::bidi::{self, BidiBase};
 use crate::bindings::Binding;
 use crate::bindings::{BindingAction, BindingsLayout, InputKind};
 use crate::font::TerminalFont;
@@ -48,6 +51,10 @@ pub struct TerminalView<'a> {
     font: TerminalFont,
     theme: TerminalTheme,
     bindings_layout: BindingsLayout,
+    /// terra patch: whether to reorder right-to-left text for display.
+    bidi: bool,
+    /// terra patch: the paragraph direction rows resolve against.
+    bidi_base: BidiBase,
 }
 
 impl Widget for TerminalView<'_> {
@@ -88,6 +95,8 @@ impl<'a> TerminalView<'a> {
             font: TerminalFont::default(),
             theme: TerminalTheme::default(),
             bindings_layout: BindingsLayout::new(),
+            bidi: true,
+            bidi_base: BidiBase::default(),
         }
     }
 
@@ -106,6 +115,23 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_focus(mut self, has_focus: bool) -> Self {
         self.has_focus = has_focus;
+        self
+    }
+
+    /// terra patch: enable UAX #9 BiDi reordering for this frame.
+    ///
+    /// Applied to the backend before `sync`, so a toggle takes effect on the
+    /// very next paint — both for what is drawn and for where clicks land.
+    #[inline]
+    pub fn set_bidi(mut self, bidi: bool) -> Self {
+        self.bidi = bidi;
+        self
+    }
+
+    /// terra patch: the paragraph direction BiDi resolves each row against.
+    #[inline]
+    pub fn set_bidi_base(mut self, base: BidiBase) -> Self {
+        self.bidi_base = base;
         self
     }
 
@@ -168,7 +194,7 @@ impl<'a> TerminalView<'a> {
                         &self.bindings_layout,
                         modifiers,
                     ))
-                },
+                }
                 egui::Event::MouseWheel { unit, delta, .. } => input_actions
                     .push(process_mouse_wheel(
                         state,
@@ -200,19 +226,19 @@ impl<'a> TerminalView<'a> {
                         pos,
                         &modifiers,
                     )
-                },
-                _ => {},
+                }
+                _ => {}
             };
 
             for action in input_actions {
                 match action {
                     InputAction::BackendCall(cmd) => {
                         self.backend.process_command(cmd);
-                    },
+                    }
                     InputAction::WriteToClipboard(data) => {
                         layout.ctx.copy_text(data);
-                    },
-                    InputAction::Ignore => {},
+                    }
+                    InputAction::Ignore => {}
                 }
             }
         }
@@ -226,6 +252,23 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         painter: &Painter,
     ) {
+        // terra patch (BiDi): settle the mode before the snapshot, so the
+        // maps in `content` describe exactly what this frame paints.
+        // terra patch: the program learns about focus only if we tell it.
+        // Both conditions matter — the window can be focused while the
+        // palette has taken the keyboard.
+        let window_focused = layout.ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        self.backend.set_focused(self.has_focus && window_focused);
+        // terra patch: hand the backend the palette to answer colour queries
+        // from. Once per tab — the table is 259 entries and the theme does
+        // not change under us.
+        // Normally already filled in when the tab was opened; this is the
+        // backstop for a backend created without a theme to hand.
+        if self.backend.wants_colors() {
+            self.backend.set_reported_colors(self.theme.reported_colors());
+        }
+        self.backend.set_bidi(self.bidi);
+        self.backend.set_bidi_base(self.bidi_base);
         let content = self.backend.sync();
         let layout_min = layout.rect.min;
         let layout_max = layout.rect.max;
@@ -263,10 +306,30 @@ impl<'a> TerminalView<'a> {
                         && r.contains(&state.current_mouse_position_on_grid)
                 });
 
-            let x = layout_min.x + (cell_width * indexed.point.column.0 as f32);
             let line_num =
                 indexed.point.line.0 + content.grid.display_offset() as i32;
             let y = layout_min.y + (cell_height * line_num as f32);
+
+            // terra patch (BiDi): the cell knows its *logical* column; the
+            // row's map says where that lands visually. This is the only
+            // place a column becomes a pixel, so it is the only place the
+            // reordering has to be applied. `content.bidi` is empty when
+            // BiDi is off, and `RowMap` is the identity for any row without
+            // right-to-left text, so the common case returns what it was
+            // given.
+            let logical_col = indexed.point.column.0;
+            let row_map = content.bidi.get(line_num.max(0) as usize);
+            let visual_col = match row_map {
+                // A wide char spans two columns; anchor the pair at its
+                // leftmost visual column so the double-width glyph never
+                // overhangs the run it belongs to.
+                Some(map) if is_wide_char => {
+                    map.visual_span_start(logical_col, 2)
+                }
+                Some(map) => map.visual_of(logical_col),
+                None => logical_col,
+            };
+            let x = layout_min.x + (cell_width * visual_col as f32);
 
             let mut fg = self.theme.get_color(indexed.fg);
             let mut bg = self.theme.get_color(indexed.bg);
@@ -321,39 +384,15 @@ impl<'a> TerminalView<'a> {
                 });
             }
 
-            // Handle cursor rendering
-            // terra patch: a thin vertical beam at the cell's left edge in the
-            // theme's cursor color, instead of a full-cell filled block. The
-            // glyph is drawn afterwards in its own color (no fg/bg swap), so
-            // the character under the cursor stays readable.
-            if content.grid.cursor.point == indexed.point {
-                // Blink: visible one interval, hidden the next; keep
-                // repainting so the phase advances. An unfocused terminal
-                // shows a steady beam instead of blinking.
-                let time = layout.ctx.input(|i| i.time);
-                let visible = !layout.has_focus()
-                    || (time / CURSOR_BLINK_INTERVAL) as u64 % 2 == 0;
-                layout.ctx.request_repaint_after(
-                    std::time::Duration::from_secs_f64(
-                        CURSOR_BLINK_INTERVAL
-                            - (time % CURSOR_BLINK_INTERVAL),
-                    ),
-                );
-                if visible {
-                    let cursor_color = self.theme.cursor_color();
-                    shapes.push(Shape::Rect(RectShape::filled(
-                        Rect::from_min_size(
-                            Pos2::new(x, y),
-                            Vec2::new(CURSOR_BEAM_WIDTH, cell_height),
-                        ),
-                        CornerRadius::default(),
-                        cursor_color,
-                    )));
-                }
-            }
-
             // Draw text content
             if indexed.c != ' ' && indexed.c != '\t' {
+                // terra patch (BiDi): rule L4 mirrors brackets whose own
+                // resolved level is odd. Purely a paint-time substitution —
+                // the cell, the clipboard and any URL match keep the
+                // original character.
+                let glyph = row_map.map_or(indexed.c, |map| {
+                    map.display_char(logical_col, indexed.c)
+                });
                 shapes.push(painter.fonts_mut(|c| {
                     // terra patch: center the glyph vertically inside the
                     // (possibly line-height-inflated) cell.
@@ -366,11 +405,97 @@ impl<'a> TerminalView<'a> {
                             y: y + pad_y,
                         },
                         Align2::CENTER_TOP,
-                        indexed.c,
+                        glyph,
                         self.font.font_type(),
                         fg,
                     )
                 }));
+            }
+        }
+
+        // terra patch: a thin vertical beam at the insertion point in the
+        // theme's cursor color, instead of upstream's full-cell filled block.
+        // The glyph keeps its own color (no fg/bg swap), so the character
+        // under the cursor stays readable.
+        //
+        // terra patch (BiDi): painted once, after the grid, rather than from
+        // inside the cell loop. Keying it off "some iterated cell's point
+        // equals the cursor point" dropped the beam altogether whenever that
+        // cell was never iterated — reachably so when the cursor is parked on
+        // the spacer column of a double-width character, which the loop skips
+        // outright. Painting it last also stops a later cell's background
+        // rect from covering a beam that the reordering put in an earlier
+        // visual column.
+        let cursor_point = content.grid.cursor.point;
+        let cursor_row =
+            cursor_point.line.0 + content.grid.display_offset() as i32;
+        let columns = content.grid.columns();
+        // The cursor lives in the active area, so scrolling back far enough
+        // takes it off screen; then there is nothing to draw.
+        if cursor_row >= 0
+            && (cursor_row as usize) < content.grid.screen_lines()
+            && columns > 0
+        {
+            // Blink: visible one interval, hidden the next; keep repainting
+            // so the phase advances. An unfocused terminal shows a steady
+            // beam instead of blinking.
+            let time = layout.ctx.input(|i| i.time);
+            let visible = !layout.has_focus()
+                || (time / CURSOR_BLINK_INTERVAL) as u64 % 2 == 0;
+            layout.ctx.request_repaint_after(
+                std::time::Duration::from_secs_f64(
+                    CURSOR_BLINK_INTERVAL - (time % CURSOR_BLINK_INTERVAL),
+                ),
+            );
+            if visible {
+                let row = &content.grid[cursor_point.line];
+                // A cursor parked on a spacer belongs to the double-width
+                // character that owns the pair, one column to its left.
+                let mut col = cursor_point.column.0.min(columns - 1);
+                if col > 0
+                    && row[Column(col)]
+                        .flags
+                        .contains(cell::Flags::WIDE_CHAR_SPACER)
+                {
+                    col -= 1;
+                }
+                let is_wide =
+                    row[Column(col)].flags.contains(cell::Flags::WIDE_CHAR);
+                // One past the row's last occupied column, counting a wide
+                // char's spacer as occupied — the same content length the
+                // BiDi pass measured for this row.
+                let content_end = (0..columns)
+                    .rposition(|column| {
+                        let grid_cell = &row[Column(column)];
+                        grid_cell.c != ' '
+                            || grid_cell
+                                .flags
+                                .contains(cell::Flags::WIDE_CHAR_SPACER)
+                    })
+                    .map_or(0, |last| last + 1);
+                let beam = bidi::beam_position(
+                    content.bidi.get(cursor_row as usize),
+                    col,
+                    is_wide,
+                    content_end,
+                );
+                let mut beam_x = layout_min.x + cell_width * beam.offset;
+                if beam.side == bidi::BeamSide::Right {
+                    // Pull the beam back inside the cell whose right edge it
+                    // marks, so it never bleeds into the next glyph.
+                    beam_x -= CURSOR_BEAM_WIDTH;
+                }
+                shapes.push(Shape::Rect(RectShape::filled(
+                    Rect::from_min_size(
+                        Pos2::new(
+                            beam_x,
+                            layout_min.y + cell_height * cursor_row as f32,
+                        ),
+                        Vec2::new(CURSOR_BEAM_WIDTH, cell_height),
+                    ),
+                    CornerRadius::default(),
+                    self.theme.cursor_color(),
+                )));
             }
         }
 
@@ -387,7 +512,7 @@ fn process_keyboard_event(
     match event {
         egui::Event::Text(text) => {
             process_text_event(&text, modifiers, backend, bindings_layout)
-        },
+        }
         egui::Event::Paste(text) => InputAction::BackendCall(
             #[cfg(not(any(target_os = "ios", target_os = "macos")))]
             if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
@@ -415,7 +540,7 @@ fn process_keyboard_event(
                 let content = backend.selectable_content();
                 InputAction::WriteToClipboard(content)
             }
-        },
+        }
         egui::Event::Key {
             key,
             pressed,
@@ -483,7 +608,7 @@ fn process_keyboard_key(
             InputAction::BackendCall(BackendCommand::Write(
                 str.as_bytes().to_vec(),
             ))
-        },
+        }
         BindingAction::Esc(seq) => InputAction::BackendCall(
             BackendCommand::Write(seq.as_bytes().to_vec()),
         ),
@@ -501,7 +626,7 @@ fn process_mouse_wheel(
         MouseWheelUnit::Line => {
             let lines = delta.y.signum() * delta.y.abs().ceil();
             InputAction::BackendCall(BackendCommand::Scroll(lines as i32))
-        },
+        }
         MouseWheelUnit::Point => {
             state.scroll_pixels -= delta.y;
             let lines = (state.scroll_pixels / font_size).trunc();
@@ -511,7 +636,7 @@ fn process_mouse_wheel(
             } else {
                 InputAction::Ignore
             }
-        },
+        }
         MouseWheelUnit::Page => InputAction::Ignore,
     }
 }
@@ -550,7 +675,9 @@ fn process_left_button(
     pressed: bool,
 ) -> InputAction {
     let terminal_mode = backend.last_content().terminal_mode;
-    if terminal_mode.intersects(TermMode::MOUSE_MODE) {
+    if terminal_mode.intersects(TermMode::MOUSE_MODE)
+        && !selection_override(modifiers)
+    {
         InputAction::BackendCall(BackendCommand::MouseReport(
             MouseButton::LeftButton,
             *modifiers,
@@ -569,6 +696,20 @@ fn process_left_button(
             modifiers,
         )
     }
+}
+
+/// terra patch: whether a mouse event should drive terra's own selection
+/// rather than being reported to the program.
+///
+/// A program that turns mouse reporting on — Claude Code, vim, tmux —
+/// swallows every click, so without an escape hatch the user can never
+/// select or copy anything on screen. Every terminal provides one: Shift is
+/// xterm's convention and Option is the macOS one, so honour both.
+///
+/// Deliberately not "any modifier": Ctrl is a modifier programs legitimately
+/// want reported with the click, and Cmd already means follow-the-link here.
+fn selection_override(modifiers: &Modifiers) -> bool {
+    modifiers.shift || modifiers.alt
 }
 
 fn process_left_button_pressed(
@@ -639,10 +780,9 @@ fn process_mouse_move(
     let terminal_content = backend.last_content();
     let cursor_x = position.x - layout.rect.min.x;
     let cursor_y = position.y - layout.rect.min.y;
-    state.current_mouse_position_on_grid = TerminalBackend::selection_point(
+    state.current_mouse_position_on_grid = backend.selection_point(
         cursor_x,
         cursor_y,
-        &terminal_content.terminal_size,
         terminal_content.grid.display_offset(),
     );
 
@@ -650,8 +790,10 @@ fn process_mouse_move(
     // Handle command or selection update based on terminal mode and modifiers
     if state.is_dragged {
         let terminal_mode = terminal_content.terminal_mode;
+        // Same rule as the press, or a drag begun with Shift/Option held
+        // would start a selection and then report motion to the program.
         let cmd = if terminal_mode.contains(TermMode::MOUSE_MOTION)
-            && modifiers.is_none()
+            && !selection_override(modifiers)
         {
             InputAction::BackendCall(BackendCommand::MouseReport(
                 MouseButton::LeftMove,
@@ -677,4 +819,34 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod selection_override_tests {
+    use super::selection_override;
+    use egui::Modifiers;
+
+    /// With no modifier the program owns the mouse — that is the whole point
+    /// of it having enabled reporting.
+    #[test]
+    fn a_bare_click_still_goes_to_the_program() {
+        assert!(!selection_override(&Modifiers::NONE));
+    }
+
+    /// Shift is xterm's bypass, Option is the macOS one. Both must work, or
+    /// text on screen is unreachable while any TUI is running.
+    #[test]
+    fn shift_or_option_hands_the_mouse_back_to_the_terminal() {
+        assert!(selection_override(&Modifiers::SHIFT));
+        assert!(selection_override(&Modifiers::ALT));
+        assert!(selection_override(&Modifiers::SHIFT.plus(Modifiers::ALT)));
+    }
+
+    /// Ctrl is a modifier programs want reported alongside the click, and
+    /// Cmd already means follow-the-link, so neither may steal the event.
+    #[test]
+    fn ctrl_and_command_are_left_to_their_existing_meanings() {
+        assert!(!selection_override(&Modifiers::CTRL));
+        assert!(!selection_override(&Modifiers::COMMAND));
+    }
 }

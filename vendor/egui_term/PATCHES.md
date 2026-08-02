@@ -27,3 +27,113 @@
    cursor is a 2px vertical beam at the cell's left edge, painted in the new
    `ColorPalette::cursor_color` (`TerminalTheme::cursor_color()`, default
    #98989d), and the glyph underneath is drawn in its own color with no swap.
+
+4. bidi.rs (new) + backend/mod.rs + view.rs: UAX #9 BiDi Level 1 — right-to-
+   left text is reordered for display. Upstream painted logical column `n` at
+   `x = n * cell_width` unconditionally, so Hebrew and Arabic rendered
+   mirrored.
+
+   `bidi.rs` is a pure module (no egui, no alacritty): `map_row(&[char]) ->
+   RowMap` computes one row's logical↔visual permutation using
+   `unicode-bidi`'s `ParagraphBidiInfo`, applying rules L1 (trailing-
+   whitespace reset), L2 (reordering) and L4 (bracket mirroring — which
+   `unicode-bidi` documents as out of scope and leaves to the caller).
+
+   The base direction is chosen per row by `BidiBase` (`[text] bidi_base`,
+   default `auto`). Two refinements make autodetection safe in a terminal:
+
+   * Detection and reordering run over the row's **non-blank prefix only**.
+     A terminal row is padded to the full column count; let that padding into
+     the paragraph and rule L2 drags it into the reversed run, pushing a
+     four-letter Hebrew word out to column 76 of an 80-column row.
+   * Under `auto`, the row's **leading chrome is held out of the paragraph**
+     — the run before the first strong letter, i.e. `⏺` bullets, `❯`
+     prompts, `│`/`⎿` box drawing, indentation. Rule P2 skips past those to
+     the first strong character, so one Hebrew line would turn the whole row
+     RTL and sweep the chrome to the right margin; a bulleted list would have
+     its bullets on different sides depending on each item's language. The
+     Unicode answer is for the application to wrap its text in U+2068 FSI.
+     Terminal applications do not, so terra does it for them.
+
+   `ltr` is available for anyone who wants the old provably-immobile
+   behaviour, at the cost of stranding RTL sentence punctuation on the wrong
+   side. Historical note on why `ltr` was the original default: A
+   terminal row is an addressable cell array, not a paragraph: with
+   autodetection a row's visual origin depends on its content, so typing one
+   Hebrew character at a prompt teleports the whole row — prompt included —
+   to the right margin, because the row's trailing blanks join the reversed
+   run. Applications that want an RTL paragraph can still say so explicitly
+   with RLM/RLE/RLI, which are honoured.
+
+   The map is computed in `TerminalBackend::sync` (not in the view) and
+   stored on `RenderableContent::bidi`, because the renderer and the
+   hit-tester must agree exactly — `selection_point` cannot see anything the
+   paint loop computes, and two derivations of one permutation would be free
+   to drift. Rows with no RTL text take an identity fast path that allocates
+   nothing (one integer compare per cell), which is every row of ordinary
+   output.
+
+   Consumers: `view.rs` maps the logical column to a visual one for `x`,
+   anchors a wide char/spacer pair at its leftmost visual column, puts the
+   cursor beam on the visual *right* edge inside an RTL run, and applies L4
+   to the painted glyph only. `backend::selection_point` inverts the map so
+   clicks land on the right cell, and `selection_side` flips Left/Right
+   inside an RTL run — without that, every RTL selection is off by one at
+   both ends. `selectable_content` is deliberately untouched: the clipboard
+   stays logical and unmirrored.
+
+   `TerminalView::set_bidi(bool)` drives it per frame (terra's `[text] bidi`
+   config key, ⇧⌘B). Not covered: Arabic contextual shaping — Arabic is
+   ordered correctly but renders as isolated letterforms — and combining
+   marks, which upstream never drew.
+
+## The cursor beam under BiDi
+
+The beam marks an *insertion point*, not a cell, so under reordering it has to
+be placed on the side new text grows from. `bidi::beam_position` is the whole
+decision, as a pure function of the row's map, the cursor's column, whether
+that column holds a double-width character, and where the row's content ends;
+`view.rs` only multiplies its answer by the cell width. Three cases:
+
+1. **The cursor's own cell reads right-to-left.** Text grows leftwards, so the
+   insertion point is the cell's visual **right** edge — the side the previous
+   character is on. For a double-width character the edge belongs to the pair
+   (`visual_span_start + 2`), never the seam down the middle of the glyph.
+2. **The cursor is past the row's content and the row ends in a right-to-left
+   run.** This is the case that fires on every keystroke while typing Hebrew or
+   Arabic, and it cannot be decided from the cursor's own cell: that cell is
+   blank padding, which rule L1 resets to the base level, so it claims to read
+   left-to-right and the beam lands to the *right* of the word — the end it
+   started from. The next character joins the trailing run, and a run grows
+   from its visual left end, so the beam goes at the **leftmost visual column
+   of that run**. Taking the minimum over the whole run, rather than reading
+   `visual_of(cursor - 1)`, is what makes this right when L2 has reordered
+   something inside the run and what keeps the answer stable when the user
+   typed a space and the cursor is no longer adjacent to the text.
+3. **Anything else** — the cell's visual **left** edge, which is the ordinary
+   left-to-right beam. With BiDi off the map is `None`, every row is this case,
+   and the answer is the plain logical column: the default configuration is
+   bit-for-bit what it was before any of this existed.
+
+Two fixes came out of auditing that path:
+
+* Deciding case 2 on "the character before the cursor is right-to-left" alone
+  also fired for a cursor sitting on a blank *inside* the row, or on a Latin
+  letter wedged between two Hebrew ones, and dragged the beam back to the run's
+  left edge — the reported "cursor in the middle of the Hebrew". The
+  `content_end` argument is what distinguishes a blank inside the line, which
+  is a real cell with a real position, from padding past the end of it.
+* The beam used to be painted from inside the cell loop, when an iterated
+  cell's point happened to equal the cursor's. A cursor parked on the spacer
+  column of a double-width character then got **no beam at all**, because the
+  loop skips spacers outright. It is now painted once after the loop, from the
+  cursor point itself, with a spacer resolved back to the character that owns
+  the pair; the row is drawn only when it is inside the viewport, which is what
+  the old coupling gave for free. Painting last also stops a later cell's
+  background rect from covering a beam that the reordering put in an earlier
+  visual column.
+
+Known limitation: a row that *ends* in digits or Latin inside a right-to-left
+paragraph (`שלום 123`) puts the beam at the cursor's own column, to the right
+of the Hebrew, rather than after the digits where the next character will
+appear. Case 2 only recognises a trailing right-to-left run.

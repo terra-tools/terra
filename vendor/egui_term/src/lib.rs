@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments, clippy::manual_is_multiple_of)]
 
 mod backend;
+mod bidi;
 mod bindings;
 mod font;
 mod theme;
@@ -10,6 +11,7 @@ mod view;
 
 pub use backend::settings::BackendSettings;
 pub use backend::{BackendCommand, PtyEvent, TerminalBackend, TerminalMode};
+pub use bidi::{BidiBase, RowMap};
 pub use bindings::{Binding, BindingAction, InputKind, KeyboardBinding};
 pub use font::{FontSettings, TerminalFont};
 pub use theme::{ColorPalette, TerminalTheme};

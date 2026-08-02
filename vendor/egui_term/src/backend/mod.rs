@@ -1,5 +1,6 @@
 pub mod settings;
 
+use crate::bidi::{self, BidiBase, RowMap};
 use crate::types::Size;
 use alacritty_terminal::event::{
     Event, EventListener, Notify, OnResize, WindowSize,
@@ -15,10 +16,12 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
+use alacritty_terminal::vte::ansi::Rgb;
 use alacritty_terminal::{tty, Grid};
 use egui::Modifiers;
 use settings::BackendSettings;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::cmp::min;
 use std::io::Result;
 use std::ops::{Index, RangeInclusive};
@@ -138,11 +141,24 @@ pub struct TerminalBackend {
     pty_id: u32,
     /// terra patch: whether this tab is currently rendered (see set_visible).
     visible: Arc<std::sync::atomic::AtomicBool>,
+    /// terra patch: colours reported for OSC 4/10/11/12 queries.
+    reported_colors: Arc<FairMutex<Option<Vec<Rgb>>>>,
     url_regex: RegexSearch,
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
     notifier: Notifier,
     last_content: RenderableContent,
+    /// terra patch: the last focus state reported to the program, so a
+    /// report is sent on change rather than every frame. `None` means the
+    /// program is not asking (mode 1004 off), which also makes re-enabling
+    /// the mode re-send the current state.
+    reported_focus: Option<bool>,
+    /// terra patch: whether to run the BiDi pass (see [`Self::set_bidi`]).
+    bidi_enabled: bool,
+    /// Paragraph direction the BiDi pass resolves each row against.
+    bidi_base: BidiBase,
+    /// Reused row buffer so the BiDi pass allocates nothing after frame one.
+    bidi_scratch: Vec<char>,
 }
 
 impl TerminalBackend {
@@ -152,9 +168,24 @@ impl TerminalBackend {
         pty_event_proxy_sender: Sender<(u64, PtyEvent)>,
         settings: BackendSettings,
     ) -> Result<Self> {
+        // terra patch: identify the terminal to the programs running in it.
+        //
+        // Without this the child inherits whatever launched terra — start it
+        // from a VS Code terminal and every program inside believes it is
+        // running in VS Code. Programs branch on these, so leaking the
+        // launcher's identity makes terra behave like a different terminal
+        // depending on how it was started, which is both wrong and
+        // impossible to reproduce.
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert("TERM_PROGRAM".into(), "terra".into());
+        env.insert(
+            "TERM_PROGRAM_VERSION".into(),
+            env!("CARGO_PKG_VERSION").into(),
+        );
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(settings.shell, settings.args)),
             working_directory: settings.working_directory,
+            env,
             ..tty::Options::default()
         };
         let config = term::Config::default();
@@ -181,6 +212,7 @@ impl TerminalBackend {
             terminal_size,
             cursor: term.grid_mut().cursor_cell().clone(),
             hovered_hyperlink: None,
+            bidi: Vec::new(),
         };
         let term = Arc::new(FairMutex::new(term));
         let pty_event_loop =
@@ -194,6 +226,10 @@ impl TerminalBackend {
         // switch janky. The flag is flipped by TerminalBackend::set_visible.
         let visible = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let visible_in_thread = visible.clone();
+        // terra patch: the palette a program sees when it asks (OSC 4/10/11/12).
+        // Filled in by the view, which is the only thing that knows the theme.
+        let reported_colors: Arc<FairMutex<Option<Vec<Rgb>>>> = Arc::new(FairMutex::new(None));
+        let colors_in_thread = reported_colors.clone();
         let _pty_event_subscription = std::thread::Builder::new()
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
@@ -211,6 +247,25 @@ impl TerminalBackend {
                     match event {
                         Event::Exit => break,
                         Event::PtyWrite(pty) => pty_notifier.notify(pty.into_bytes()),
+                        // terra patch: answer colour queries.
+                        //
+                        // Programs ask what the terminal's foreground and
+                        // background actually are so they can derive a shade
+                        // that contrasts with it — Codex computes its
+                        // composer background this way. A terminal that
+                        // stays silent gets no styling at all, which looks
+                        // like a missing feature rather than an unanswered
+                        // question. alacritty hands us the index and a
+                        // formatter; all we owe it is the colour.
+                        Event::ColorRequest(index, format) => {
+                            let rgb = colors_in_thread
+                                .lock()
+                                .as_ref()
+                                .and_then(|table| table.get(index).copied());
+                            if let Some(rgb) = rgb {
+                                pty_notifier.notify(format(rgb).into_bytes());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -224,7 +279,12 @@ impl TerminalBackend {
             size: terminal_size,
             notifier,
             visible,
+            reported_colors,
             last_content: initial_content,
+            reported_focus: None,
+            bidi_enabled: true,
+            bidi_base: BidiBase::default(),
+            bidi_scratch: Vec::new(),
         })
     }
 
@@ -235,41 +295,54 @@ impl TerminalBackend {
             BackendCommand::Write(input) => {
                 self.write(input);
                 term.scroll_display(Scroll::Bottom);
-            },
+            }
             BackendCommand::Scroll(delta) => {
                 self.scroll(&mut term, delta);
-            },
+            }
             BackendCommand::Resize(layout_size, font_size) => {
                 self.resize(&mut term, layout_size, font_size);
-            },
+            }
             BackendCommand::SelectStart(selection_type, x, y) => {
                 self.start_selection(&mut term, selection_type, x, y);
-            },
+            }
             BackendCommand::SelectUpdate(x, y) => {
                 self.update_selection(&mut term, x, y);
-            },
+            }
             BackendCommand::ProcessLink(link_action, point) => {
                 self.process_link_action(&term, link_action, point);
-            },
+            }
             BackendCommand::MouseReport(button, modifiers, point, pressed) => {
                 self.process_mouse_report(button, modifiers, point, pressed);
-            },
+            }
         };
     }
 
+    /// Pixel position -> **logical** grid point.
+    ///
+    /// terra patch: the x pixel names a *visual* column, so the row's BiDi
+    /// map has to convert it back before the point reaches alacritty, which
+    /// only ever speaks logical coordinates. The map used is last frame's —
+    /// deliberately, because a click describes pixels the user actually saw,
+    /// not a layout that may have scrolled out from under it.
     pub fn selection_point(
+        &self,
         x: f32,
         y: f32,
-        terminal_size: &TerminalSize,
         display_offset: usize,
     ) -> Point {
-        let col = (x as usize) / (terminal_size.cell_width as usize);
-        let col = min(Column(col), Column(terminal_size.num_cols as usize - 1));
+        let (vline, vcol) = self.visual_cell_at(x, y);
+        let col = self.row_map(vline).logical_of(vcol);
+        let col = min(Column(col), Column(self.size.num_cols as usize - 1));
+        viewport_to_point(display_offset, Point::new(vline, col))
+    }
 
-        let line = (y as usize) / (terminal_size.cell_height as usize);
-        let line = min(line, terminal_size.num_lines as usize - 1);
-
-        viewport_to_point(display_offset, Point::new(line, col))
+    /// Pixel position -> (visible row, **visual** column), both clamped.
+    fn visual_cell_at(&self, x: f32, y: f32) -> (usize, usize) {
+        let col = (x as usize) / (self.size.cell_width as usize);
+        let col = min(col, self.size.num_cols as usize - 1);
+        let line = (y as usize) / (self.size.cell_height as usize);
+        let line = min(line, self.size.num_lines as usize - 1);
+        (line, col)
     }
 
     pub fn selectable_content(&self) -> String {
@@ -299,7 +372,127 @@ impl TerminalBackend {
         self.last_content.cursor = cursor.clone();
         self.last_content.terminal_mode = *terminal.mode();
         self.last_content.terminal_size = self.size;
+        drop(terminal);
+        self.sync_bidi();
         self.last_content()
+    }
+
+    /// terra patch: recompute the visual order of every visible row.
+    ///
+    /// Runs against the grid snapshot `sync` just took, so the map and the
+    /// cells it describes can never be a frame apart. Rows of ordinary
+    /// output hit [`bidi::map_row`]'s identity fast path and allocate
+    /// nothing, so the usual cost is one integer compare per cell — far less
+    /// than the grid clone happening just above.
+    fn sync_bidi(&mut self) {
+        self.last_content.bidi.clear();
+        if !self.bidi_enabled {
+            return;
+        }
+
+        let display_offset = self.last_content.grid.display_offset() as i32;
+        let cols = self.size.columns();
+        let rows = self.size.screen_lines();
+        let bottom = self.last_content.grid.bottommost_line();
+
+        for vline in 0..rows {
+            let line = Line(-display_offset + vline as i32);
+            if line > bottom {
+                break;
+            }
+            let row = &self.last_content.grid[line];
+            self.bidi_scratch.clear();
+            self.bidi_scratch.reserve(cols);
+            let mut col = 0;
+            while col < cols {
+                let grid_cell = &row[Column(col)];
+                self.bidi_scratch.push(grid_cell.c);
+                // A wide char spans two columns. Push it twice rather than
+                // pushing the spacer's blank: identical characters mean
+                // identical Bidi classes, hence identical levels, hence a
+                // pair L2 can never split across a run boundary.
+                let wide =
+                    grid_cell.flags.contains(term::cell::Flags::WIDE_CHAR);
+                if wide && col + 1 < cols {
+                    self.bidi_scratch.push(grid_cell.c);
+                    col += 1;
+                }
+                col += 1;
+            }
+            let map = bidi::map_row(&self.bidi_scratch, self.bidi_base);
+            self.last_content.bidi.push(map);
+        }
+    }
+
+    /// terra patch: whether the colour table still needs filling in.
+    ///
+    /// The theme lives in the view, so the view supplies it — but only once,
+    /// which keeps a 259-entry table off the per-frame path.
+    pub fn wants_colors(&self) -> bool {
+        self.reported_colors.lock().is_none()
+    }
+
+    /// terra patch: the palette to answer colour queries from.
+    ///
+    /// Indices follow alacritty's table: 0..=255 are the ANSI palette, then
+    /// foreground, background and cursor.
+    pub fn set_reported_colors(&self, colors: Vec<Rgb>) {
+        *self.reported_colors.lock() = Some(colors);
+    }
+
+    /// terra patch: report window focus to the program (DECSET 1004).
+    ///
+    /// Programs that enable focus reporting — Codex does, and it is what
+    /// draws its composer highlight — assume the terminal is *unfocused*
+    /// until told otherwise. Never sending the report leaves them rendering
+    /// a permanently-blurred UI, which looks like a missing background
+    /// rather than a missing escape sequence.
+    pub fn set_focused(&mut self, focused: bool) {
+        let enabled = self.last_content.terminal_mode.contains(TermMode::FOCUS_IN_OUT);
+        let Some(report) = focus_report(enabled, focused, self.reported_focus)
+        else {
+            if !enabled {
+                self.reported_focus = None;
+            }
+            return;
+        };
+        self.reported_focus = Some(report);
+        // CSI I on focus in, CSI O on focus out.
+        let seq: &[u8] = if report { b"\x1b[I" } else { b"\x1b[O" };
+        self.notifier.notify(seq.to_vec());
+    }
+
+    /// terra patch: turn BiDi reordering on or off for this tab.
+    ///
+    /// Disabling clears the maps, so every accessor falls back to the
+    /// identity and both the renderer and the hit-tester return to logical
+    /// order in the same frame.
+    pub fn set_bidi(&mut self, enabled: bool) {
+        if self.bidi_enabled != enabled {
+            self.bidi_enabled = enabled;
+            self.last_content.bidi.clear();
+        }
+    }
+
+    /// terra patch: choose the paragraph direction rows resolve against.
+    ///
+    /// Clearing the maps on a change means the very next paint uses the new
+    /// base, rather than one stale frame in the old one.
+    pub fn set_bidi_base(&mut self, base: BidiBase) {
+        if self.bidi_base != base {
+            self.bidi_base = base;
+            self.last_content.bidi.clear();
+        }
+    }
+
+    /// The visual order of the visible row at `vline`, or the identity when
+    /// BiDi is off or the row is past the end of the viewport.
+    fn row_map(&self, vline: usize) -> RowMap {
+        self.last_content
+            .bidi
+            .get(vline)
+            .cloned()
+            .unwrap_or(RowMap::Identity(self.size.columns()))
     }
 
     pub fn last_content(&self) -> &RenderableContent {
@@ -334,13 +527,13 @@ impl TerminalBackend {
                     point,
                     &mut self.url_regex.clone(),
                 );
-            },
+            }
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
-            },
+            }
             LinkAction::Open => {
                 self.open_link();
-            },
+            }
         };
     }
 
@@ -384,7 +577,7 @@ impl TerminalBackend {
         match MouseMode::from(self.last_content().terminal_mode) {
             MouseMode::Sgr => {
                 self.sgr_mouse_report(point, button as u8 + mods, pressed)
-            },
+            }
             MouseMode::Normal(is_utf8) => {
                 if pressed {
                     self.normal_mouse_report(
@@ -395,7 +588,7 @@ impl TerminalBackend {
                 } else {
                     self.normal_mouse_report(point, 3 + mods, is_utf8)
                 }
-            },
+            }
         }
     }
 
@@ -452,16 +645,12 @@ impl TerminalBackend {
         x: f32,
         y: f32,
     ) {
-        let location = Self::selection_point(
-            x,
-            y,
-            &self.size,
-            terminal.grid().display_offset(),
-        );
+        let location =
+            self.selection_point(x, y, terminal.grid().display_offset());
         terminal.selection = Some(Selection::new(
             selection_type,
             location,
-            self.selection_side(x),
+            self.selection_side(x, y),
         ));
     }
 
@@ -472,18 +661,32 @@ impl TerminalBackend {
         y: f32,
     ) {
         let display_offset = terminal.grid().display_offset();
+        let location = self.selection_point(x, y, display_offset);
+        let side = self.selection_side(x, y);
         if let Some(ref mut selection) = terminal.selection {
-            let location =
-                Self::selection_point(x, y, &self.size, display_offset);
-            selection.update(location, self.selection_side(x));
+            selection.update(location, side);
         }
     }
 
-    fn selection_side(&self, x: f32) -> Side {
+    /// Which side of a cell the pointer is on, in **logical** terms.
+    ///
+    /// terra patch: `Side` is what alacritty's `Selection` uses to decide
+    /// whether the anchor cell is itself inside the range, so it is logical —
+    /// but the pointer offset producing it is visual. Inside an RTL run the
+    /// two are mirrored, and skipping the flip costs an off-by-one at *both*
+    /// ends of every RTL selection: a zero-drag click on the left half of a
+    /// Hebrew glyph selects one character instead of clearing the selection,
+    /// and dragging makes the boundary cell flicker in and out.
+    fn selection_side(&self, x: f32, y: f32) -> Side {
         let cell_x = x as usize % self.size.cell_width as usize;
         let half_cell_width = (self.size.cell_width as f32 / 2.0) as usize;
+        let visual_right = cell_x > half_cell_width;
 
-        if cell_x > half_cell_width {
+        let (vline, vcol) = self.visual_cell_at(x, y);
+        let map = self.row_map(vline);
+        let is_rtl = map.is_rtl(map.logical_of(vcol));
+
+        if visual_right != is_rtl {
             Side::Right
         } else {
             Side::Left
@@ -582,6 +785,23 @@ fn visible_regex_match_iter<'a>(
         .take_while(move |rm| rm.start().line <= viewport_end)
 }
 
+/// What focus state to report, or `None` when there is nothing to send.
+///
+/// Reporting only on change keeps the PTY quiet, but the mode is typically
+/// enabled *after* the window already has focus — so enabling it must also
+/// produce a report, which falls out of resetting `last` to `None` whenever
+/// the mode is off.
+fn focus_report(
+    mode_enabled: bool,
+    focused: bool,
+    last: Option<bool>,
+) -> Option<bool> {
+    if !mode_enabled || last == Some(focused) {
+        return None;
+    }
+    Some(focused)
+}
+
 pub struct RenderableContent {
     pub grid: Grid<Cell>,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
@@ -589,6 +809,15 @@ pub struct RenderableContent {
     pub cursor: Cell,
     pub terminal_mode: TermMode,
     pub terminal_size: TerminalSize,
+    /// terra patch: one BiDi map per *visible* row, index 0 being the
+    /// topmost visible row. Rebuilt by every [`TerminalBackend::sync`].
+    ///
+    /// It lives here, rather than being recomputed in the view, because the
+    /// renderer and the hit-tester must agree exactly. `selection_point` has
+    /// no access to anything the paint loop computes, and two independent
+    /// derivations of one permutation would be free to drift — which shows
+    /// up only as clicks landing a cell off, and only on RTL rows.
+    pub bidi: Vec<RowMap>,
 }
 
 impl Default for RenderableContent {
@@ -597,6 +826,7 @@ impl Default for RenderableContent {
             grid: Grid::new(0, 0, 0),
             hovered_hyperlink: None,
             selectable_range: None,
+            bidi: Vec::new(),
             cursor: Cell::default(),
             terminal_mode: TermMode::empty(),
             terminal_size: TerminalSize::default(),
@@ -616,5 +846,34 @@ pub struct EventProxy(mpsc::Sender<Event>);
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let _ = self.0.send(event.clone());
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::focus_report;
+
+    /// A program that has not asked for focus reports must never be sent
+    /// one — the bytes would land in its input stream as garbage.
+    #[test]
+    fn nothing_is_reported_while_the_mode_is_off() {
+        assert_eq!(focus_report(false, true, None), None);
+        assert_eq!(focus_report(false, false, Some(true)), None);
+    }
+
+    /// The mode is enabled *after* the window already has focus, so enabling
+    /// it has to produce a report. This is the case that made Codex render a
+    /// permanently-unfocused composer.
+    #[test]
+    fn enabling_the_mode_reports_the_current_state() {
+        assert_eq!(focus_report(true, true, None), Some(true));
+        assert_eq!(focus_report(true, false, None), Some(false));
+    }
+
+    #[test]
+    fn only_changes_are_reported() {
+        assert_eq!(focus_report(true, true, Some(true)), None);
+        assert_eq!(focus_report(true, false, Some(true)), Some(false));
+        assert_eq!(focus_report(true, true, Some(false)), Some(true));
     }
 }

@@ -1,0 +1,4 @@
+# Vendored code keeps upstream's narrower width, so `cargo fmt --all` at the
+# workspace root does not reflow every untouched line and bury terra's patches
+# in churn. Upstream egui_term is formatted at 80 columns.
+max_width = 80
