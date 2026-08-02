@@ -38,12 +38,11 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 /// terminal card reads as a separate object floating on it.
 pub const DEFAULT_BG: (Rgb, Rgb) = (Rgb(0xa8, 0x9b, 0xf2), Rgb(0xdc, 0xc9, 0xf2));
 
-/// The window dots. ray.so-style: three identical muted grey discs rather
-/// than the literal red/amber/green — decoration, not controls.
+/// macOS window controls, in the order they appear.
 const TRAFFIC_LIGHTS: [Rgb; 3] = [
-    Rgb(0x56, 0x51, 0x60),
-    Rgb(0x56, 0x51, 0x60),
-    Rgb(0x56, 0x51, 0x60),
+    Rgb(0xff, 0x5f, 0x57),
+    Rgb(0xfe, 0xbc, 0x2e),
+    Rgb(0x28, 0xc8, 0x40),
 ];
 
 /// A decoded image: 8-bit RGBA, row major, no padding.
