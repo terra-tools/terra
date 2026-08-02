@@ -3,6 +3,9 @@ name = "terra-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Shown by the OS installers (deb control file, msi/nsis metadata). The GUI
+# binary stays terra-app; "Terra" is the product name users see.
+description = "Terra — a terminal your agents can drive"
 
 [[bin]]
 name = "terra-app"
@@ -57,7 +60,7 @@ windows-sys = { version = "0.61", features = [
 # `cargo packager -p terra-app --release` — cross-platform bundles
 # (.app/.dmg on macOS, nsis/msi on Windows, deb/appimage on Linux).
 [package.metadata.packager]
-product-name = "terra"
+product-name = "Terra"
 identifier = "dev.terra.app"
 # no `version` here on purpose — cargo-packager inherits [package] version,
 # which is workspace-inherited. Typing it twice lets the bundle and the binary
@@ -65,9 +68,13 @@ identifier = "dev.terra.app"
 category = "DeveloperTool"
 icons = [
   "assets/icon/terra.icns",
+  "assets/icon/terra.ico",
   "assets/icon/terra-256.png",
   "assets/icon/terra-512.png",
 ]
+# The default formats for a bare `cargo packager` run (i.e. `just bundle` on a
+# Mac). CI overrides per platform with `--formats` — nsis on Windows, deb on
+# Linux (see .github/workflows/release.yml).
 formats = ["app", "dmg"]
 
 [package.metadata.packager.macos]

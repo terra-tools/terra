@@ -8,7 +8,7 @@ just t <args>        # CLI against the dev app, e.g. `just t ls`
 just pre-commit      # fmt + clippy + tests
 just log             # tail /tmp/terra-app.log
 just bundle          # release build + cargo-packager (.app / .dmg)
-just upgrade         # replace /Applications/terra.app and relaunch it
+just upgrade         # replace /Applications/Terra.app and relaunch it
 ```
 
 ## Dev instance vs daily instance

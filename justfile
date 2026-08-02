@@ -8,11 +8,11 @@ set quiet
 # is what lets it open beside the terra you actually work in all day — and it is
 # also what puts " (dev)" in its title bar (see `dev_suffix` in
 # crates/terra-app/src/main.rs). Nothing in the code changes: plain `terra` and
-# /Applications/terra.app still use the default socket.
+# /Applications/Terra.app still use the default socket.
 dev-socket := env('HOME', '/tmp') / '.terra/terra-dev.sock'
 
 # Pattern that matches the dev app and *only* the dev app. The installed build
-# runs from `terra.app/Contents/MacOS/terra-app`, so it can never match this.
+# runs from `Terra.app/Contents/MacOS/terra-app`, so it can never match this.
 dev-pattern := 'target/debug/terra-app'
 
 default:
@@ -70,65 +70,19 @@ bundle: release
 # Ad-hoc signatures (`--sign -`) are per-build hashes: every upgrade looks
 # like a brand-new app and re-prompts for Downloads/Music/etc.
 setup-signing:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if security find-identity -v -p codesigning | grep -q terra-dev; then
-        echo "terra-dev identity already exists"; exit 0
-    fi
-    tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"' EXIT
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-        -subj "/CN=terra-dev" \
-        -addext "keyUsage=digitalSignature" \
-        -addext "extendedKeyUsage=codeSigning" \
-        -keyout "$tmp/key.pem" -out "$tmp/cert.pem"
-    openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
-        -passout pass:terra -out "$tmp/terra-dev.p12"
-    security import "$tmp/terra-dev.p12" -P terra -T /usr/bin/codesign
-    echo "terra-dev identity created. macOS may show one keychain prompt on the"
-    echo "next 'just upgrade' — choose Always Allow. Permissions will then"
-    echo "survive upgrades (one final round of TCC prompts, then never again)."
+    uv run scripts/release/setup_signing.py
 
 # Bundle + sign + install to /Applications and the CLI to bin, e.g. `just install 1 ~/.local/bin`.
 # Signs with the stable terra-dev identity when present (see setup-signing),
 # else falls back to ad-hoc.
 install force="" bin="/usr/local/bin":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    dest=/Applications/terra.app
-    if [ -e "$dest" ] && [ -z "{{force}}" ]; then
-        echo "$dest already exists. Re-run as 'just install 1' to replace it." >&2
-        exit 1
-    fi
-    just bundle
-    identity=$(security find-identity -v -p codesigning \
-        | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')
-    if [ -z "$identity" ] && security find-identity -v -p codesigning | grep -q terra-dev; then
-        identity=terra-dev
-    fi
-    if [ -n "$identity" ]; then
-        echo "signing with: $identity"
-        codesign --force --deep --options runtime --sign "$identity" target/release/terra.app
-    else
-        echo "note: signing ad-hoc; run 'just setup-signing' once to stop macOS" >&2
-        echo "      re-asking for folder permissions after every upgrade" >&2
-        codesign --force --deep --sign - target/release/terra.app
-    fi
-    # Deliberate: the bundle being replaced has to let go of the app first. The
-    # pattern is bundle-only, so `just run`'s dev instance keeps running.
-    pkill -f 'terra.app/Contents/MacOS/terra-app' 2>/dev/null || true
-    rm -rf "$dest"
-    cp -R target/release/terra.app "$dest"
-    xattr -dr com.apple.quarantine "$dest" 2>/dev/null || true
-    install -m 755 target/release/terra "{{bin}}/terra" 2>/dev/null \
-        || sudo install -m 755 target/release/terra "{{bin}}/terra"
-    echo "installed $dest and {{bin}}/terra — first launch: right-click the app -> Open"
+    uv run scripts/release/install.py '{{force}}' '{{bin}}'
 
 # Replace the installed app with a fresh build and relaunch it.
 # Closes the running daily instance (its tabs die) — run when you're done for the iteration.
 upgrade:
     just install 1
-    open /Applications/terra.app
+    open /Applications/Terra.app
     echo "terra upgraded and relaunched"
 
 # Remove build artifacts

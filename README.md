@@ -1,35 +1,57 @@
-# terra 🌱
+<div align="center">
 
-A GUI terminal with browser-style tabs and a remote-control CLI — tmux
-ergonomics in a Ghostty-like window, built for watching (and driving) coding
-agents. Any process can open a tab, type into it, and read it back while you
-watch the same tabs live.
+<a href="https://terra-tools.github.io/terra/">
+  <img src="crates/terra-app/assets/icon/terra.svg" width="76" alt="Terra">
+</a>
 
-## Quick start
+<h1>Terra</h1>
+
+<p>
+  <b>A terminal your agents can drive.</b><br>
+  Browser-style tabs in a clean, dark window. Your coding agent opens tabs, types into them and reads them back — while you watch the same tabs live.
+</p>
+
+<p>
+  <a href="https://terra-tools.github.io/terra/"><img alt="Website" src="https://img.shields.io/badge/website-terra--tools.github.io-1d4ed8?style=flat-square"></a>
+  <a href="https://github.com/terra-tools/terra/releases"><img alt="Download" src="https://img.shields.io/badge/download-macOS%20%7C%20Windows%20%7C%20Linux-1d4ed8?style=flat-square"></a>
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-1d4ed8?style=flat-square">
+</p>
+
+</div>
+
+## Install
+
+**[Download for your platform →](https://terra-tools.github.io/terra/#install)**
+
+macOS and Linux, from a terminal:
 
 ```sh
-just restart          # build + launch the app
-just t learn          # the CLI teaches agents (and you) everything else
+curl -fsSL https://terra-tools.github.io/terra/install.sh | sh
 ```
 
-```sh
-id=$(terra new --title "tests")               # open a tab
-terra send "$id" "cargo test{Enter}" --keys   # type into it ({C-c}, {Tab}, {Up}, …)
-terra send "$id" "$(cat patch.txt)"           # no --keys: text goes in literally
-terra capture "$id"                           # read its screen
-terra capture "$id" --cells                   # …or as JSON, with colours and cursor
-```
+Installers are on the [releases page](https://github.com/terra-tools/terra/releases)
+too: `.dmg` on macOS, `-setup.exe` on Windows, `.deb` on Linux. Not signed yet —
+macOS: right-click → Open on first launch; Windows: click through SmartScreen.
 
-Also: `terra bidi <tab> off|on|auto` (right-to-left reordering, per tab),
-`terra doctor` (what the terminal you're in advertises) and `terra record`
-(both directions of a program's terminal I/O) — the last two work in any
-terminal, so their output diffs. Settings live in `~/.terra/config.toml`
-([template](docs/config.example.toml)).
+## Why
+
+Agents run long commands somewhere you cannot see. Terra gives them a real
+window instead: every command lands in a tab you can watch, scroll back and
+take over at any moment. Nothing is hidden in a log file, and nothing needs a
+second terminal multiplexer on top.
+
+- **Tabs, not panes.** Titles, icons and `⌘1`–`⌘9`, the way a browser does it.
+- **Driveable.** Anything on your machine can open a tab, send keystrokes and
+  read the screen back.
+- **Yours.** Free, open source and local — no account, no telemetry.
 
 ## Docs
 
-- [docs/AGENTS.md](docs/AGENTS.md) — copy-paste block for your CLAUDE.md / AGENTS.md so agents run their commands in visible terra tabs
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — design, crate layout, wire protocol, CLI contract
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — building, tasks, packaging, project conventions
+- [Using Terra with agents](docs/AGENTS.md) — the block to paste into your CLAUDE.md or AGENTS.md
+- [Architecture](docs/ARCHITECTURE.md) — how the app, the CLI and the protocol fit together
+- [Development](docs/DEVELOPMENT.md) — building, testing and packaging from source
+- [Configuration](docs/config.example.toml) — the settings file in `~/.terra/config.toml`
 
-MIT.
+## License
+
+MIT
