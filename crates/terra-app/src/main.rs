@@ -202,7 +202,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([480.0, 320.0])
-            .with_title(format!("terra{}", dev_mark()))
+            .with_title(format!("Terra{}", dev_mark()))
             .with_icon(app_icon()),
         ..Default::default()
     };
@@ -336,7 +336,7 @@ impl App {
             .as_ref()
             .and_then(|tabs| lock(tabs).infos().into_iter().find(|i| i.active))
             .map(|i| i.title)
-            .unwrap_or_else(|| "terra".to_string());
+            .unwrap_or_else(|| "Terra".to_string());
         if title == self.last_window_title {
             return; // nothing moved — don't stat the disk on every frame
         }

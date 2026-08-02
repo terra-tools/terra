@@ -11,7 +11,7 @@ export function Footer() {
         <div className="flex items-center gap-3">
           <Logo className="size-8 rounded-lg" />
           <div>
-            <p className="text-sm font-medium text-white">terra</p>
+            <p className="text-sm font-medium text-white">Terra</p>
             <p className="text-xs text-ink-500">{t('footer.tagline')}</p>
           </div>
         </div>

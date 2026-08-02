@@ -18,7 +18,7 @@ export function CopyLine({ command }: { command: string }) {
 
   return (
     <div className="flex items-center gap-3 rounded-lg bg-tile-300/80 px-4 py-3 ring-1 ring-white/10">
-      <code className="min-w-0 flex-1 overflow-x-auto font-mono text-[13px] whitespace-pre text-ink-100">
+      <code className="min-w-0 flex-1 overflow-x-auto font-mono text-[13px] whitespace-pre text-ink-100 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         <span className="text-ink-500 select-none">$ </span>
         {command}
       </code>

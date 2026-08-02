@@ -75,7 +75,7 @@ export function TerraWindow() {
       <div className="flex items-center gap-3 bg-chrome-bar px-4 py-2">
         <TrafficLights />
         <span className="flex-1 text-center text-[11px] font-medium text-ink-300">
-          terra
+          Terra
         </span>
         <button
           type="button"
