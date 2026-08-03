@@ -34,8 +34,8 @@ protected your PC" — **More info** → **Run anyway**. This is more painful th
 the macOS case because it also affects reputation: an unsigned installer never
 accumulates SmartScreen reputation, so the warning never goes away on its own.
 
-**Linux.** Nothing is signed and nothing complains. The `.deb` and the tarball
-are unaffected by any of this; the Linux job is untouched.
+**Linux.** Nothing is signed and nothing complains. The `.deb` is unaffected by
+any of this; the Linux job is untouched.
 
 The release notes appended by the `support-notes` job state the unsigned
 situation in these terms. If signing is turned on permanently, that text is
@@ -44,15 +44,54 @@ worth updating.
 ## How the opt-in works
 
 The workflow passes every signing secret as environment variables to the one
-step that builds and packages, and `scripts/release/build.py` decides from what
-it finds there: a Developer ID when `APPLE_CERTIFICATE` and `APPLE_ID` are both
-non-empty, ad-hoc otherwise; the YubiKey server when `SIGN_TUNNEL_URL` and
-`SIGN_TUNNEL_SECRET` are both non-empty, unsigned otherwise. Unset secrets
-arrive as empty strings, so nothing has to inspect the `secrets` context in an
-`if:` (which GitHub Actions does not allow anyway).
+step that builds and packages. Unset secrets arrive as empty strings, so nothing
+has to inspect the `secrets` context in an `if:` (which GitHub Actions does not
+allow anyway).
 
-The script prints which path it took, and once a path is enabled a failure in it
-fails the run — there is no fallback from real signing to unsigned.
+**cargo-packager 0.11.8 does the signing itself**, in both directions;
+`scripts/release/build.py` only chooses the identity and reports which path it
+took. Once a path is enabled a failure in it fails the run — there is no
+fallback from real signing to unsigned.
+
+**macOS is packager-native.** `[package.metadata.packager.macos]` in
+`crates/terra-app/Cargo.toml` carries `signing-identity = "-"`, and that single
+setting is what turns everything on: cargo-packager then signs every Mach-O in
+the bundle and the bundle itself, inside-out, with `--options runtime
+--timestamp`, signs the `.dmg` afterwards, and notarises when it can find
+credentials. `-` is an ad-hoc signature, which is exactly the unsigned default.
+For a real release `build.py` rewrites that one line to `$APPLE_SIGNING_IDENTITY`
+before packaging and restores it in a `finally`. It has to: the certificate and
+the notarisation credentials are read from the environment by cargo-packager,
+but the *identity* is config-only — there is no `APPLE_SIGNING_IDENTITY`
+fallback anywhere in 0.11.8's source. The environment variables it does read,
+from `src/codesign/macos.rs`:
+
+| Variable | Read by | Effect |
+| -------- | ------- | ------ |
+| `APPLE_CERTIFICATE` | `try_sign()` | base64 `.p12`, imported into a throwaway `cargo-packager.keychain` deleted after signing |
+| `APPLE_CERTIFICATE_PASSWORD` | `try_sign()` | the `.p12` password; both must be set or no keychain is created |
+| `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | `notarize_auth()` | notarisation credentials; all three, or notarisation is skipped with a warning |
+| `APPLE_KEYCHAIN_PROFILE` | `notarize_auth()` | alternative: a stored `notarytool` profile, checked first |
+| `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_KEY_PATH` | `notarize_auth()` | alternative: App Store Connect key |
+
+**Windows goes through `sign-command`.** Also in the manifest:
+
+```toml
+[package.metadata.packager.windows]
+sign-command = "terra-sign.cmd %1"
+```
+
+cargo-packager substitutes the file to sign for `%1` and runs the command for
+the main binary, for the uninstaller (as an NSIS `!uninstfinalize` line) and for
+the finished installer. `terra-sign.cmd` is a one-line shim that `build.py`
+writes into `$RUNNER_TEMP` and prepends to `PATH` for the packaging step; it
+calls `scripts/release/sign_client.py`. The shim exists because the hook runs
+from three different working directories, so no relative path to the script
+would resolve in all of them.
+
+The one gap: 0.11.8 offers the hook only the *main* binary
+(`src/package/nsis/mod.rs`), so `terra.exe` would go into the installer
+unsigned. `build.py` signs it with the same client before packaging.
 
 vibe instead gates on `workflow_dispatch` inputs (`sign-macos`, `sign-windows`)
 in
@@ -120,21 +159,29 @@ App-Specific Passwords. A regular Apple ID password gets a 401 from
 
 ### What the workflow then does
 
-vibe gets all of this for free from `tauri-action`. Terra has no bundler doing
-it, so the release workflow performs the same sequence explicitly:
+vibe gets all of this for free from `tauri-action`; terra gets it from
+cargo-packager, which grew the same machinery. One `cargo packager -f app
+-f dmg` call, and inside it:
 
-1. **Import** the `.p12` into a temporary keychain in `$RUNNER_TEMP`, with
+1. **Import** the `.p12` into a `cargo-packager.keychain`, with
    `security set-key-partition-list` so `codesign` does not block on a GUI
-   prompt no one can click, and `security find-identity` as an early failure
-   check.
-2. **Sign** the universal `Terra.app` and the standalone `terra` CLI with
-   `--options runtime --timestamp`. Hardened runtime is mandatory for
-   notarisation; the timestamp keeps signatures valid past certificate expiry.
-3. **Build the `.dmg`** from the already-signed app, then sign the image too.
-4. **Notarise** with `xcrun notarytool submit --wait`, then `stapler staple`
-   both the `.dmg` and the `.app` (one submission covers both — the ticket is
-   looked up by code hash), so the `.app.tar.gz` artifact is notarised as well.
-5. **Delete the keychain** in an `always()` step.
+   prompt no one can click.
+2. **Sign** every Mach-O inside the bundle — `terra-app`, the `terra` CLI, any
+   framework — deepest path first, then the bundle, with `--options runtime
+   --timestamp`. Hardened runtime is mandatory for notarisation; the timestamp
+   keeps signatures valid past certificate expiry. This is Apple's recommended
+   inside-out order and better than the `--deep` the script used to pass.
+3. **Notarise** the `.app`: `ditto` it into a zip, `xcrun notarytool submit
+   --wait`, then `xcrun stapler staple` the bundle.
+4. **Build the `.dmg`** around the stapled bundle and sign the image.
+5. **Delete the keychain**, on success and on failure.
+
+One difference from the old flow, worth knowing: cargo-packager submits the
+`.app`, not the `.dmg`, so the image ends up signed but without a stapled
+ticket of its own. The bundle inside it is stapled, which is what Gatekeeper
+assesses when the app is launched from `/Applications`, but `xcrun stapler
+validate` on the `.dmg` will fail. If that ever matters, staple the image by
+hand after the run.
 
 The first notarisation for a new certificate can take hours on Apple's side;
 subsequent ones are minutes. If a run times out, the submission is still
@@ -186,24 +233,34 @@ and leave it running for the duration of the release job.
 
 ### Client
 
-The `remote_sign()` function in `scripts/release/build.py`, so the Windows
-release job needs no toolchain beyond the `uv` it already uses. The protocol is
-vibe's exactly: `POST /sign`, multipart field `file`, secret in
-`X-Tunnel-Secret`, signed bytes in the response body.
+`scripts/release/sign_client.py` — one file, one argument, stdlib only, so the
+Windows release job needs no toolchain beyond the `uv` it already uses. The
+protocol is vibe's exactly: `POST /sign`, multipart field `file`, secret in
+`X-Tunnel-Secret`, signed bytes in the response body. With `SIGN_TUNNEL_URL` or
+`SIGN_TUNNEL_SECRET` unset it prints a line and exits 0 without touching the
+file, which is what keeps a secretless run unsigned — cargo-packager has no way
+to enable the hook conditionally.
+
+**It sets an explicit `User-Agent` and that line must stay.** Cloudflare sits in
+front of the tunnel and answers the stdlib default, `Python-urllib/3.x`, with a
+403. This is not theoretical: it is what failed the Windows job of the v1.0.1
+release, and the same request through the same tunnel succeeds with a
+non-urllib UA. If Windows signing starts returning 403, check that header first.
 
 ### What gets signed, and in what order
 
-1. `terra-app.exe` and `terra.exe`, **before** `cargo packager -f nsis` runs —
-   NSIS embeds them, so signing after packaging would leave the copies users
-   actually execute unsigned. vibe signs per-binary the same way, via Tauri's
+1. `terra.exe`, by `build.py` calling the client directly, **before**
+   `cargo packager -f nsis` runs — NSIS embeds it, so signing afterwards would
+   leave the copy users actually execute unsigned. This one is manual because
+   cargo-packager 0.11.8 only hands the hook the main binary.
+2. `terra-app.exe`, by cargo-packager through `sign-command`, at the start of
+   NSIS packaging. vibe signs per-binary the same way, via Tauri's
    `signCommand` in
    [`tauri.windows.signing.conf.json`](https://github.com/thewh1teagle/vibe/blob/main/desktop/src-tauri/tauri.windows.signing.conf.json).
-2. The NSIS `setup.exe`, after packaging. This is the file SmartScreen judges.
-3. `signtool verify /pa /v` on the staged installer, as an independent check
+3. The uninstaller, by `makensis` invoking the same hook from `!uninstfinalize`.
+4. The NSIS `setup.exe`, after packaging. This is the file SmartScreen judges.
+5. `signtool verify /pa /v` on the staged installer, as an independent check
    that Windows will accept the result.
-
-The zip artifact is built from the same `target\release` binaries as step 1, so
-its contents are signed too.
 
 ## Verifying a release
 
@@ -212,9 +269,13 @@ macOS:
 ```sh
 codesign --verify --deep --strict --verbose=2 /Applications/Terra.app
 codesign --display --verbose=4 /Applications/Terra.app   # authority, flags, timestamp
-spctl --assess --type open --context context:primary-signature -v terra-macos-universal.dmg
-xcrun stapler validate terra-macos-universal.dmg
+xcrun stapler validate /Applications/Terra.app           # the ticket is on the app
+spctl --assess --type execute -v /Applications/Terra.app
 ```
+
+Check the app, not the image: cargo-packager notarises and staples the `.app`
+and only signs the `.dmg`, so `stapler validate` on the image is expected to
+fail. `codesign --verify` on the `.dmg` should still pass.
 
 Windows (PowerShell, Windows SDK installed):
 

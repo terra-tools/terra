@@ -37,26 +37,19 @@ jobs:
             runner: macos-15
             artifact: macos-universal
             targets: aarch64-apple-darwin, x86_64-apple-darwin
-            files: |
-              dist/terra-macos-universal.dmg
-              dist/terra-cli-macos-universal.tar.gz
-              dist/terra-macos-universal.app.tar.gz
+            files: dist/terra-macos-universal.dmg
             release_notes: true
           - name: Linux (x86_64)
             platform: linux
             runner: ubuntu-22.04
             artifact: linux-x86_64
-            files: |
-              dist/terra-linux-x86_64.tar.gz
-              dist/terra-linux-x86_64.deb
+            files: dist/terra-linux-x86_64.deb
             release_notes: false
           - name: Windows (x86_64)
             platform: windows
             runner: windows-2022
             artifact: windows-x86_64
-            files: |
-              dist/terra-windows-x86_64.zip
-              dist/terra-windows-x86_64-setup.exe
+            files: dist/terra-windows-x86_64-setup.exe
             release_notes: false
 
     steps:
@@ -86,8 +79,21 @@ jobs:
             libxkbcommon-dev \
             libwayland-dev
 
+      # `cargo install cargo-packager` is 80-220s per job; the binary is the
+      # only thing it leaves behind, so cache that instead. The version is in
+      # the key, so a bump misses the cache and reinstalls.
+      - name: Cache cargo-packager
+        id: cargo-packager-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-packager
+            ~/.cargo/bin/cargo-packager.exe
+          key: cargo-packager-0.11.8-${{ runner.os }}
+
       # Pinned: the .app layout and dmg behaviour were verified against this one.
       - name: Install cargo-packager
+        if: steps.cargo-packager-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-packager --locked --version 0.11.8
 
       # A tag that ships a broken build is worse than a failed workflow.
@@ -145,12 +151,20 @@ jobs:
             right-click the app and choose Open.
 
             **Linux (x86_64) and Windows (x86_64) — build-verified only.** The
-            installers (`.deb`, `-setup.exe`) and archives compile, pass the
-            test suite and pass clippy in CI, but the GUI has had far less
-            real-world use than on macOS. Bug reports welcome. The Windows
-            installer is unsigned, so SmartScreen will warn on first run —
-            choose "More info" → "Run anyway".
+            installers (`.deb`, `-setup.exe`) compile, pass the test suite and
+            pass clippy in CI, but the GUI has had far less real-world use than
+            on macOS. Bug reports welcome. The Windows installer is unsigned, so
+            SmartScreen will warn on first run — choose "More info" → "Run
+            anyway".
 
-            Each plain archive contains two binaries — `terra-app` (the GUI) and
-            `terra` (the CLI, needed for `terra ls`, `terra new`, `terra learn`).
-            Put both somewhere on your `PATH`.
+            Every installer puts both halves of terra in place: `terra-app` (the
+            GUI) and `terra` (the CLI, needed for `terra ls`, `terra new`,
+            `terra learn`). On Linux and Windows both land on your `PATH`. On
+            macOS the CLI lives inside the bundle, at
+            `/Applications/Terra.app/Contents/MacOS/terra` — the install script
+            symlinks it into `/usr/local/bin`; if you installed by dragging the
+            `.dmg`, link it yourself:
+
+            ```sh
+            ln -sf /Applications/Terra.app/Contents/MacOS/terra /usr/local/bin/terra
+            ```

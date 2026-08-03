@@ -15,23 +15,28 @@ publish step is skipped because the ref is not a tag.
 
 ## Artifacts
 
+Three files, one installer per platform:
+
 | File | Contents |
 | ---- | -------- |
 | `terra-macos-universal.dmg` | `Terra.app` (arm64 + x86_64) plus the `/Applications` drop target |
-| `terra-macos-universal.app.tar.gz` | the same universal `.app` |
-| `terra-cli-macos-universal.tar.gz` | the `terra` CLI |
-| `terra-linux-x86_64.deb` | GUI + CLI, desktop entry and icons |
-| `terra-linux-x86_64.tar.gz` | `terra-app` and `terra`, flat |
-| `terra-windows-x86_64-setup.exe` | NSIS installer |
-| `terra-windows-x86_64.zip` | `terra-app.exe` and `terra.exe` |
+| `terra-linux-x86_64.deb` | `/usr/bin/terra-app` and `/usr/bin/terra`, desktop entry and icons |
+| `terra-windows-x86_64-setup.exe` | NSIS installer: `terra-app.exe` and `terra.exe` |
 
 The installers are renamed to stable, versionless names so the site and
 `install.sh` never have to parse a version out of a URL. Those names are
 produced by `scripts/release/build.py` and listed in the workflow's matrix —
 the two places to edit if one ever changes.
 
-Every archive holds two binaries because the GUI is only half of terra: `terra`
-is what `terra ls`, `terra new` and `terra learn` need on `PATH`.
+Every installer carries both binaries, because the GUI is only half of terra:
+`terra` is what `terra ls`, `terra new` and `terra learn` need. That comes from
+the `binaries` list in `[package.metadata.packager]`; cargo-packager otherwise
+picks up only the bin targets of the `terra-app` crate. On macOS the CLI sits at
+`Terra.app/Contents/MacOS/terra` and `install.sh` symlinks it into
+`/usr/local/bin`; on Linux and Windows the installer puts it on `PATH` directly.
+
+There are no plain archives any more. Anyone who wants loose binaries can build
+them: `cargo build --release -p terra-app -p terra-cli`.
 
 ## Running the build locally
 
@@ -47,10 +52,22 @@ uv run scripts/release/build.py macos --dry-run   # print the commands only
 CI runs exactly these commands. `--dry-run` echoes the whole sequence without
 touching anything, which is the cheapest way to check a change to the script.
 
+Each platform is now one `cargo packager` call: `-f app -f dmg` on macOS (one
+invocation — the dmg format reuses the `.app` already in `out_dir` instead of
+rebuilding it), `-f deb` on Linux, `-f nsis` on Windows. The script's remaining
+work is the `lipo` merge for the universal build, the rename into `dist/`, and
+telling cargo-packager which identity to sign with.
+
 Prerequisites are the same as the runners': a Rust toolchain (plus both
 `*-apple-darwin` targets on macOS) and `cargo install cargo-packager --locked
---version 0.11.8`. The version is pinned because the `.app` layout and the dmg
-behaviour were verified against exactly that one.
+--version 0.11.8`. The version is pinned because the `.app` layout, the dmg
+behaviour and the signing hooks were verified against exactly that one. CI
+caches the installed binary, keyed on that version, rather than rebuilding it
+each run.
+
+`cargo packager -p terra-app --release` on its own (the `just bundle` path)
+produces an ad-hoc signed `.app` and `.dmg` with no notarisation, which is what
+a release with no secrets configured produces too.
 
 Set `CI=true` locally too if you want the runner's behaviour: cargo-packager
 passes `--skip-jenkins` to create-dmg when it is set, which skips Finder window
@@ -63,8 +80,12 @@ is ad-hoc signed and the Windows installer is unsigned. The build script decides
 from the environment — `APPLE_CERTIFICATE` + `APPLE_ID` for the Developer ID and
 notarisation path, `SIGN_TUNNEL_URL` + `SIGN_TUNNEL_SECRET` for the Windows
 YubiKey server — prints which path it took, and fails the run rather than
-falling back to unsigned once a path is enabled. See
-[SIGNING.md](SIGNING.md) for the secrets and the setup behind them.
+falling back to unsigned once a path is enabled.
+
+**cargo-packager does the signing now**, not the build script: it imports the
+`.p12`, signs the bundle inside-out, notarises and staples on macOS, and shells
+out to `scripts/release/sign_client.py` for each Windows file. See
+[SIGNING.md](SIGNING.md) for the secrets, the wiring and the setup behind them.
 
 ## Packaging decisions
 
@@ -79,10 +100,18 @@ cargo-packager manifest as everything else. AppImage tooling (linuxdeploy) is a
 build-time download and one more unattended moving part on a tag push, for a
 format nothing here needs yet.
 
-**The `.dmg` is built by hand**, not by `cargo packager -f dmg`: the dmg format
-re-creates the `.app` from scratch first, which would discard the signature
-applied in between. So the script packages the `.app`, signs it, and only then
-builds a plain UDZO image around it.
+**The `.dmg` comes from `cargo packager -f dmg`.** It used to be built by hand
+with `hdiutil`, because the script signed the `.app` between the two steps and a
+second `cargo packager` invocation would have rebuilt the bundle and discarded
+that signature. Now cargo-packager signs during bundling, and a single
+`-f app -f dmg` call is safe: `src/package/mod.rs` packages the `app` format for
+a dmg only when no app output exists yet, so within one invocation the dmg is
+built around the bundle that was just signed.
+
+**Installers only.** The `.app.tar.gz`, the CLI tarball, the Linux `.tar.gz` and
+the Windows `.zip` are gone. They existed to carry the `terra` CLI, which the
+installers now ship themselves, and each one was a second way to get terra onto
+a machine that nothing verified.
 
 ## TODO: updater feed (`latest.json`)
 
