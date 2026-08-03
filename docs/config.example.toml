@@ -189,17 +189,18 @@ codex = "on"
 # unaffected. `terra new --profile` with a name that is not here fails with an
 # error listing the names that are, rather than quietly opening a shell.
 #
-# These are examples; delete them.
+# These are examples — uncomment (and adapt) the ones you want. They ship
+# commented out so a fresh install's ⌄ menu isn't padded with demo entries.
 
-[profile.htop]
-command = "htop"
-title = "system"
+# [profile.htop]
+# command = "htop"
+# title = "system"
 
-[profile.logs]
-command = "tail -f /var/log/system.log"
-cwd = "~"
-title = "logs"
+# [profile.logs]
+# command = "tail -f /var/log/system.log"
+# cwd = "~"
+# title = "logs"
 
-[profile.home]
-# No command at all: just a shell, over there.
-cwd = "~"
+# [profile.home]
+# # No command at all: just a shell, over there.
+# cwd = "~"

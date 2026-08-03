@@ -289,6 +289,282 @@ pub fn install_app_menu(_app_name: &str, _rows: &[MenuSpec], _edit_with: &[MenuS
 pub const QUIT_TAG: isize = -1;
 
 // ---------------------------------------------------------------------------
+// Termination requests that never reach the window
+// ---------------------------------------------------------------------------
+//
+// The red traffic light and terra's own Quit row both arrive as a winit window
+// event, so `App::ui` sees `close_requested` and the "Close Window?" dialog can
+// hold it back. A *termination* does not: Dock ▸ Quit, `osascript 'tell app …
+// to quit'` and macOS logout all arrive as the `kAEQuitApplication` Apple
+// event, which AppKit turns into `-[NSApplication terminate:]`. That path never
+// asks a window anything — it asks the *application delegate*, once, through
+// `applicationShouldTerminate:`, and then calls `exit()`. Terra used to
+// implement neither, so those three quits killed a window full of running
+// programs without a word.
+//
+// So terra answers `applicationShouldTerminate:` — but it cannot simply install
+// a delegate of its own. winit owns that slot: it sets an instance of its
+// `WinitApplicationDelegate` on `NSApp`, keeps every bit of event-loop state in
+// that object's ivars, and `ApplicationDelegate::get` *panics* if the app's
+// delegate is not that exact class. Replacing or wrapping it breaks the event
+// loop outright.
+//
+// What winit 0.30.13 does implement on that class is only
+// `applicationDidFinishLaunching:` and `applicationWillTerminate:`
+// (`src/platform_impl/macos/app_state.rs`); `applicationShouldTerminate:` is
+// absent, and nothing in winit mediates `terminate:` either. That is the whole
+// opening: we add the missing method to winit's own delegate class at runtime,
+// leaving the delegate object, its ivars and every method winit does implement
+// untouched.
+
+/// What terra tells AppKit about a termination request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum TerminateDecision {
+    /// Let it through — either nothing is worth asking about, or terra has
+    /// already decided to go.
+    Now,
+    /// Hold it. Terra has queued a quit of its own and will ask first.
+    Cancel,
+}
+
+/// The decision itself, with AppKit and every global left outside so it can be
+/// tested.
+///
+/// `approved` is terra having already resolved a close (the user said "Close",
+/// or the close never needed asking about). It is checked *first* and it wins:
+/// once terra is on its way out, a second termination request — macOS
+/// re-sending the Apple event during logout, an impatient Dock ▸ Quit while the
+/// window fades — must not be turned back into another question, which is how
+/// an interception like this deadlocks an app shut.
+///
+/// `ask` is the guard's answer, or `None` when no guard is installed yet (the
+/// window is still starting up, or terra was built without one). No guard means
+/// no opinion, and no opinion means the quit proceeds exactly as it did before
+/// this hook existed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn decide_termination(approved: bool, ask: Option<bool>) -> TerminateDecision {
+    if approved {
+        return TerminateDecision::Now;
+    }
+    match ask {
+        Some(true) => TerminateDecision::Cancel,
+        Some(false) | None => TerminateDecision::Now,
+    }
+}
+
+/// Terra has resolved a close: every termination request from here on goes
+/// straight through. See [`decide_termination`].
+pub fn approve_termination() {
+    TERMINATION_APPROVED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+static TERMINATION_APPROVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A held-back termination waiting to be re-issued as terra's own quit.
+static QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Was a termination request held back since the last call?
+///
+/// Drained from the frame loop, the same shape as [`take_menu_actions`]: AppKit
+/// asks between frames, when terra's state is not reachable, so the hook only
+/// records the request and the next frame turns it into an ordinary quit.
+pub fn take_quit_request() -> bool {
+    QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+#[cfg(target_os = "macos")]
+struct TerminateGuard {
+    /// Does a quit right now need to ask first? Called on the main thread
+    /// between frames.
+    ask: Box<dyn Fn() -> bool + Send + Sync>,
+    /// A parked terra would never notice [`QUIT_REQUESTED`]: the Apple event
+    /// wakes the run loop, not egui's repaint clock.
+    ctx: egui::Context,
+}
+
+#[cfg(target_os = "macos")]
+static TERMINATE_GUARD: std::sync::OnceLock<TerminateGuard> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    // SAFETY: NSObject imposes no subclassing requirements, and this type holds
+    // no instance variables and implements no `Drop`.
+    //
+    // This class is never instantiated. It exists only so `define_class!`
+    // compiles one correctly-typed `applicationShouldTerminate:` IMP, with the
+    // method type encoding the runtime wants, which `install_terminate_hook`
+    // then grafts onto winit's delegate class. That is what makes the *method
+    // body* below sound while running against a `WinitApplicationDelegate`:
+    // `&self` there is not a `TerminateSource` at all, so the body must never
+    // touch a field, an ivar, or a `TerminateSource`-specific method — and it
+    // does not. It reads process-wide statics and returns.
+    #[unsafe(super(objc2::runtime::NSObject))]
+    #[name = "TerraTerminateSource"]
+    struct TerminateSource;
+
+    impl TerminateSource {
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn should_terminate(
+            &self,
+            sender: *mut objc2::runtime::AnyObject,
+        ) -> objc2_app_kit::NSApplicationTerminateReply {
+            let this = (self as *const TerminateSource)
+                .cast::<objc2::runtime::AnyObject>()
+                .cast_mut();
+            terminate_reply(this, sender)
+        }
+    }
+
+    unsafe impl NSObjectProtocol for TerminateSource {}
+);
+
+/// The body of the grafted `applicationShouldTerminate:`.
+///
+/// `this` is winit's delegate, not a [`TerminateSource`]; it is passed on only
+/// so a pre-existing implementation can be forwarded to (see
+/// [`ORIGINAL_SHOULD_TERMINATE`]) and is never dereferenced here.
+#[cfg(target_os = "macos")]
+fn terminate_reply(
+    this: *mut objc2::runtime::AnyObject,
+    sender: *mut objc2::runtime::AnyObject,
+) -> objc2_app_kit::NSApplicationTerminateReply {
+    use objc2_app_kit::NSApplicationTerminateReply as Reply;
+    use std::sync::atomic::Ordering;
+
+    let guard = TERMINATE_GUARD.get();
+    let decision = decide_termination(
+        TERMINATION_APPROVED.load(Ordering::Acquire),
+        guard.map(|g| (g.ask)()),
+    );
+    log::debug!("terra: applicationShouldTerminate: -> {decision:?}");
+    match decision {
+        TerminateDecision::Cancel => {
+            QUIT_REQUESTED.store(true, Ordering::Release);
+            if let Some(guard) = guard {
+                guard.ctx.request_repaint();
+            }
+            // Cancelling is the whole answer, including at logout: macOS shows
+            // "Terra cancelled logout" and stops there until the user answers
+            // the dialog and quits terra themselves. `TerminateLater` plus a
+            // `replyToApplicationShouldTerminate:` once the dialog is answered
+            // would let the logout continue on its own, and is deliberately out
+            // of scope — iTerm2 cancels here too.
+            Reply::TerminateCancel
+        }
+        // If someone already implemented this method on winit's delegate, their
+        // answer is still theirs to give; we only had first refusal.
+        TerminateDecision::Now => match ORIGINAL_SHOULD_TERMINATE.load(Ordering::Acquire) {
+            0 => Reply::TerminateNow,
+            imp => {
+                // SAFETY: the value is non-zero, so it was stored by
+                // `install_terminate_hook` from `Method::implementation()` of a
+                // real `applicationShouldTerminate:` — whose ABI is exactly the
+                // signature transmuted to here. `this` and `sender` are the
+                // arguments the runtime handed us, unmodified.
+                let original: unsafe extern "C" fn(
+                    *mut objc2::runtime::AnyObject,
+                    objc2::runtime::Sel,
+                    *mut objc2::runtime::AnyObject,
+                ) -> Reply = unsafe { std::mem::transmute(imp) };
+                unsafe { original(this, objc2::sel!(applicationShouldTerminate:), sender) }
+            }
+        },
+    }
+}
+
+/// A displaced `applicationShouldTerminate:` IMP, or 0 when we added the method
+/// rather than replacing one. See [`install_terminate_hook`].
+#[cfg(target_os = "macos")]
+static ORIGINAL_SHOULD_TERMINATE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Route `NSApp terminate:` through terra's own quit path.
+///
+/// `ask` answers "would a quit right now need to ask first?" and is called on
+/// the main thread between frames — it may lock what the frame loop locks, but
+/// must not need a frame to be running. `ctx` is only used to wake a parked
+/// terra once a request has been held back.
+///
+/// Idempotent: only the first call installs, later ones are ignored.
+#[cfg(target_os = "macos")]
+pub fn install_terminate_hook(ctx: &egui::Context, ask: impl Fn() -> bool + Send + Sync + 'static) {
+    use objc2::runtime::{AnyClass, Imp};
+    use objc2::ClassType;
+    use std::sync::atomic::Ordering;
+
+    if TERMINATE_GUARD
+        .set(TerminateGuard {
+            ask: Box::new(ask),
+            ctx: ctx.clone(),
+        })
+        .is_err()
+    {
+        return; // already installed
+    }
+
+    // The class winit registers for its delegate
+    // (`platform_impl/macos/app_state.rs`, `const NAME`). Looked up by name
+    // rather than by asking `NSApp` for its delegate, so the hook can be
+    // installed from the first frame without caring whether the delegate object
+    // exists yet — and so a winit that renamed or dropped the class degrades to
+    // "no hook", not to a crash.
+    let Some(class) = AnyClass::get(c"WinitApplicationDelegate") else {
+        log::warn!("terra: no WinitApplicationDelegate; quit-by-AppleEvent will not be confirmed");
+        return;
+    };
+    let selector = objc2::sel!(applicationShouldTerminate:);
+    let Some(source) = TerminateSource::class().instance_method(selector) else {
+        log::error!("terra: TerraTerminateSource is missing applicationShouldTerminate:");
+        return;
+    };
+    let imp: Imp = source.implementation();
+    // SAFETY: `source` is a live `Method` from a registered class, which is
+    // what `method_getTypeEncoding` takes. The string it returns belongs to the
+    // runtime and outlives this call.
+    let types = unsafe { objc2::ffi::method_getTypeEncoding(source) };
+
+    // Adding beats swizzling and is what happens today: winit implements no
+    // `applicationShouldTerminate:`, so the selector is free and terra's IMP
+    // becomes the only one. `class_addMethod` says so by returning NO when the
+    // class *does* implement it — an ordering trap in reverse, and the reason
+    // this is not an unconditional `method_setImplementation`.
+    //
+    // SAFETY: `class` is a registered, non-null class; `imp` and `types` come
+    // from a method of the same name and signature on a class we defined, so
+    // the IMP's ABI matches the encoding. The method body is documented above
+    // to be independent of the receiver's class.
+    let added = unsafe {
+        objc2::ffi::class_addMethod((class as *const AnyClass).cast_mut(), selector, imp, types)
+    };
+    if added.as_bool() {
+        log::debug!("terra: applicationShouldTerminate: added to WinitApplicationDelegate");
+        return;
+    }
+
+    // A future winit that implements the method itself: replace it and keep the
+    // old IMP, so `TerminateDecision::Now` still runs winit's own answer.
+    let Some(existing) = class.instance_method(selector) else {
+        log::error!("terra: applicationShouldTerminate: neither added nor found");
+        return;
+    };
+    // SAFETY: same argument as the `class_addMethod` above — `existing` is a
+    // live method with this exact selector, and `imp` implements that
+    // signature.
+    let previous = unsafe { objc2::ffi::method_setImplementation(existing, imp) };
+    ORIGINAL_SHOULD_TERMINATE.store(previous.map_or(0, |p| p as usize), Ordering::Release);
+    log::debug!("terra: applicationShouldTerminate: swizzled on WinitApplicationDelegate");
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_terminate_hook(
+    _ctx: &egui::Context,
+    _ask: impl Fn() -> bool + Send + Sync + 'static,
+) {
+}
+
+// ---------------------------------------------------------------------------
 // Window open/close transition
 // ---------------------------------------------------------------------------
 //
@@ -605,6 +881,55 @@ fn transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reason the hook exists: a window with work in it does not die to an
+    /// Apple event, it asks.
+    #[test]
+    fn a_quit_worth_asking_about_is_cancelled() {
+        assert_eq!(
+            decide_termination(false, Some(true)),
+            TerminateDecision::Cancel
+        );
+    }
+
+    /// Idle shells, or `confirm_close = false`: the quit proceeds exactly as it
+    /// did before the hook existed.
+    #[test]
+    fn a_quit_with_nothing_to_protect_goes_straight_through() {
+        assert_eq!(
+            decide_termination(false, Some(false)),
+            TerminateDecision::Now
+        );
+    }
+
+    /// No guard yet — the window is still starting up. No opinion is not a
+    /// reason to hold a quit.
+    #[test]
+    fn a_quit_before_the_guard_is_installed_goes_through() {
+        assert_eq!(decide_termination(false, None), TerminateDecision::Now);
+    }
+
+    /// The loop-breaker: once terra has resolved a close, every later
+    /// termination request is let through — including the one it would
+    /// otherwise still want to ask about.
+    #[test]
+    fn an_approved_close_is_never_asked_about_again() {
+        assert_eq!(decide_termination(true, Some(true)), TerminateDecision::Now);
+        assert_eq!(
+            decide_termination(true, Some(false)),
+            TerminateDecision::Now
+        );
+        assert_eq!(decide_termination(true, None), TerminateDecision::Now);
+    }
+
+    /// The hand-off itself: one held-back request, drained once.
+    #[test]
+    fn a_held_quit_request_is_drained_exactly_once() {
+        assert!(!take_quit_request(), "nothing is pending to begin with");
+        QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+        assert!(take_quit_request());
+        assert!(!take_quit_request(), "a drained request does not come back");
+    }
 
     #[test]
     fn a_plain_tab_title_is_not_a_directory() {

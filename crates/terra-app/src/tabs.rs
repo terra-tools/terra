@@ -223,7 +223,7 @@ fn default_cwd() -> Option<PathBuf> {
 /// to a directory that does not exist.
 ///
 /// Pure, so the ordering is testable without touching the real environment.
-fn home_dir(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+pub(crate) fn home_dir(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     let get = |key: &str| var(key).filter(|v| !v.is_empty()).map(PathBuf::from);
     if !cfg!(windows) {
         return get("HOME");
