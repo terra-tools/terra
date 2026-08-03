@@ -178,20 +178,23 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         state: &mut TerminalViewState,
     ) -> Self {
-        if !layout.has_focus() {
-            return self;
-        }
         // terra patch: the pointer decides where a *mouse* event lands, never
         // where a keystroke does. Upstream gated the whole function on
         // `contains_pointer`, so the focused terminal dropped everything typed
         // while the pointer sat anywhere else — over the tab bar right after
         // clicking a tab, or outside the window entirely. See `accepts`.
         let hovered = layout.contains_pointer();
+        let focused = layout.has_focus();
+        // Nothing to route: this view neither holds the keyboard nor sits
+        // under the pointer.
+        if !focused && !hovered {
+            return self;
+        }
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
         for event in events {
-            if !accepts(&event, hovered) {
+            if !accepts(&event, hovered, focused) {
                 continue;
             }
             let mut input_actions = vec![];
@@ -209,6 +212,21 @@ impl<'a> TerminalView<'a> {
                     ))
                 }
                 egui::Event::MouseWheel { unit, delta, .. } => {
+                    // terra patch (hover scroll): an unfocused view never
+                    // takes `PointerMoved`, so its cached grid position is
+                    // whatever the pointer last did *while it was focused* —
+                    // usually cell (0, 0). A wheel report has to name the cell
+                    // the pointer is over now, so recompute it here.
+                    if !focused {
+                        if let Some(pos) = layout.ctx.pointer_latest_pos() {
+                            track_grid_position(
+                                state,
+                                layout,
+                                self.backend,
+                                pos,
+                            );
+                        }
+                    }
                     input_actions = process_mouse_wheel(
                         state,
                         self.backend,
@@ -562,28 +580,111 @@ impl<'a> TerminalView<'a> {
     }
 }
 
-/// terra patch: whether a focused terminal acts on `event` this frame.
+/// terra patch: whether this terminal acts on `event` this frame.
 ///
-/// The two input kinds are addressed differently, and conflating them is what
-/// made selecting a tab need a second click: a keystroke belongs to whatever
-/// holds keyboard focus, wherever the pointer happens to be resting, while a
-/// mouse event belongs to whatever is under the pointer. Upstream required
+/// The input kinds are addressed differently, and conflating them is what made
+/// selecting a tab need a second click: a keystroke belongs to whatever holds
+/// keyboard focus, wherever the pointer happens to be resting, while a mouse
+/// event belongs to whatever is under the pointer. Upstream required
 /// `contains_pointer` for both, so everything typed with the pointer parked
 /// over the tab bar — exactly where it lands after clicking a tab — went
 /// nowhere.
-fn accepts(event: &egui::Event, hovered: bool) -> bool {
+///
+/// The **wheel** is the one event that needs neither: it is routed by hover
+/// alone, so with several panes on screen the one under the cursor scrolls
+/// without being clicked first (iTerm2 / Ghostty behaviour). Keyboard focus
+/// does not move — typing, paste and IME keep going where they went. Clicks
+/// and pointer motion still need both, so click-to-focus and selection are
+/// exactly what they were: a drag starts only in the pane that already holds
+/// focus.
+fn accepts(event: &egui::Event, hovered: bool, focused: bool) -> bool {
     match event {
         egui::Event::Text(_)
         | egui::Event::Key { .. }
         | egui::Event::Copy
-        | egui::Event::Paste(_) => true,
-        egui::Event::MouseWheel { .. }
-        | egui::Event::PointerButton { .. }
-        | egui::Event::PointerMoved(_) => hovered,
+        | egui::Event::Paste(_) => focused,
+        egui::Event::MouseWheel { .. } => hovered,
+        egui::Event::PointerButton { .. } | egui::Event::PointerMoved(_) => {
+            hovered && focused
+        }
         // Everything else is ignored by the match below anyway.
         _ => false,
     }
 }
+
+/// terra patch: whether this `Copy`/`Paste` event is really the terminal's
+/// own `^C` / `^V` wearing a clipboard costume.
+///
+/// `egui_winit` synthesises `Event::Copy`/`Event::Paste` from
+/// `modifiers.command + C/V` and *swallows* the `Event::Key`, and on every
+/// platform but macOS `command` is Ctrl. Handing those to the clipboard would
+/// cost a Linux or Windows user Ctrl+C — the interrupt every terminal is
+/// expected to deliver — and the literal `^V` that `bind -v`, `showkey` and
+/// quoted-insert want. So the bare Ctrl spelling stays a passthrough, which is
+/// also the convention gnome-terminal, konsole and xterm follow: **Ctrl+Shift+C
+/// / Ctrl+Shift+V** are the clipboard, plain Ctrl+C / Ctrl+V are bytes.
+///
+/// What *is* fixed here is that the old test asked for `COMMAND | SHIFT` and
+/// sent `^V` for everything else, so Windows' Shift+Insert and Ctrl+Insert and
+/// the dedicated `Key::Copy`/`Key::Paste` media keys — none of which carry the
+/// command modifier — pasted a `^V` instead of the clipboard. Only the exact
+/// "command held, shift not" spelling is a passthrough now.
+///
+/// On macOS the clipboard modifier is ⌘ and Ctrl+C/Ctrl+V never come through
+/// here at all, so a paste is always a paste.
+fn clipboard_key_is_passthrough(modifiers: Modifiers) -> bool {
+    if cfg!(any(target_os = "ios", target_os = "macos")) {
+        false
+    } else {
+        modifiers.command && !modifiers.shift
+    }
+}
+
+/// terra patch: the bytes a paste puts on the PTY.
+///
+/// Two things upstream did not do, and the reason "paste is broken in terra"
+/// was a real report:
+///
+/// * **Bracketed paste (DECSET 2004).** A program that set the mode asked to be
+///   told where a paste begins and ends, so it can take the text as data rather
+///   than as typing. Without the `ESC[200~` … `ESC[201~` wrapper a shell runs
+///   every pasted line, and codex, claude and syntax-highlighting shells — all
+///   of which gate on the marker — see a burst of keystrokes.
+/// * **Line endings.** A paste is not a key sequence; the byte the Enter key
+///   produces is CR, so `\r\n` and a lone `\n` both become `\r`. Alacritty does
+///   this for unbracketed pastes and terra does it in both modes, as iTerm2 and
+///   xterm do: a payload full of LFs inside the brackets makes readline's
+///   bracketed-paste handler and tmux's buffer disagree about line count.
+///
+/// The payload is sanitised the way xterm sanitises it: the two markers cannot
+/// appear *inside* the brackets, or a crafted paste (a snippet off a web page)
+/// could close the bracket early and have its remainder executed as typing.
+/// Stripping runs to a fixpoint because one removal can splice a fresh marker
+/// out of the halves either side of it (`ESC[20` + `ESC[201~` + `1~`).
+///
+/// Alacritty instead deletes every `\x1b` and `\x03` from a bracketed payload.
+/// That is blunter — it silently eats the SGR colours in a snippet copied out
+/// of another terminal — and the narrower rule closes the same hole.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if !bracketed {
+        return text.into_bytes();
+    }
+    let mut text = text;
+    while text.contains(PASTE_START) || text.contains(PASTE_END) {
+        text = text.replace(PASTE_START, "").replace(PASTE_END, "");
+    }
+    let mut out =
+        Vec::with_capacity(text.len() + PASTE_START.len() + PASTE_END.len());
+    out.extend_from_slice(PASTE_START.as_bytes());
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(PASTE_END.as_bytes());
+    out
+}
+
+/// terra patch: the bracketed-paste delimiters (DECSET 2004).
+const PASTE_START: &str = "\x1b[200~";
+const PASTE_END: &str = "\x1b[201~";
 
 fn process_keyboard_event(
     event: egui::Event,
@@ -595,32 +696,28 @@ fn process_keyboard_event(
         egui::Event::Text(text) => {
             process_text_event(&text, modifiers, backend, bindings_layout)
         }
-        egui::Event::Paste(text) => InputAction::BackendCall(
-            #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-            if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
-                BackendCommand::Write(text.as_bytes().to_vec())
+        egui::Event::Paste(text) => {
+            // terra patch: a bare Ctrl+V is the terminal's literal ^V on the
+            // platforms where Ctrl *is* the command modifier — see
+            // `clipboard_key_is_passthrough`.
+            if clipboard_key_is_passthrough(modifiers) {
+                InputAction::BackendCall(BackendCommand::Write(vec![0x16]))
             } else {
-                // Hotfix - Send ^V when there's not selection on view.
-                BackendCommand::Write([0x16].to_vec())
-            },
-            #[cfg(any(target_os = "ios", target_os = "macos"))]
-            {
-                BackendCommand::Write(text.as_bytes().to_vec())
-            },
-        ),
-        egui::Event::Copy => {
-            #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-            if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
-                let content = backend.selectable_content();
-                InputAction::WriteToClipboard(content)
-            } else {
-                // Hotfix - Send ^C when there's not selection on view.
-                InputAction::BackendCall(BackendCommand::Write([0x3].to_vec()))
+                let bracketed = backend
+                    .last_content()
+                    .terminal_mode
+                    .contains(TermMode::BRACKETED_PASTE);
+                InputAction::BackendCall(BackendCommand::Write(paste_bytes(
+                    &text, bracketed,
+                )))
             }
-            #[cfg(any(target_os = "ios", target_os = "macos"))]
-            {
-                let content = backend.selectable_content();
-                InputAction::WriteToClipboard(content)
+        }
+        egui::Event::Copy => {
+            // terra patch: the same rule, so Ctrl+C still interrupts.
+            if clipboard_key_is_passthrough(modifiers) {
+                InputAction::BackendCall(BackendCommand::Write(vec![0x03]))
+            } else {
+                InputAction::WriteToClipboard(backend.selectable_content())
             }
         }
         egui::Event::Key {
@@ -895,6 +992,28 @@ fn build_start_select_command(
     )
 }
 
+/// terra patch: remember which cell the pointer is over, and hand back the
+/// pixel offset inside the view that says so.
+///
+/// Split out of `process_mouse_move` because the wheel needs the same answer
+/// on a view that gets no pointer events at all — an unfocused pane the
+/// cursor is merely hovering (see `accepts`).
+fn track_grid_position(
+    state: &mut TerminalViewState,
+    layout: &Response,
+    backend: &TerminalBackend,
+    position: Pos2,
+) -> (f32, f32) {
+    let cursor_x = position.x - layout.rect.min.x;
+    let cursor_y = position.y - layout.rect.min.y;
+    state.current_mouse_position_on_grid = backend.selection_point(
+        cursor_x,
+        cursor_y,
+        backend.last_content().grid.display_offset(),
+    );
+    (cursor_x, cursor_y)
+}
+
 fn process_mouse_move(
     state: &mut TerminalViewState,
     layout: &Response,
@@ -902,14 +1021,9 @@ fn process_mouse_move(
     position: Pos2,
     modifiers: &Modifiers,
 ) -> Vec<InputAction> {
+    let (cursor_x, cursor_y) =
+        track_grid_position(state, layout, backend, position);
     let terminal_content = backend.last_content();
-    let cursor_x = position.x - layout.rect.min.x;
-    let cursor_y = position.y - layout.rect.min.y;
-    state.current_mouse_position_on_grid = backend.selection_point(
-        cursor_x,
-        cursor_y,
-        terminal_content.grid.display_offset(),
-    );
 
     let mut actions = vec![];
     // terra patch: the drag belongs to whoever the press gave it to.
@@ -922,7 +1036,14 @@ fn process_mouse_move(
             cursor_x, cursor_y,
         )));
     } else if state.is_reported_press
-        && terminal_content.terminal_mode.contains(TermMode::MOUSE_MOTION)
+        // terra patch: motion during a held reported press belongs to the
+        // program under *button-event* tracking (DECSET 1002, what tmux sets)
+        // as well as any-motion tracking (1003). Upstream only checked 1003,
+        // so a drag reached tmux as press…silence…release — two clicks, never
+        // a drag, and tmux's mouse selection could not start.
+        && terminal_content
+            .terminal_mode
+            .intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
     {
         actions.push(InputAction::BackendCall(BackendCommand::MouseReport(
             MouseButton::LeftMove,
@@ -967,36 +1088,62 @@ mod accepts_tests {
         }
     }
 
+    fn wheel() -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::Vec2::ZERO,
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
     /// The one that matters: a focused terminal is typed into no matter where
     /// the pointer is resting — over the tab bar just after a tab was picked,
     /// or off the window entirely.
     #[test]
     fn keystrokes_reach_a_focused_terminal_wherever_the_pointer_is() {
         for hovered in [true, false] {
-            assert!(accepts(&key(), hovered));
-            assert!(accepts(&egui::Event::Text("a".into()), hovered));
-            assert!(accepts(&egui::Event::Copy, hovered));
-            assert!(accepts(&egui::Event::Paste("a".into()), hovered));
+            assert!(accepts(&key(), hovered, true));
+            assert!(accepts(&egui::Event::Text("a".into()), hovered, true));
+            assert!(accepts(&egui::Event::Copy, hovered, true));
+            assert!(accepts(&egui::Event::Paste("a".into()), hovered, true));
         }
     }
 
-    /// Mouse events still belong to whatever is under the pointer, so a click
-    /// or a scroll aimed at the tab bar is not also delivered to the grid.
+    /// …and nowhere else. Hovering an unfocused pane must not make it a
+    /// second keyboard sink: typing belongs to focus alone.
+    #[test]
+    fn keystrokes_never_reach_an_unfocused_terminal() {
+        for hovered in [true, false] {
+            assert!(!accepts(&key(), hovered, false));
+            assert!(!accepts(&egui::Event::Text("a".into()), hovered, false));
+            assert!(!accepts(&egui::Event::Copy, hovered, false));
+            assert!(!accepts(&egui::Event::Paste("a".into()), hovered, false));
+        }
+    }
+
+    /// Clicks and pointer motion still need both: the pointer over the grid
+    /// *and* the view holding focus. That is what keeps click-to-focus and
+    /// drag-selection exactly as they were.
     #[test]
     fn mouse_events_are_only_taken_while_the_pointer_is_over_the_grid() {
-        for event in [
-            click(),
-            egui::Event::PointerMoved(Pos2::ZERO),
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line,
-                delta: egui::Vec2::ZERO,
-                phase: egui::TouchPhase::Move,
-                modifiers: Modifiers::NONE,
-            },
-        ] {
-            assert!(accepts(&event, true));
-            assert!(!accepts(&event, false));
+        for event in [click(), egui::Event::PointerMoved(Pos2::ZERO)] {
+            assert!(accepts(&event, true, true));
+            assert!(!accepts(&event, false, true));
+            assert!(!accepts(&event, true, false));
+            assert!(!accepts(&event, false, false));
         }
+    }
+
+    /// The wheel is routed by hover alone, so the pane under the cursor
+    /// scrolls without being clicked first — and the focused pane does not
+    /// also scroll when the pointer is somewhere else.
+    #[test]
+    fn the_wheel_follows_the_pointer_not_the_focus() {
+        assert!(accepts(&wheel(), true, false));
+        assert!(accepts(&wheel(), true, true));
+        assert!(!accepts(&wheel(), false, true));
+        assert!(!accepts(&wheel(), false, false));
     }
 }
 
@@ -1027,5 +1174,97 @@ mod selection_override_tests {
     fn ctrl_and_command_are_left_to_their_existing_meanings() {
         assert!(!selection_override(&Modifiers::CTRL));
         assert!(!selection_override(&Modifiers::COMMAND));
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::{paste_bytes, PASTE_END, PASTE_START};
+
+    fn s(text: &str, bracketed: bool) -> String {
+        String::from_utf8(paste_bytes(text, bracketed)).unwrap()
+    }
+
+    /// The mode the report was filed against: DECSET 2004 means "tell me where
+    /// the paste starts and ends".
+    #[test]
+    fn a_bracketed_paste_is_wrapped() {
+        assert_eq!(s("hello", true), format!("{PASTE_START}hello{PASTE_END}"));
+    }
+
+    /// Without the mode there is nothing to wrap in — the program cannot tell
+    /// a paste from typing, and must not be told it can.
+    #[test]
+    fn an_unbracketed_paste_is_bare() {
+        assert_eq!(s("hello", false), "hello");
+    }
+
+    /// A paste is data, and the byte Enter produces is CR. Both spellings of a
+    /// line break collapse to it, in both modes.
+    #[test]
+    fn newlines_become_carriage_returns() {
+        assert_eq!(s("a\nb\r\nc", false), "a\rb\rc");
+        assert_eq!(s("a\nb\r\nc", true), format!("{PASTE_START}a\rb\rc{PASTE_END}"));
+        // A CR that was already a CR is left alone rather than doubled.
+        assert_eq!(s("a\rb", false), "a\rb");
+    }
+
+    /// The whole point of the sanitiser: a payload carrying the terminator
+    /// must not be able to close the bracket early and have its tail run as
+    /// keystrokes.
+    #[test]
+    fn an_embedded_terminator_cannot_close_the_bracket_early() {
+        let out = s(&format!("safe{PASTE_END}rm -rf /"), true);
+        assert_eq!(out, format!("{PASTE_START}saferm -rf /{PASTE_END}"));
+        assert_eq!(
+            out.matches(PASTE_END).count(),
+            1,
+            "more than one terminator survived: {out:?}"
+        );
+        // The opener is just as bad: a second one nests, and programs that
+        // count them lose track of where the paste began.
+        let out = s(&format!("a{PASTE_START}b"), true);
+        assert_eq!(out.matches(PASTE_START).count(), 1, "{out:?}");
+    }
+
+    /// Stripping once is not enough: deleting a marker splices its neighbours
+    /// together, and the halves can spell a fresh one.
+    #[test]
+    fn stripping_runs_to_a_fixpoint() {
+        // "\x1b[20" + "\x1b[201~" + "1~" collapses into a live terminator.
+        let out = s("\x1b[20\x1b[201~1~tail", true);
+        assert_eq!(out, format!("{PASTE_START}tail{PASTE_END}"));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_key_tests {
+    use super::clipboard_key_is_passthrough;
+    use egui::Modifiers;
+
+    /// On macOS the clipboard modifier is ⌘, so Ctrl+C/Ctrl+V never arrive as
+    /// `Copy`/`Paste` at all and ⌘V must always paste.
+    #[test]
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    fn the_mac_always_uses_the_clipboard() {
+        assert!(!clipboard_key_is_passthrough(Modifiers::COMMAND));
+        assert!(!clipboard_key_is_passthrough(
+            Modifiers::COMMAND | Modifiers::SHIFT
+        ));
+    }
+
+    /// Elsewhere `command` is Ctrl: a bare Ctrl+C has to stay the interrupt,
+    /// and Ctrl+Shift+C is the clipboard, as in every X11 terminal.
+    #[test]
+    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
+    fn ctrl_passes_through_and_ctrl_shift_copies() {
+        assert!(clipboard_key_is_passthrough(Modifiers::COMMAND));
+        assert!(!clipboard_key_is_passthrough(
+            Modifiers::COMMAND | Modifiers::SHIFT
+        ));
+        // Shift+Insert, Ctrl+Insert and the media keys carry no command
+        // modifier — the old test sent them a ^V.
+        assert!(!clipboard_key_is_passthrough(Modifiers::SHIFT));
+        assert!(!clipboard_key_is_passthrough(Modifiers::NONE));
     }
 }

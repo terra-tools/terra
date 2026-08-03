@@ -76,6 +76,28 @@ bar_with_one_tab = true
 # Capped at 65536 (64 MB per tab).
 transcript_kb = 512
 
+[input]
+# Move the keyboard to the pane the mouse moves into.
+#
+# With the window split, the terminal you are pointing at is the terminal you
+# mean, and clicking first is a step that only tells terra something the cursor
+# already said. On by default; it is the X11 and tmux (focus-follows-mouse)
+# behaviour.
+#
+# It listens for actual pointer *movement* into a pane, so a resting cursor
+# never moves the keyboard: splitting, resizing or closing a pane, and output
+# scrolling underneath the cursor, all leave focus where it is. It also stands
+# down while a mouse button is held — a selection drag or a tab being carried
+# across the window belongs to the pane it started in — and while the command
+# palette or a dialog is up. Moving over a tab bar changes nothing; only a
+# pane's terminal counts. Clicking a pane focuses it either way.
+#
+# Set this to false for pure click-to-focus. The mouse *wheel* is not affected
+# by this key: it always scrolls the pane under the pointer, focused or not,
+# which is what lets you read another pane's scrollback while typing in this
+# one.
+focus_follows_mouse = true
+
 [window]
 # Ask before closing a window that is running something.
 #

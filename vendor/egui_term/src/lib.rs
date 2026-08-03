@@ -12,7 +12,9 @@ mod view;
 
 pub use backend::settings::BackendSettings;
 pub use backend::tap::OutputTap;
-pub use backend::{BackendCommand, PtyEvent, TerminalBackend, TerminalMode};
+pub use backend::{
+    BackendCommand, ClipboardType, PtyEvent, TerminalBackend, TerminalMode,
+};
 pub use bidi::{BidiBase, RowMap};
 pub use bindings::{Binding, BindingAction, InputKind, KeyboardBinding};
 pub use font::{FontSettings, TerminalFont};
