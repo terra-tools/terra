@@ -11,6 +11,12 @@ description = "Terra — a terminal your agents can drive"
 name = "terra-app"
 path = "src/main.rs"
 
+# build.rs embeds assets/icon/terra.ico into the .exe (see the script's doc
+# comment). winresource is a no-op on every non-Windows target, so this costs
+# the mac/linux builds nothing.
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 egui = { workspace = true }
 eframe = { workspace = true }

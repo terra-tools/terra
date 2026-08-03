@@ -186,6 +186,15 @@ fn close_would_kill_work(enabled: bool, tabs: Option<&Arc<Mutex<TabManager>>>) -
     confirm_close::should_confirm(enabled, &names)
 }
 
+/// `window.confirm_close`, mirrored for the AppKit termination hook.
+///
+/// `applicationShouldTerminate:` runs on the main thread *between* frames,
+/// where `App` — and so the `ConfigStore` inside it — is not reachable. The
+/// switch is one `bool` and it moves only when the config file does, so a
+/// mirror is enough; `App::sync_config_cache` keeps it current.
+static CONFIRM_CLOSE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(config::DEFAULT_WINDOW_CONFIRM_CLOSE);
+
 /// Ghostty-like readability: bright foreground on a soft dark background
 /// (egui_term's defaults are dimmer and smaller than a real terminal).
 fn terminal_theme() -> egui_term::TerminalTheme {
@@ -395,6 +404,12 @@ impl App {
         let (pty_sender, pty_events) = mpsc::channel();
         let config = config::ConfigStore::load();
         let cached_font = terminal_font(&config.get().font);
+        // `sync_config_cache` only fires when the generation moves, so the
+        // first value has to be published here.
+        CONFIRM_CLOSE_ENABLED.store(
+            config.get().window.confirm_close,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Self {
             pty_events,
             pty_sender,
@@ -445,6 +460,21 @@ impl App {
                 self.ipc = Some(server);
             }
             Err(err) => log::error!("terra: ipc server unavailable: {err}"),
+        }
+
+        // Now that there are tabs to protect, let a `terminate:` be held back
+        // too — see `macos::install_terminate_hook`. The guard runs between
+        // frames, so it may take the tab lock but must not want a frame; the
+        // same `close_would_kill_work` the in-window close path uses fits
+        // exactly.
+        {
+            let guard_tabs = Arc::clone(&tabs);
+            macos::install_terminate_hook(ctx, move || {
+                close_would_kill_work(
+                    CONFIRM_CLOSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+                    Some(&guard_tabs),
+                )
+            });
         }
 
         // Scoped so the guard is dropped before `ensure_started` returns —
@@ -847,6 +877,14 @@ impl App {
 
     /// Turn menu choices made since the last frame into actions.
     fn drain_menu_actions(&self, actions: &mut Vec<AppAction>) {
+        // A quit that arrived as an Apple event — Dock ▸ Quit, `osascript …
+        // quit`, logout — held back by `macos::install_terminate_hook`. It
+        // becomes an ordinary [`AppAction::Quit`] here, so the confirmation
+        // dialog, the fade and the teardown are the same code every other quit
+        // runs.
+        if macos::take_quit_request() {
+            actions.push(AppAction::Quit);
+        }
         for tag in macos::take_menu_actions() {
             match tag {
                 MENU_TAG_SETTINGS => actions.push(AppAction::OpenConfig),
@@ -999,6 +1037,10 @@ impl App {
             return;
         }
         self.cached_font = terminal_font(&self.config.get().font);
+        CONFIRM_CLOSE_ENABLED.store(
+            self.config.get().window.confirm_close,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.cached_config_generation = self.config.generation();
     }
 
@@ -1397,6 +1439,12 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         let step = if close_requested && !held {
+            // This close is going through. Tell the AppKit hook, so a
+            // `terminate:` that lands while the window fades — macOS re-sending
+            // the Apple event during logout, a second Dock ▸ Quit — is answered
+            // "yes" rather than turned into another question the user has
+            // already answered.
+            macos::approve_termination();
             self.closing.requested(now, || macos::animate_close(frame))
         } else {
             self.closing.tick(now)
@@ -1532,7 +1580,12 @@ impl eframe::App for App {
             self.confirm_close.answer(confirm_close::Choice::Close);
         }
         if (self.quitting || empty) && !self.closing.is_fading() {
-            self.ipc = None;
+            // The listener is *not* dropped here. A quit only becomes a close
+            // one frame later, and it may still be held back by the "Close
+            // Window?" dialog — a cancelled quit that had already unlinked the
+            // socket would leave a perfectly alive terra that no `terra`
+            // command can reach again. The close path drops it once the answer
+            // is in and the fade is over (`CloseStep::Close`).
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }

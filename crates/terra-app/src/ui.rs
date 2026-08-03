@@ -134,6 +134,11 @@ const BAR_BUTTON_ACTIVE_BG: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x40);
 /// small button inside the bar rather than as another tab.
 const BAR_BUTTON_HEIGHT: f32 = 21.0;
 const BAR_BUTTON_CORNER: u8 = 6;
+/// The hairline between `+` and `⌄` (Windows Terminal's `+ | ⌄`). Shorter than
+/// the hover wash so it reads as a divider, not a border.
+const BAR_BUTTON_SEPARATOR_HEIGHT: f32 = 14.0;
+// Premultiplied white at ~8% alpha (from_white_alpha is not const).
+const BAR_BUTTON_SEPARATOR: Color32 = Color32::from_rgba_premultiplied(0x14, 0x14, 0x14, 0x14);
 const TEXT_ACTIVE: Color32 = Color32::from_rgb(0xef, 0xef, 0xf4);
 const TEXT_IDLE: Color32 = Color32::from_rgb(0xb6, 0xb6, 0xbe);
 /// Title colours, sampled off Ghostty's native tab bar: the active title is
@@ -1435,6 +1440,19 @@ pub fn tab_bar(
                 Vec2::new(PLUS_WIDTH, bar.height()),
             );
             plus_button(ui, plus, actions);
+
+            // Windows Terminal draws a hairline between `+` and `⌄` so the
+            // pair reads as two controls rather than one wide button. Faint on
+            // purpose — quieter than the glyphs, shorter than the hover wash.
+            let sep_x = chevron_left(plus_x);
+            ui.painter().vline(
+                sep_x,
+                egui::Rangef::new(
+                    bar.center().y - BAR_BUTTON_SEPARATOR_HEIGHT / 2.0,
+                    bar.center().y + BAR_BUTTON_SEPARATOR_HEIGHT / 2.0,
+                ),
+                egui::Stroke::new(1.0, BAR_BUTTON_SEPARATOR),
+            );
 
             // The `⌄` hangs off this group's `+` right edge, Windows-Terminal
             // style — so it travels with the `+` as the row grows rather than

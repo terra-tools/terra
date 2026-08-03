@@ -582,23 +582,26 @@ pub enum SessionEdit {
 
 /// Resolve the config path. Honors `TERRA_CONFIG`, else `~/.terra/config.toml`.
 ///
-/// Deliberately mirrors [`terra_protocol::socket_path`], including its `/tmp`
-/// fallback for a missing `HOME`. `~/.terra` is computed independently of the
-/// socket path, because `TERRA_SOCKET` may relocate the socket without
-/// relocating the config.
+/// Home comes from [`crate::tabs::home_dir`] — `HOME` on Unix, `USERPROFILE`
+/// et al on Windows, where `HOME` is usually unset (the old direct `HOME` read
+/// sent Windows users to a literal `/tmp\.terra`). The `/tmp` last resort
+/// mirrors [`terra_protocol::socket_path`] and is effectively Unix-only.
+/// `~/.terra` is computed independently of the socket path, because
+/// `TERRA_SOCKET` may relocate the socket without relocating the config.
 pub fn config_path() -> PathBuf {
     resolve_path(
         std::env::var("TERRA_CONFIG").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
+        crate::tabs::home_dir(&|key| std::env::var_os(key)),
     )
 }
 
 /// The pure core of [`config_path`], so the precedence is testable without
 /// mutating process-global environment.
-fn resolve_path(terra_config: Option<&str>, home: Option<&str>) -> PathBuf {
+fn resolve_path(terra_config: Option<&str>, home: Option<PathBuf>) -> PathBuf {
     match terra_config {
         Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => PathBuf::from(home.unwrap_or("/tmp"))
+        _ => home
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".terra")
             .join("config.toml"),
     }
@@ -1355,16 +1358,16 @@ mod tests {
     #[test]
     fn terra_config_wins_over_the_home_path() {
         assert_eq!(
-            resolve_path(Some("/etc/terra.toml"), Some("/home/x")),
+            resolve_path(Some("/etc/terra.toml"), Some(PathBuf::from("/home/x"))),
             PathBuf::from("/etc/terra.toml")
         );
         assert_eq!(
-            resolve_path(None, Some("/home/x")),
+            resolve_path(None, Some(PathBuf::from("/home/x"))),
             PathBuf::from("/home/x/.terra/config.toml")
         );
         // An empty TERRA_CONFIG is treated as unset, not as the empty path.
         assert_eq!(
-            resolve_path(Some(""), Some("/home/x")),
+            resolve_path(Some(""), Some(PathBuf::from("/home/x"))),
             PathBuf::from("/home/x/.terra/config.toml")
         );
         // No HOME still yields a path rather than panicking.
