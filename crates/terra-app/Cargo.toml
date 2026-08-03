@@ -107,6 +107,12 @@ minimum-system-version = "11.0"
 # puts it back afterwards.
 signing-identity = "-"
 
+# Without this the setup.exe wears NSIS's default icon; the app itself already
+# gets terra.ico via `icons` above. (The dmg's volume icon needs nothing — the
+# packager derives an .icns from `icons` and passes --volicon itself.)
+[package.metadata.packager.nsis]
+installer-icon = "assets/icon/terra.ico"
+
 [package.metadata.packager.windows]
 # %1 is the file cargo-packager wants signed. It applies this to the main
 # binary, the uninstaller (via NSIS `!uninstfinalize`, from a different working
