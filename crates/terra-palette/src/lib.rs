@@ -22,7 +22,9 @@ use egui::{
 };
 
 /// Glyph drawn in an action's leading tile. Painted from primitives rather
-/// than typeset, so it never depends on a font shipping the codepoint.
+/// than typeset, so it never depends on a font shipping the codepoint — with
+/// one exception, [`PaletteIcon::Image`], for the rows that name a *program*
+/// and want its logo rather than a stroked shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteIcon {
     Plus,
@@ -34,6 +36,16 @@ pub enum PaletteIcon {
     Terminal,
     Power,
     Dot,
+    /// A texture the host uploaded, drawn to fill the tile. terra hands its
+    /// tab-icon set in this way (see `terra-app`'s `tab_icon::texture_id`), so
+    /// a "config: edit with Claude Code" row wears the same mark as the tab it
+    /// opens. The palette never decodes an image itself: it is given an id and
+    /// draws it.
+    Image(egui::TextureId),
+    /// The same, but *tinted*: a coverage mask rather than a picture, so it
+    /// takes the section's accent colour the way a stroked glyph does. For
+    /// marks that are chrome (terra's gear) rather than a brand.
+    Mask(egui::TextureId),
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +155,10 @@ const ICON_TILE_RADIUS: u8 = 5;
 const ICON_STROKE: f32 = 1.5;
 /// Space between the icon tile and the label.
 const ICON_GAP: f32 = 10.0;
+/// How much of the tile a [`PaletteIcon::Image`] fills. The stroked glyphs
+/// live inside roughly this much of it too, so a brand mark lands at the same
+/// optical weight as its neighbours instead of looming over them.
+const ICON_IMAGE_SCALE: f32 = 0.72;
 
 /// Translucent white, premultiplied (the `const` form of `from_white_alpha`).
 const fn white(alpha: u8) -> Color32 {
@@ -323,6 +339,21 @@ fn paint_icon(p: &egui::Painter, tile: Rect, icon: PaletteIcon, tint: Color32) {
         }
         PaletteIcon::Dot => {
             p.circle_filled(c, r * 0.45, tint);
+        }
+        PaletteIcon::Image(id) | PaletteIcon::Mask(id) => {
+            // Inset from the tile so the logo sits inside the tinted chip the
+            // way a stroked glyph does, rather than filling it edge to edge.
+            let glyph = Rect::from_center_size(c, Vec2::splat(tile.width() * ICON_IMAGE_SCALE));
+            let color = match icon {
+                PaletteIcon::Mask(_) => tint,
+                _ => Color32::WHITE,
+            };
+            p.image(
+                id,
+                glyph,
+                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                color,
+            );
         }
     }
 }

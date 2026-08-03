@@ -28,6 +28,7 @@ use egui::{
 };
 
 use crate::config::Profile;
+use crate::edit_tools::EditTool;
 use crate::tab_icon::{IconCache, TabIcon};
 use crate::tabs::TabManager;
 
@@ -51,6 +52,11 @@ const PLUS_WIDTH: f32 = 28.0;
 const CHEVRON_WIDTH: f32 = 20.0;
 /// Tabs never shrink below this, even if that means the row overflows (clipped).
 const MIN_TAB_WIDTH: f32 = 44.0;
+/// Tabs never grow past this, however empty the bar is. Chrome and VS Code both
+/// cap the pill and leave the rest of the strip bare; without a cap a lone tab
+/// spans the whole window and reads as an address bar rather than as a tab.
+/// 240 is wide enough for a full `~/src/terra — zsh` style title at 13px.
+const MAX_TAB_WIDTH: f32 = 240.0;
 /// A tab only shows its `⌘n` hint when it is at least this wide.
 const HINT_MIN_TAB_WIDTH: f32 = 120.0;
 /// Horizontal space kept free on both sides of the centred title, so the title
@@ -119,10 +125,15 @@ const TAB_HOVER_BG: Color32 = Color32::from_rgb(0x27, 0x27, 0x2a);
 /// Darker than the bar: the seam between two inactive tabs.
 const TAB_SEPARATOR: Color32 = Color32::from_rgb(0x14, 0x14, 0x16);
 const CLOSE_HOVER_BG: Color32 = Color32::from_rgb(0x63, 0x63, 0x6b);
-const PLUS_HOVER_BG: Color32 = Color32::from_rgb(0x2e, 0x2e, 0x33);
-/// The + button's enclosing circle (Ghostty-style).
-const PLUS_CIRCLE_RADIUS: f32 = 10.5;
-const PLUS_CIRCLE_EDGE: Color32 = Color32::from_rgb(0x45, 0x45, 0x4a);
+/// The wash behind a bar button (`+`, `⌄`) under the pointer. At rest they draw
+/// no chrome at all, Windows Terminal style — see [`bar_button_chrome`].
+const BAR_BUTTON_HOVER_BG: Color32 = Color32::from_rgb(0x2e, 0x2e, 0x33);
+/// The same wash a shade stronger, so a press reads as landing.
+const BAR_BUTTON_ACTIVE_BG: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x40);
+/// Height of that wash — a little short of the tab height, so it reads as a
+/// small button inside the bar rather than as another tab.
+const BAR_BUTTON_HEIGHT: f32 = 21.0;
+const BAR_BUTTON_CORNER: u8 = 6;
 const TEXT_ACTIVE: Color32 = Color32::from_rgb(0xef, 0xef, 0xf4);
 const TEXT_IDLE: Color32 = Color32::from_rgb(0xb6, 0xb6, 0xbe);
 /// Title colours, sampled off Ghostty's native tab bar: the active title is
@@ -217,6 +228,10 @@ pub enum AppAction {
     /// the documented example first if it does not exist yet) — Windows
     /// Terminal's "Settings" menu item.
     OpenConfig,
+    /// Hand `~/.terra/config.toml` to one detected tool: an agent gets a new
+    /// tab and a prompt, an editor just gets the file. See
+    /// [`crate::edit_tools`].
+    EditConfigWith(EditTool),
     ShowConfigWarnings,
     Quit,
 }
@@ -327,7 +342,9 @@ pub fn consume_shortcuts(ui: &mut Ui) -> Vec<AppAction> {
 /// Width of a single tab: the bar minus the `+` and `⌄` zone, split evenly.
 ///
 /// `n` is the number of tabs. The result is clamped to [`MIN_TAB_WIDTH`], in
-/// which case the row overflows and is clipped instead of collapsing to slivers.
+/// which case the row overflows and is clipped instead of collapsing to slivers,
+/// and to [`MAX_TAB_WIDTH`], in which case the tabs sit at the left of the bar
+/// and the space they declined stays empty.
 fn tab_width(bar_width: f32, n: usize) -> f32 {
     if n == 0 {
         return 0.0;
@@ -335,7 +352,35 @@ fn tab_width(bar_width: f32, n: usize) -> f32 {
     let n_f = n as f32;
     let usable = bar_width - PLUS_WIDTH - CHEVRON_WIDTH - PLUS_GAP;
     let per = (usable - TAB_GAP * (n_f - 1.0)) / n_f;
-    per.max(MIN_TAB_WIDTH)
+    per.clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH)
+}
+
+/// Left edge of the `+` button: docked immediately after the last tab, Chrome
+/// style, rather than pinned to the right of the bar. The `⌄` rides along
+/// directly off its right edge — see [`chevron_left`] — so the pair reads as one
+/// control that follows the row instead of two things stranded across the bar.
+///
+/// `tabs_end` is the right edge of the last tab *as drawn this frame* — the
+/// animated one — so the cluster slides along with a tab growing in or shrinking
+/// away instead of jumping a whole slot. Once the tabs fill their share it stops
+/// where both buttons still fit before `bar_right`, which is exactly the row's
+/// own limit ([`tabs_limit`]) plus the gap, so crossing that threshold moves it
+/// by nothing at all.
+fn plus_left(tabs_end: f32, bar_right: f32) -> f32 {
+    (tabs_end + PLUS_GAP).min(bar_right - PLUS_WIDTH - CHEVRON_WIDTH)
+}
+
+/// Left edge of the `⌄`, which hangs off the `+` wherever that ended up.
+fn chevron_left(plus_left: f32) -> f32 {
+    plus_left + PLUS_WIDTH
+}
+
+/// How far right the tabs themselves may reach: the bar minus the space the
+/// `+` and `⌄` need once the row is dense enough to push them to the end.
+/// Bounds both the row's clip and the drag clamp, so a tab can never slide
+/// under either button.
+fn tabs_limit(bar_right: f32) -> f32 {
+    bar_right - PLUS_WIDTH - CHEVRON_WIDTH - PLUS_GAP
 }
 
 // ---------------------------------------------------------------------------
@@ -735,27 +780,49 @@ fn tab(ui: &mut Ui, v: &TabVisual<'_>, actions: &mut Vec<AppAction>) -> egui::Re
     response
 }
 
-/// Draw the `+` button in its fixed zone at the far right of the bar.
+/// The chrome shared by the bar's two buttons, the `+` and the `⌄`: nothing at
+/// all at rest, a rounded wash under the pointer, a stronger one while held.
+/// Windows Terminal's treatment — the buttons read as bar furniture until you
+/// reach for one, instead of as two permanently outlined controls competing
+/// with the tabs. Returns the colour to draw the glyph in.
+///
+/// Only the *fill* is inset from `rect`; the rect itself is still the hit
+/// target, so shedding the resting outline costs the button no clickable area.
+/// `lit` forces the hot look on for a button whose menu is open.
+fn bar_button_chrome(ui: &Ui, rect: Rect, response: &egui::Response, lit: bool) -> Color32 {
+    let held = response.is_pointer_button_down_on();
+    let hot = lit || response.hovered();
+    if hot {
+        ui.painter().rect_filled(
+            Rect::from_center_size(rect.center(), Vec2::new(rect.width(), BAR_BUTTON_HEIGHT)),
+            CornerRadius::same(BAR_BUTTON_CORNER),
+            if held {
+                BAR_BUTTON_ACTIVE_BG
+            } else {
+                BAR_BUTTON_HOVER_BG
+            },
+        );
+    }
+    match (hot, held) {
+        (_, true) => TITLE_ACTIVE,
+        (true, false) => TEXT_ACTIVE,
+        // The inactive tab title's grey: at rest these are furniture.
+        (false, false) => TITLE_IDLE,
+    }
+}
+
+/// Draw the `+` button, in whatever zone the bar has docked it into.
 fn plus_button(ui: &mut Ui, rect: Rect, actions: &mut Vec<AppAction>) {
     let response = ui
         .interact(rect, ui.id().with("terra_new_tab"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("New tab  ⌘T");
 
     if ui.is_rect_visible(rect) {
+        let color = bar_button_chrome(ui, rect, &response, false);
         let painter = ui.painter();
         let c = rect.center();
-        // Ghostty draws the + inside its own small circle.
-        let r = PLUS_CIRCLE_RADIUS;
-        if response.hovered() {
-            painter.circle_filled(c, r, PLUS_HOVER_BG);
-        }
-        painter.circle_stroke(c, r, Stroke::new(1.0, PLUS_CIRCLE_EDGE));
         let arm = 4.5;
-        let color = if response.hovered() {
-            TEXT_ACTIVE
-        } else {
-            TEXT_IDLE
-        };
         let stroke = Stroke::new(1.3, color);
         painter.line_segment(
             [egui::pos2(c.x - arm, c.y), egui::pos2(c.x + arm, c.y)],
@@ -772,12 +839,19 @@ fn plus_button(ui: &mut Ui, rect: Rect, actions: &mut Vec<AppAction>) {
     }
 }
 
-/// Whether a group's bar is worth showing at all: like Ghostty, a lone tab in
-/// the only group gets no chrome and the terminal owns the full column height.
-/// The moment there is a second group, every group shows its bar — otherwise
-/// a single-tab column would be indistinguishable from its neighbour.
-pub fn bar_visible(tab_count: usize, group_count: usize) -> bool {
-    group_count >= 2 || tab_count >= 2
+/// Whether a group's bar is worth showing at all.
+///
+/// Two tabs, or two groups, always show every bar — otherwise a single-tab
+/// column would be indistinguishable from its neighbour. The one open question
+/// is a lone tab in the only group, and `with_one_tab` (the `[tabs]
+/// bar_with_one_tab` config key) answers it: on by default, so the `+` button
+/// and the tab's title are there from the first tab; off gives the older,
+/// Ghostty-like bare window, where the terminal owns the full column height.
+///
+/// The lone *empty* group — a transient between the last close and the app
+/// exiting — is chrome over nothing, so it stays bare under either setting.
+pub fn bar_visible(tab_count: usize, group_count: usize, with_one_tab: bool) -> bool {
+    group_count >= 2 || tab_count >= 2 || (tab_count == 1 && with_one_tab)
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +867,9 @@ pub struct MenuEntry {
     /// use — so the row for an `htop` profile and the tab it opens carry the
     /// same mark.
     pub icon: TabIcon,
+    /// Right-aligned keybinding hint, macOS-menu style (`⇧⌘P`). Rows that are
+    /// only reachable through the menu carry none.
+    pub shortcut: Option<String>,
     pub action: AppAction,
 }
 
@@ -803,12 +880,18 @@ impl MenuEntry {
         Self {
             label: label.into(),
             icon: TabIcon::Terminal,
+            shortcut: None,
             action,
         }
     }
 
     pub fn with_icon(mut self, icon: TabIcon) -> Self {
         self.icon = icon;
+        self
+    }
+
+    pub fn with_shortcut(mut self, shortcut: impl Into<String>) -> Self {
+        self.shortcut = Some(shortcut.into());
         self
     }
 }
@@ -825,7 +908,10 @@ impl MenuEntry {
 /// Split out from the drawing so the list is testable without a `Ui`, and so
 /// whoever re-anchors the button only has to decide *where* it goes.
 pub fn new_tab_entries<'a>(profiles: impl IntoIterator<Item = &'a Profile>) -> Vec<MenuEntry> {
-    let mut entries = vec![MenuEntry::new("New Tab", AppAction::NewTab)];
+    let mut entries = vec![
+        MenuEntry::new("New Tab", AppAction::NewTab).with_shortcut("⌘T"),
+        MenuEntry::new("Command Palette", AppAction::OpenPalette).with_shortcut("⇧⌘P"),
+    ];
     entries.extend(profiles.into_iter().map(|profile| {
         let mut text = profile.command.join(" ");
         if let Some(title) = &profile.title {
@@ -838,12 +924,12 @@ pub fn new_tab_entries<'a>(profiles: impl IntoIterator<Item = &'a Profile>) -> V
         )
         .with_icon(crate::tab_icon::from_text(&text).unwrap_or(TabIcon::Terminal))
     }));
-    // Windows Terminal's dropdown ends on Settings; so does this one. The
-    // row opens the config file in an editor rather than a settings UI —
-    // the file *is* terra's settings surface.
-    entries.push(MenuEntry::new("Settings", AppAction::OpenConfig).with_icon(TabIcon::Gear));
     entries
 }
+
+/// How many rows at the head of [`new_tab_entries`] are terra's own commands
+/// rather than profiles — i.e. where the menu's hairline goes.
+const MENU_COMMAND_ROWS: usize = 2;
 
 /// A `⌄` disclosure button and the menu it opens: `ui` + a rect + a list of
 /// actions in, the chosen action out.
@@ -870,22 +956,11 @@ pub fn chevron_menu(
 
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
     if ui.is_rect_visible(rect) {
+        // Same chrome as the `+` next to it, and an open menu keeps it lit.
+        // The glyph is drawn rather than typeset, so no font has to have it.
+        let color = bar_button_chrome(ui, rect, &response, open);
         let painter = ui.painter();
-        // Same visual language as the `+`: a dark rounded fill on hover, the
-        // glyph itself drawn rather than typeset so no font has to have it.
-        if response.hovered() || open {
-            painter.rect_filled(
-                Rect::from_center_size(rect.center(), Vec2::new(rect.width(), CHEVRON_HEIGHT)),
-                CornerRadius::same(CHEVRON_CORNER),
-                PLUS_HOVER_BG,
-            );
-        }
         let c = rect.center();
-        let color = if response.hovered() || open {
-            TEXT_ACTIVE
-        } else {
-            TEXT_IDLE
-        };
         let stroke = Stroke::new(1.3, color);
         // A `⌄`: two strokes meeting below centre, so it reads as pointing at
         // the menu that drops out of it.
@@ -919,9 +994,10 @@ pub fn chevron_menu(
             // egui's default rhythm has nothing left to add.
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             for (i, entry) in entries.iter().enumerate() {
-                // The default shell is not one of the profiles; a hairline
-                // says so without a heading.
-                if i == 1 {
+                // terra's own commands are not profiles; a hairline says so
+                // without a heading. Never trailing: the loop only reaches
+                // this index when there is a profile row after it.
+                if i == MENU_COMMAND_ROWS {
                     menu_separator(ui);
                 }
                 if menu_row(ui, entry).clicked() {
@@ -938,13 +1014,19 @@ pub fn chevron_menu(
 /// not a chip.
 fn menu_width(ui: &Ui, entries: &[MenuEntry]) -> f32 {
     let font = title_font(false);
+    let measure =
+        |text: String, font: FontId| ui.painter().layout_no_wrap(text, font, MENU_TEXT).size().x;
     let widest = entries
         .iter()
         .map(|entry| {
-            ui.painter()
-                .layout_no_wrap(entry.label.clone(), font.clone(), MENU_TEXT)
-                .size()
-                .x
+            let label = measure(entry.label.clone(), font.clone());
+            // The hint is part of the row's width, not an overlay: a menu that
+            // sized itself on labels alone would have "⇧⌘P" sitting on top of
+            // "Command Palette".
+            let hint = entry.shortcut.as_ref().map_or(0.0, |sc| {
+                MENU_SHORTCUT_GAP + measure(sc.clone(), hint_font())
+            });
+            label + hint
         })
         .fold(0.0_f32, f32::max);
     let content = MENU_ROW_PAD_X * 2.0 + ICON_SIZE + MENU_ICON_GAP + widest;
@@ -1010,6 +1092,18 @@ fn menu_row(ui: &mut Ui, entry: &MenuEntry) -> egui::Response {
         rect.center().y - galley.size().y * 0.5,
     );
     ui.painter().galley(baseline, galley, text_color);
+
+    // The hint, dimmed and hard right — where macOS puts a menu key equivalent.
+    if let Some(shortcut) = &entry.shortcut {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(shortcut.clone(), hint_font(), TEXT_HINT);
+        let pos = egui::pos2(
+            rect.right() - MENU_ROW_PAD_X - galley.size().x,
+            rect.center().y - galley.size().y * 0.5,
+        );
+        ui.painter().galley(pos, galley, TEXT_HINT);
+    }
     response
 }
 
@@ -1028,10 +1122,6 @@ fn menu_separator(ui: &mut Ui) {
     );
 }
 
-/// Height of the chevron's hover fill — a little short of the tab height, so
-/// it reads as a small button inside the bar rather than a tab.
-const CHEVRON_HEIGHT: f32 = 21.0;
-const CHEVRON_CORNER: u8 = 6;
 /// Half-width of the `⌄` glyph.
 const CHEVRON_ARM: f32 = 4.0;
 /// Keeps the menu from collapsing to the width of "New Tab".
@@ -1056,6 +1146,9 @@ const MENU_ROW_PAD_X: f32 = 10.0;
 /// Wider than the pills' [`ICON_GAP`]: a menu has the room, and the extra air
 /// lets the labels line up as a column instead of crowding their logos.
 const MENU_ICON_GAP: f32 = 8.0;
+/// Least space between the longest label and its keybinding hint, so the two
+/// columns never touch however narrow the menu gets.
+const MENU_SHORTCUT_GAP: f32 = 24.0;
 /// The hover fill, from the pills' grey family — between [`TAB_HOVER_BG`] and
 /// [`TAB_ACTIVE_BG`], because it has to read against the panel and not the bar.
 const MENU_ROW_HOVER: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x40);
@@ -1099,8 +1192,9 @@ fn slot_title(tabs: &TabManager, id: u64) -> String {
 /// group's column), allocating [`TAB_BAR_HEIGHT`]. Appends any user
 /// interaction to `actions`.
 ///
-/// With a single group holding fewer than two tabs nothing is drawn and no
-/// space is taken, so the terminal below simply grows into the whole column.
+/// Nothing is drawn and no space is taken when [`bar_visible`] says so — a
+/// single group holding no tabs, or holding one tab with `bar_with_one_tab`
+/// off — and the terminal below simply grows into the whole column.
 /// Keyboard shortcuts are handled by [`consume_shortcuts`] and keep working
 /// with the bar hidden. `focused` gates the `⌘n` hints, which act on the
 /// focused group only.
@@ -1116,6 +1210,7 @@ pub fn tab_bar(
     group: usize,
     focused: bool,
     icons: &IconCache,
+    with_one_tab: bool,
     actions: &mut Vec<AppAction>,
 ) {
     // Identity by stable leaf id, not DFS index: a split renumbers every
@@ -1123,7 +1218,11 @@ pub fn tab_bar(
     // neighbour's animations — one drop visibly nudging every other bar.
     let leaf = tabs.group_leaf_id(group).unwrap_or(u64::MAX);
     let state_id = Id::new(("terra_tab_bar_state", leaf));
-    if !bar_visible(tabs.group_tabs(group).len(), tabs.group_count()) {
+    if !bar_visible(
+        tabs.group_tabs(group).len(),
+        tabs.group_count(),
+        with_one_tab,
+    ) {
         // Nothing on screen to continue from: drop the animations so the bar
         // comes back settled rather than mid-flight from minutes ago.
         ui.ctx().data_mut(|d| d.remove::<BarState>(state_id));
@@ -1153,9 +1252,10 @@ pub fn tab_bar(
         {
             let bar = panel.shrink2(Vec2::new(f32::from(PAD_X), f32::from(PAD_Y)));
             let now = ui.input(|i| i.time);
-            let chevron_left = bar.right() - CHEVRON_WIDTH;
-            let plus_left = chevron_left - PLUS_WIDTH;
-            let tabs_right = plus_left - PLUS_GAP;
+            // The furthest right the tabs may reach. The `+` and the `⌄` dock
+            // after the last tab (see [`plus_left`]) rather than sitting here,
+            // but a dense row still has to stop short of where they end up.
+            let tabs_right = tabs_limit(bar.right());
             let width = tab_width(bar.width(), tabs.group_tabs(group).len());
 
             // 1. Carry an in-progress drag first, so the rest of the frame lays
@@ -1321,20 +1421,31 @@ pub fn tab_bar(
                 ui.ctx().request_repaint();
             }
 
+            // `cursor` left the layout loop just past the last slot, so it is
+            // the animated right edge of the row — ghosts included, which is
+            // what keeps the `+` gliding back as a closing tab shrinks away.
+            let tabs_end = if slots.is_empty() {
+                bar.left()
+            } else {
+                cursor - TAB_GAP
+            };
+            let plus_x = plus_left(tabs_end, bar.right());
             let plus = Rect::from_min_size(
-                egui::pos2(plus_left, bar.top()),
+                egui::pos2(plus_x, bar.top()),
                 Vec2::new(PLUS_WIDTH, bar.height()),
             );
             plus_button(ui, plus, actions);
 
             // The `⌄` hangs off this group's `+` right edge, Windows-Terminal
-            // style. The bar is the only thing deciding *where*; the button
-            // itself is anchor-agnostic (see [`chevron_menu`]), so every group
-            // gets its own, salted by leaf id so two bars' popups and
-            // interact ids never collide (and an open popup stays this
-            // bar's when a split renumbers the groups).
+            // style — so it travels with the `+` as the row grows rather than
+            // being stranded at the far end of an empty bar. The bar is the
+            // only thing deciding *where*; the button itself is anchor-agnostic
+            // (see [`chevron_menu`]), so every group gets its own, salted by
+            // leaf id so two bars' popups and interact ids never collide (and
+            // an open popup stays this bar's when a split renumbers the
+            // groups).
             let chevron = Rect::from_min_size(
-                egui::pos2(chevron_left, bar.top()),
+                egui::pos2(chevron_left(plus_x), bar.top()),
                 Vec2::new(CHEVRON_WIDTH, bar.height()),
             );
             let entries = new_tab_entries(tabs.profiles().values());
@@ -1669,37 +1780,184 @@ mod tests {
         );
     }
 
+    /// A lone tab is a tab, not an address bar: it takes its cap and leaves the
+    /// rest of the bar empty. Only a bar too narrow to grant even that goes back
+    /// to sharing.
     #[test]
-    fn a_single_tab_takes_the_whole_bar() {
-        let w = tab_width(400.0, 1);
-        assert!((w + PLUS_GAP + PLUS_WIDTH + CHEVRON_WIDTH - 400.0).abs() < 0.01);
+    fn a_single_tab_stops_at_the_cap() {
+        assert_eq!(tab_width(400.0, 1), MAX_TAB_WIDTH);
+        assert_eq!(tab_width(2000.0, 1), MAX_TAB_WIDTH);
+        let narrow = tab_width(200.0, 1);
+        assert!(narrow < MAX_TAB_WIDTH);
+        assert!((narrow + PLUS_GAP + PLUS_WIDTH + CHEVRON_WIDTH - 200.0).abs() < 0.01);
     }
 
-    /// The menu always offers a plain new tab first, then the profiles in the
-    /// order they arrive — which is the config's `BTreeMap` order, i.e.
-    /// alphabetical — and ends on Settings, Windows Terminal style.
+    /// The cap is per bar, so it is the *share* that decides: the same window
+    /// hands three tabs the cap and four tabs less than it.
     #[test]
-    fn the_chevron_menu_lists_the_default_shell_then_every_profile() {
+    fn crowded_tabs_keep_sharing_the_bar_below_the_cap() {
+        // 800 wide: 746 usable, so three tabs want 248.7 and are capped.
+        assert_eq!(tab_width(800.0, 3), MAX_TAB_WIDTH);
+        let four = tab_width(800.0, 4);
+        assert!(four < MAX_TAB_WIDTH);
+        assert!(
+            (4.0 * four + 3.0 * TAB_GAP + PLUS_GAP + PLUS_WIDTH + CHEVRON_WIDTH - 800.0).abs()
+                < 0.01
+        );
+        // A narrow bar's tabs are untouched by the cap, at every count.
+        for n in 1..40 {
+            let w = tab_width(300.0, n);
+            assert!(w <= MAX_TAB_WIDTH, "{n} tabs at {w}");
+        }
+    }
+
+    /// The `+` follows the last tab while there is room, and parks at the end
+    /// of the bar the moment the tabs claim the whole row — the two agree
+    /// exactly at the crossover, so adding tabs never makes it jump.
+    #[test]
+    fn the_plus_docks_after_the_last_tab_until_the_row_is_full() {
+        let (left, right) = (10.0, 810.0);
+        let parked = right - PLUS_WIDTH - CHEVRON_WIDTH;
+        let tabs_right = tabs_limit(right);
+
+        // One capped tab: the button sits a gap past its right edge.
+        let one = left + tab_width(800.0, 1);
+        assert_eq!(plus_left(one, right), one + PLUS_GAP);
+        // Three capped tabs: further right, still short of the parked slot.
+        let three = left + 3.0 * tab_width(800.0, 3) + 2.0 * TAB_GAP;
+        assert_eq!(plus_left(three, right), three + PLUS_GAP);
+        assert!(plus_left(three, right) < parked);
+        // Exactly full, and overflowing: parked at the end, both times.
+        assert_eq!(plus_left(tabs_right, right), parked);
+        assert_eq!(plus_left(tabs_right + 500.0, right), parked);
+        // Never leaves the bar, however long the row claims to be.
+        for end in [0.0, 100.0, 500.0, 5000.0] {
+            assert!(chevron_left(plus_left(end, right)) + CHEVRON_WIDTH <= right);
+        }
+    }
+
+    /// Render one frame of a bar button at `rect` with the pointer somewhere,
+    /// and report the glyph colour it chose plus every rect fill that reached
+    /// the paint list. Two frames because egui hit-tests against the widget
+    /// rects it registered *last* frame.
+    fn bar_button_frame(rect: Rect, pointer: egui::Pos2) -> (Color32, Vec<Color32>) {
+        let ctx = egui::Context::default();
+        let mut glyph = Color32::PLACEHOLDER;
+        let mut fills = Vec::new();
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerMoved(pointer)],
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = ui.interact(rect, Id::new("probe"), Sense::click());
+                    glyph = bar_button_chrome(ui, rect, &response, false);
+                });
+            });
+            fills = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(r) => Some(r.fill),
+                    _ => None,
+                })
+                .collect();
+        }
+        (glyph, fills)
+    }
+
+    /// Windows Terminal's treatment: at rest the `+` and `⌄` are bare glyphs in
+    /// the inactive title's grey, with no ring and no fill of their own; the
+    /// wash and the brighter glyph only arrive with the pointer.
+    #[test]
+    fn a_bar_button_is_bare_until_the_pointer_reaches_it() {
+        let rect = Rect::from_min_size(egui::pos2(100.0, 4.0), Vec2::new(PLUS_WIDTH, 24.0));
+
+        let (cold, cold_fills) = bar_button_frame(rect, egui::pos2(5.0, 400.0));
+        assert_eq!(cold, TITLE_IDLE);
+        assert!(!cold_fills.contains(&BAR_BUTTON_HOVER_BG));
+        assert!(!cold_fills.contains(&BAR_BUTTON_ACTIVE_BG));
+
+        let (hot, hot_fills) = bar_button_frame(rect, rect.center());
+        assert_eq!(hot, TEXT_ACTIVE);
+        assert!(hot_fills.contains(&BAR_BUTTON_HOVER_BG));
+    }
+
+    /// The `⌄` is welded to the `+`, so the pair travels as one cluster —
+    /// including into the parked slot, where together they exactly fill the
+    /// space the row gave up.
+    #[test]
+    fn the_chevron_rides_along_on_the_plus() {
+        let right = 810.0;
+        for end in [0.0, 100.0, 500.0, 5000.0] {
+            let plus = plus_left(end, right);
+            assert_eq!(chevron_left(plus), plus + PLUS_WIDTH);
+        }
+        // At the crossover the tabs stop one gap short of the cluster, and the
+        // cluster reaches the bar's right edge exactly.
+        let plus = plus_left(tabs_limit(right), right);
+        assert_eq!(plus - tabs_limit(right), PLUS_GAP);
+        assert_eq!(chevron_left(plus) + CHEVRON_WIDTH, right);
+    }
+
+    /// A tab wide enough to be capped is wide enough for its `⌘n`, so the hint
+    /// never disappears just because the cap kicked in.
+    #[test]
+    fn a_capped_tab_still_has_room_for_its_hint() {
+        // However wide the window, the widest tab it can hand out clears both
+        // the hint's threshold and the title's own reserved margins.
+        for bar in [400.0, 1200.0, 4000.0] {
+            let w = tab_width(bar, 1);
+            assert!(w >= HINT_MIN_TAB_WIDTH, "{bar} wide bar gave {w}");
+            assert!(w > 2.0 * TITLE_RESERVE);
+        }
+    }
+
+    /// The menu offers terra's own two commands first — a plain new tab and
+    /// the palette, each with its key hint — then the profiles in the order
+    /// they arrive, which is the config's `BTreeMap` order, i.e. alphabetical.
+    #[test]
+    fn the_chevron_menu_lists_the_commands_then_every_profile() {
         let bare = new_tab_entries(std::iter::empty());
-        assert_eq!(bare.len(), 2);
-        assert_eq!(bare[0], MenuEntry::new("New Tab", AppAction::NewTab));
+        assert_eq!(bare.len(), MENU_COMMAND_ROWS);
+        assert_eq!(
+            bare[0],
+            MenuEntry::new("New Tab", AppAction::NewTab).with_shortcut("⌘T")
+        );
         assert_eq!(
             bare[1],
-            MenuEntry::new("Settings", AppAction::OpenConfig).with_icon(TabIcon::Gear)
+            MenuEntry::new("Command Palette", AppAction::OpenPalette).with_shortcut("⇧⌘P")
         );
 
         let profiles = [profile("build", "cargo build"), profile("htop", "htop")];
         let entries = new_tab_entries(&profiles);
         let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
-        assert_eq!(labels, ["New Tab", "build", "htop", "Settings"]);
+        assert_eq!(labels, ["New Tab", "Command Palette", "build", "htop"]);
         assert_eq!(
-            entries[1].action,
+            entries[2].action,
             AppAction::NewTabProfile("build".to_owned())
         );
         assert_eq!(
-            entries[2].action,
+            entries[3].action,
             AppAction::NewTabProfile("htop".to_owned())
         );
+        // A profile row is reachable only from the menu, so it carries no hint.
+        assert!(entries[2].shortcut.is_none());
+    }
+
+    /// Settings left this menu when "Edit Settings With …" arrived: the app
+    /// menu and the palette both carry it (⌘, still opens the file), and a
+    /// dropdown hanging off `+` is about *opening tabs*.
+    #[test]
+    fn the_chevron_menu_no_longer_offers_settings() {
+        let profiles = [profile("build", "cargo build")];
+        for entry in new_tab_entries(&profiles) {
+            assert_ne!(entry.action, AppAction::OpenConfig);
+            assert_ne!(entry.icon, TabIcon::Gear);
+        }
     }
 
     fn profile(name: &str, command: &str) -> Profile {
@@ -1728,25 +1986,36 @@ mod tests {
         assert_eq!(
             icons,
             [
-                // "New Tab" itself.
+                // "New Tab" and "Command Palette" — terra's own commands.
+                TabIcon::Terminal,
                 TabIcon::Terminal,
                 TabIcon::Htop,
                 TabIcon::OpenAi,
                 TabIcon::Terminal,
-                // The trailing Settings row.
-                TabIcon::Gear,
             ]
         );
     }
 
     #[test]
-    fn the_bar_hides_for_a_lone_tab_in_a_lone_group() {
-        assert!(!bar_visible(0, 1));
-        assert!(!bar_visible(1, 1));
-        assert!(bar_visible(2, 1));
+    fn the_bar_shows_for_a_lone_tab_by_default() {
+        // Chrome over nothing stays hidden; one tab is the default-on case.
+        assert!(!bar_visible(0, 1, true));
+        assert!(bar_visible(1, 1, true));
+        assert!(bar_visible(2, 1, true));
         // With a second group every column shows its bar, tabs or not.
-        assert!(bar_visible(1, 2));
-        assert!(bar_visible(0, 2));
+        assert!(bar_visible(1, 2, true));
+        assert!(bar_visible(0, 2, true));
+    }
+
+    /// `[tabs] bar_with_one_tab = false` buys back the bare single-tab window,
+    /// and nothing else: two tabs, or two groups, still show every bar.
+    #[test]
+    fn bar_with_one_tab_off_hides_the_bar_for_a_lone_tab_only() {
+        assert!(!bar_visible(0, 1, false));
+        assert!(!bar_visible(1, 1, false));
+        assert!(bar_visible(2, 1, false));
+        assert!(bar_visible(1, 2, false));
+        assert!(bar_visible(2, 2, false));
     }
 
     #[test]

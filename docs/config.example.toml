@@ -38,6 +38,19 @@ line_height = 1.3
 # the drawing.
 icons = true
 
+# Show the tab bar when there is only one tab open.
+#
+# On by default: the bar carries the tab's title, the + button and the ⌄ profile
+# menu, and a window that grows its chrome only once you own a second tab both
+# hides the way to open one and shifts the terminal down by the bar's height the
+# moment you do.
+#
+# Set this to false for a bare single-tab window — Ghostty's behaviour, and
+# terra's before this key existed. The bar comes back the moment there is a
+# second tab; a split always shows every group's bar either way, since two
+# unlabelled columns are indistinguishable.
+bar_with_one_tab = true
+
 [text]
 # Reorder right-to-left text (Hebrew, Arabic, …) for display, per the Unicode
 # Bidirectional Algorithm, UAX #9: https://unicode.org/reports/tr9/
