@@ -72,6 +72,12 @@ category = "DeveloperTool"
 # terra-cli into the same target directory) to Terra.app/Contents/MacOS, to the
 # .deb's /usr/bin and to the NSIS install directory. `main = true` is what picks
 # the .app's CFBundleExecutable and the installer's launch target.
+# The order here does not reach cargo-packager: it sorts its sign targets by
+# path depth alone (`impl Ord for SignTarget`, src/codesign/macos.rs), so two
+# binaries in Contents/MacOS tie and come out of the BinaryHeap in whatever
+# order it likes. Signing the *main* executable makes codesign validate the
+# whole bundle, so an unsigned sibling fails the run half the time —
+# scripts/release/build.py signs the CLI before packaging to close that.
 binaries = [
   { path = "terra-app", main = true },
   { path = "terra" },
