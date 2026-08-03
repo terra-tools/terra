@@ -4,6 +4,7 @@
 #   curl -fsSL https://terra-tools.github.io/terra/install.sh | sh
 #   curl -fsSL https://terra-tools.github.io/terra/install.sh | sh -s v1.0.0
 #
+# Installs from the release installers: the .dmg on macOS, the .deb on Linux.
 set -eu
 
 REPO="https://github.com/terra-tools/terra"
@@ -16,7 +17,11 @@ else
 fi
 
 TMPDIR_TERRA=""
-cleanup() { [ -z "$TMPDIR_TERRA" ] || rm -rf "$TMPDIR_TERRA"; }
+MOUNT=""
+cleanup() {
+  [ -z "$MOUNT" ] || hdiutil detach "$MOUNT" -quiet 2>/dev/null || true
+  [ -z "$TMPDIR_TERRA" ] || rm -rf "$TMPDIR_TERRA"
+}
 trap cleanup EXIT INT TERM
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -35,18 +40,6 @@ download() {
   fetch "$BASE/$1" "$TMPDIR_TERRA/$1" || die "failed to download $BASE/$1"
 }
 
-# Install $1 (a file) as an executable named $2 into $3, using sudo if needed.
-install_bin() {
-  chmod +x "$1"
-  if [ -w "$3" ]; then
-    mv -f "$1" "$3/$2"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo mv -f "$1" "$3/$2" || die "could not install $2 into $3"
-  else
-    return 1
-  fi
-}
-
 path_hint() {
   case ":$PATH:" in
     *":$1:"*) ;;
@@ -62,42 +55,50 @@ OS="$(uname -s)"
 case "$OS" in
   Darwin)
     info "Installing Terra for macOS..."
-    APP_TGZ="terra-macos-universal.app.tar.gz"
-    CLI_TGZ="terra-cli-macos-universal.tar.gz"
+    DMG="terra-macos-universal.dmg"
+    download "$DMG"
 
-    download "$APP_TGZ"
-    tar -xzf "$TMPDIR_TERRA/$APP_TGZ" -C "$TMPDIR_TERRA" || die "could not extract $APP_TGZ"
-    [ -d "$TMPDIR_TERRA/Terra.app" ] || die "$APP_TGZ did not contain Terra.app"
+    MOUNT="$TMPDIR_TERRA/mnt"
+    mkdir -p "$MOUNT"
+    hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$TMPDIR_TERRA/$DMG" -quiet ||
+      die "could not mount $DMG"
+    [ -d "$MOUNT/Terra.app" ] || die "$DMG did not contain Terra.app"
 
     if [ -w /Applications ]; then
       rm -rf /Applications/Terra.app
-      mv "$TMPDIR_TERRA/Terra.app" /Applications/ || die "could not move Terra.app into /Applications"
+      cp -R "$MOUNT/Terra.app" /Applications/ || die "could not copy Terra.app into /Applications"
     elif command -v sudo >/dev/null 2>&1; then
       info "  /Applications needs elevated permissions; you may be asked for your password."
       sudo rm -rf /Applications/Terra.app || die "could not remove the previous /Applications/Terra.app"
-      sudo mv "$TMPDIR_TERRA/Terra.app" /Applications/ || die "could not move Terra.app into /Applications"
+      sudo cp -R "$MOUNT/Terra.app" /Applications/ || die "could not copy Terra.app into /Applications"
     else
       die "/Applications is not writable and sudo is unavailable."
     fi
+
+    hdiutil detach "$MOUNT" -quiet 2>/dev/null || true
+    MOUNT=""
     xattr -dr com.apple.quarantine /Applications/Terra.app 2>/dev/null || true
     info "  installed /Applications/Terra.app"
 
-    download "$CLI_TGZ"
-    tar -xzf "$TMPDIR_TERRA/$CLI_TGZ" -C "$TMPDIR_TERRA" || die "could not extract $CLI_TGZ"
-    [ -f "$TMPDIR_TERRA/terra" ] || die "$CLI_TGZ did not contain the terra binary"
-    if install_bin "$TMPDIR_TERRA/terra" terra /usr/local/bin; then
-      info "  installed /usr/local/bin/terra"
+    # The CLI ships inside the bundle, so it is a symlink rather than a copy:
+    # it then tracks whatever version of the app is installed.
+    CLI=/Applications/Terra.app/Contents/MacOS/terra
+    [ -x "$CLI" ] || die "Terra.app does not contain the terra CLI"
+    if [ -w /usr/local/bin ]; then
+      ln -sf "$CLI" /usr/local/bin/terra && info "  linked /usr/local/bin/terra"
+    elif command -v sudo >/dev/null 2>&1 &&
+         sudo mkdir -p /usr/local/bin && sudo ln -sf "$CLI" /usr/local/bin/terra; then
+      info "  linked /usr/local/bin/terra"
     else
       mkdir -p "$HOME/.local/bin"
-      install_bin "$TMPDIR_TERRA/terra" terra "$HOME/.local/bin" ||
-        die "could not install the terra CLI anywhere."
-      info "  installed $HOME/.local/bin/terra"
+      ln -sf "$CLI" "$HOME/.local/bin/terra" || die "could not link the terra CLI anywhere."
+      info "  linked $HOME/.local/bin/terra"
       path_hint "$HOME/.local/bin"
     fi
 
     info ""
     info "Done. Terra is in your Applications folder."
-    info "First launch: right-click Terra.app and choose Open (the app is not notarized yet)."
+    info "If macOS warns on first launch, right-click Terra.app and choose Open."
     info "From the terminal: terra"
     ;;
 
@@ -111,25 +112,32 @@ case "$OS" in
     esac
 
     info "Installing Terra for Linux (x86_64)..."
-    TGZ="terra-linux-x86_64.tar.gz"
-    download "$TGZ"
-    tar -xzf "$TMPDIR_TERRA/$TGZ" -C "$TMPDIR_TERRA" || die "could not extract $TGZ"
-    [ -f "$TMPDIR_TERRA/terra-app" ] && [ -f "$TMPDIR_TERRA/terra" ] ||
-      die "$TGZ did not contain the expected terra-app and terra binaries"
+    DEB="terra-linux-x86_64.deb"
+    download "$DEB"
 
-    if [ -w /usr/local/bin ] || command -v sudo >/dev/null 2>&1; then
-      DEST=/usr/local/bin
+    if [ "$(id -u)" = 0 ]; then
+      SUDO=""
+    elif command -v sudo >/dev/null 2>&1; then
+      SUDO="sudo"
+      info "  installing the package needs root; you may be asked for your password."
     else
-      DEST="$HOME/.local/bin"
-      mkdir -p "$DEST"
+      die "installing the .deb needs root, and sudo is unavailable. Run this as root."
     fi
-    install_bin "$TMPDIR_TERRA/terra-app" terra-app "$DEST" || die "could not install terra-app into $DEST"
-    install_bin "$TMPDIR_TERRA/terra" terra "$DEST" || die "could not install terra into $DEST"
-    info "  installed $DEST/terra-app and $DEST/terra"
-    path_hint "$DEST"
+
+    if command -v apt-get >/dev/null 2>&1; then
+      $SUDO apt-get install -y "$TMPDIR_TERRA/$DEB" || die "apt-get could not install $DEB"
+    elif command -v dpkg >/dev/null 2>&1; then
+      $SUDO dpkg -i "$TMPDIR_TERRA/$DEB" ||
+        die "dpkg could not install $DEB; try '$SUDO apt-get -f install' to pull in what it needs."
+    else
+      echo "error: this installer needs apt-get or dpkg, and neither is available." >&2
+      echo "Download a package by hand from $REPO/releases" >&2
+      exit 1
+    fi
 
     info ""
     info "Done. Launch Terra with: terra-app"
+    info "The terra CLI is installed too: terra ls"
     ;;
 
   *)

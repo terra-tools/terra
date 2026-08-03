@@ -66,6 +66,16 @@ identifier = "dev.terra.app"
 # which is workspace-inherited. Typing it twice lets the bundle and the binary
 # disagree, which would break an updater in both directions.
 category = "DeveloperTool"
+# The installers are the only artifacts now, so both binaries have to be inside
+# them. cargo-packager auto-detects only the bin targets of *this* crate, which
+# is `terra-app` alone; listing them explicitly adds the `terra` CLI (built by
+# terra-cli into the same target directory) to Terra.app/Contents/MacOS, to the
+# .deb's /usr/bin and to the NSIS install directory. `main = true` is what picks
+# the .app's CFBundleExecutable and the installer's launch target.
+binaries = [
+  { path = "terra-app", main = true },
+  { path = "terra" },
+]
 icons = [
   "assets/icon/terra.icns",
   "assets/icon/terra.ico",
@@ -79,3 +89,22 @@ formats = ["app", "dmg"]
 
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
+# cargo-packager signs the bundle itself, inside-out (every Mach-O first, then
+# the .app), and notarises when APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID are in the
+# environment — but only if an identity is configured here. There is no
+# APPLE_SIGNING_IDENTITY fallback in 0.11.8 (see src/package/app/mod.rs and
+# src/codesign/macos.rs), so "-" is the checked-in default: an ad-hoc signature,
+# exactly what an unsigned release has always shipped. For a real release
+# scripts/release/build.py swaps this one line for $APPLE_SIGNING_IDENTITY and
+# puts it back afterwards.
+signing-identity = "-"
+
+[package.metadata.packager.windows]
+# %1 is the file cargo-packager wants signed. It applies this to the main
+# binary, the uninstaller (via NSIS `!uninstfinalize`, from a different working
+# directory) and the finished installer, so the command has to resolve from
+# anywhere: build.py drops terra-sign.cmd — a one-line shim around
+# scripts/release/sign_client.py — into a directory it prepends to PATH.
+# The shim exits 0 without touching the file when SIGN_TUNNEL_URL /
+# SIGN_TUNNEL_SECRET are unset, which is how a secretless run stays unsigned.
+sign-command = "terra-sign.cmd %1"
