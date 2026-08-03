@@ -21,6 +21,8 @@ mod config;
 mod ghostty_theme;
 #[path = "../src/tabs.rs"]
 mod tabs;
+#[path = "../src/transcript.rs"]
+mod transcript;
 
 use std::time::{Duration, Instant};
 

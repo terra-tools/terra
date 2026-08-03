@@ -129,6 +129,57 @@
    plain geometric circle serves and the button glyph does not. Cell,
    clipboard and capture keep the original character.
 
+9. view.rs `process_left_button` / `process_mouse_move`: **Shift (or Option)
+   bypasses mouse reporting**, so text can still be selected inside a program
+   that grabbed the mouse. Upstream routed every click to the program the
+   moment `TermMode::MOUSE_MODE` was set, which left the user unable to
+   select — and therefore unable to copy — anything on screen while claude
+   code, htop or vim was running. The new `selection_override` decides it:
+   Shift is xterm's convention, Option the macOS one, and a press held under
+   either takes the ordinary `SelectStart`/`SelectUpdate` path instead. It is
+   deliberately not "any modifier" — Ctrl is one programs want reported with
+   the click, and Cmd already means follow-the-link. Nothing else about the
+   selection differs: double-click still selects a word, triple-click a line,
+   and ⌘C copies through the same `selectable_content`.
+
+   The decision is latched at **press** time (`is_reported_press`) and the
+   release follows the press. Re-deciding on release reads the modifiers as
+   they are then, which need not be how they were: let go of Shift before the
+   mouse button and the program that never saw the press got an orphan
+   release — it believes the button is still down — while terra's own drag
+   never ended, so `is_dragged` stayed set and the next pointer move kept
+   extending the selection. The same latch drives drag motion, which now
+   also fixes reporting under `MOUSE_MOTION` (modes 1002/1003): a reported
+   press left `is_dragged` false, so the motion branch was unreachable and a
+   drag inside tmux or vim sent press and release with nothing in between.
+
+   Scroll is untouched — Shift-scroll keeps the item 6 behaviour (scrollback
+   on the primary screen, arrows on the alt screen). Guarded by
+   `terra-app/tests/shift_selection.rs`. Worth upstreaming.
+
+10. backend/tap.rs (new) + backend/mod.rs + backend/settings.rs + Cargo.toml
+    (`polling`): **an optional tee on the child→terminal byte stream**.
+    `BackendSettings.output_tap` takes an `Arc<dyn Fn(&[u8]) + Send + Sync>`
+    which is called with every chunk read from the PTY, on the reader thread,
+    before the parser sees it. terra keeps a bounded per-tab ring of those
+    bytes so `terra transcript` can read back what a full-screen program
+    painted — output that exists nowhere else once the screen is cleared
+    (`terra-app/src/transcript.rs`).
+
+    The tee is a `TappedPty<P>` wrapper around alacritty's `Pty`, which works
+    because `EventLoop` is generic over `EventedPty`; no alacritty fork is
+    involved. The one subtlety is `EventedReadWrite::reader(&mut self) -> &mut
+    Self::Reader`: the wrapper has to hand back a reader it owns, while the
+    bytes come from one the wrapped PTY owns. `Tap` therefore holds a raw
+    pointer to the inner reader, re-stored on every `reader()` call — sound
+    because the returned `&mut Tap` borrows the whole `TappedPty`, so the
+    inner reader cannot move or drop while the only route to `Tap::read` is
+    alive. See the SAFETY note on `Tap::src`.
+
+    With no tap installed the wrapper is a pure delegation (one pointer store
+    and one `Option` check per read), so it is applied unconditionally and
+    `[tabs] transcript_kb = 0` costs nothing.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to

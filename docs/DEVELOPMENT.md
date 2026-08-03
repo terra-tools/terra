@@ -46,6 +46,12 @@ Three questions, each answered without a screenshot:
 
 - **What did the program draw?** `terra capture <tab> --cells` — styled grid
   as JSON. If the styling isn't there, the program never emitted it.
+- **What did it draw *earlier*?** `terra transcript <tab> --tail 200` — the
+  bytes the tab's program wrote, from its own bounded ring. This is the only
+  way to read back a full-screen program: `capture` sees the grid, and the
+  alternate screen keeps no scrollback, so everything claude/htop/less painted
+  is gone as soon as it clears. `--raw` gives the bytes verbatim, which pipes
+  into `terra record --decode`-style inspection.
 - **What does this terminal advertise?** `diff <(terra doctor) <(ssh box
   terra doctor)`.
 - **What did the program say and hear?** `terra record --out t.jsonl -- prog`

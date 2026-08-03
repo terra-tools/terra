@@ -105,6 +105,14 @@ fn learn_text() -> String {
          \"#3a3a3a\") so you see what the program asked for. This answers \"is\n\
          that row's background really grey?\" and \"where is the cursor?\"\n\
          without a screenshot. --scrollback N applies to both forms.\n\n\
+         \x20 terra transcript \"$id\" --tail 200\n\
+         What the tab's program actually wrote, including everything a\n\
+         full-screen app (claude, htop, less) painted — capture cannot see\n\
+         that, because the alternate screen keeps no scrollback. terra holds a\n\
+         bounded in-memory ring per tab ([tabs] transcript_kb, 512 KB default,\n\
+         0 disables). Escape sequences are stripped, not replayed: a repainting\n\
+         program leaves one copy per frame, which is the history rather than\n\
+         the screen. --raw gives the bytes verbatim (--tail then counts bytes).\n\n\
          \x20 terra bidi \"$id\" [off|on|auto]\n\
          Per-tab right-to-left reordering (UAX #9). Default off, like every\n\
          other terminal; on for programs that emit logical order; auto uses the\n\
@@ -125,7 +133,8 @@ fn learn_text() -> String {
          Config\n\
          ------\n\
          ~/.terra/config.toml: [font] size, line_height; [text] bidi,\n\
-         bidi_base, [text.bidi_quirks]; [profile.<name>] command, cwd, title.\n\
+         bidi_base, [text.bidi_quirks]; [tabs] icons, bar_with_one_tab,\n\
+         transcript_kb; [profile.<name>] command, cwd, title.\n\
          Every key optional; a broken file yields defaults plus a warning.\n\
          Template: docs/config.example.toml.\n\n\
          Profiles\n\
@@ -238,6 +247,45 @@ enum Command {
         /// Emit the full cell grid with styling as JSON instead of plain text
         #[arg(long)]
         cells: bool,
+    },
+
+    /// Print what a tab's program has written, including what it painted on
+    /// the alternate screen.
+    ///
+    /// `capture` reads the terminal's grid, which is why it comes back empty
+    /// for Claude Code, htop or less: a full-screen program paints on the
+    /// alternate screen, that screen has no scrollback, and when the program
+    /// clears or exits nothing of it is left. terra keeps the bytes instead —
+    /// a bounded per-tab ring of everything the child wrote, in memory only,
+    /// sized by `[tabs] transcript_kb` (512 KB by default, 0 disables it).
+    ///
+    ///     terra transcript 3 --tail 200
+    ///
+    /// Fidelity: this is a stripper, not a terminal. Escape sequences are
+    /// removed and the text between them kept, in the order it arrived, so
+    /// cursor motion is not replayed — a program that repaints one screen
+    /// fifty times leaves fifty copies of it, and an interface drawn with
+    /// cursor addressing comes back as its pieces rather than its layout. That
+    /// is a faithful *history*, not a picture of the screen; for the screen as
+    /// it looks now, use `capture`.
+    ///
+    /// `--raw` writes the bytes exactly as the program sent them, escape
+    /// sequences and all, for feeding back into a terminal or a decoder.
+    /// `--tail N` means the last N lines of the rendered text, or the last N
+    /// bytes with `--raw` — a full-screen program can repaint for minutes
+    /// without emitting a newline, so bytes are the only limit that means
+    /// anything there.
+    Transcript {
+        /// Numeric tab id (from `terra ls`)
+        tab: u64,
+
+        /// Limit to the last N lines (or the last N bytes with --raw)
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
+
+        /// Emit the bytes verbatim, escape sequences included
+        #[arg(long)]
+        raw: bool,
     },
 
     /// Save a PNG of the terra window.
@@ -406,6 +454,11 @@ impl Command {
                 scrollback: *scrollback,
                 cells: *cells,
             },
+            Command::Transcript { tab, tail, raw } => Request::Transcript {
+                tab: *tab,
+                tail: *tail,
+                raw: *raw,
+            },
             Command::Rename { tab, title } => Request::Rename {
                 tab: *tab,
                 title: title.clone(),
@@ -523,6 +576,7 @@ fn run() -> Result<()> {
             text,
             tab,
             png,
+            bytes,
         } => {
             match cli.command {
                 Command::Ls => {
@@ -543,6 +597,28 @@ fn run() -> Result<()> {
                         // add a second trailing newline.
                         print!("{text}");
                         if !text.ends_with('\n') {
+                            println!();
+                        }
+                    }
+                }
+                Command::Transcript { raw, .. } => {
+                    if raw {
+                        // Verbatim means verbatim: straight to stdout as
+                        // bytes, no newline added, no lossy UTF-8 conversion.
+                        // Pipe it into a file or `terra record --decode`; a
+                        // terminal will happily execute the escapes.
+                        use std::io::Write as _;
+                        let encoded = bytes.context(
+                            "the app answered without a payload — is it a newer or older terra?",
+                        )?;
+                        let raw = terra_protocol::decode_binary(&encoded)?;
+                        let mut stdout = std::io::stdout().lock();
+                        stdout.write_all(&raw)?;
+                        stdout.flush()?;
+                    } else if let Some(text) = text {
+                        // Already newline-separated, like capture.
+                        print!("{text}");
+                        if !text.is_empty() && !text.ends_with('\n') {
                             println!();
                         }
                     }

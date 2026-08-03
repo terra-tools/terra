@@ -13,6 +13,10 @@ license = "MIT"
 egui = { workspace = true }
 alacritty_terminal = "0.26"
 anyhow = "1"
+# terra patch: `EventedReadWrite`'s register/reregister take polling types, so
+# wrapping a PTY (src/backend/tap.rs) means naming them. Same version
+# alacritty_terminal already depends on — no extra crate, no extra build.
+polling = "3.8"
 open = "5.3.2"
 # terra patch: UAX #9 BiDi reordering (see src/bidi.rs).
 unicode-bidi = "0.3"

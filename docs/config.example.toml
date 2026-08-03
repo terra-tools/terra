@@ -51,6 +51,31 @@ icons = true
 # unlabelled columns are indistinguishable.
 bar_with_one_tab = true
 
+# Kilobytes of raw terminal output kept per tab, for `terra transcript <tab>`.
+#
+# `terra capture` reads the terminal's grid, which is why it comes back empty
+# for a full-screen program: Claude Code, htop and less paint on the *alternate
+# screen*, that screen has no scrollback by definition, and when the program
+# clears or exits nothing of it is left anywhere. terra saw the bytes, though —
+# they arrived through it — so it keeps the last few hundred kilobytes of them
+# per tab and `terra transcript` reads them back, escape sequences stripped.
+#
+# In memory only. A transcript is never written to disk, never logged, and dies
+# with its tab; the only way out is the same 0700 socket as every other command.
+#
+# The buffer is allocated on a tab's first byte of output, not when the tab is
+# created, and then overwrites oldest-first — so the cost is bounded at this
+# many kilobytes per tab that has actually printed something, and idle tabs
+# cost nothing. The default is a few hundred repaints of a full-screen app, or
+# tens of thousands of lines of ordinary shell output.
+#
+# Set this to 0 to switch transcripts off entirely: no buffer is allocated, the
+# bytes are not copied at all, and `terra transcript` answers with an error
+# saying so. Changing it takes effect for tabs opened afterwards — an open tab
+# keeps the buffer it was created with rather than losing what it recorded.
+# Capped at 65536 (64 MB per tab).
+transcript_kb = 512
+
 [text]
 # Reorder right-to-left text (Hebrew, Arabic, …) for display, per the Unicode
 # Bidirectional Algorithm, UAX #9: https://unicode.org/reports/tr9/

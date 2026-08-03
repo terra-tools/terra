@@ -125,12 +125,28 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   build lines for the visible screen; include up to `scrollback` lines above
   via grid indexing if feasible, else visible-only is acceptable for v1.
   Trim trailing whitespace / blank tail lines.
+- Transcripts (`transcript.rs`): a bounded per-tab ring of the raw bytes the
+  child wrote, so `terra transcript` can read back what a full-screen program
+  painted — output that exists nowhere else, since the alternate screen has no
+  scrollback and is discarded when the program leaves it. The bytes are tapped
+  in the one place they pass through: `BackendSettings.output_tap`, a terra
+  patch on vendored egui_term that wraps alacritty's PTY (`backend/tap.rs`) and
+  hands every chunk to a closure before the parser sees it. `Ring` is a plain
+  byte ring — push, snapshot, overwrite oldest — that allocates on the first
+  push rather than at tab creation, and `render` strips escape sequences back
+  out. **In memory only**: never written to disk, dies with the tab. Sized by
+  `[tabs] transcript_kb` (0 = no ring, no tap, nothing copied), mirrored onto
+  the `TabManager` like the profile table and read when a tab is opened, so a
+  reload sizes the *next* tab rather than discarding an open one's history.
+  `render` is a stripper, not a terminal: cursor motion is not replayed, so a
+  repainting program leaves one copy per frame — the history, not the screen.
 - Send: `process_command(BackendCommand::Write(text.into_bytes()))`, append
   `\r` if `enter`. With `keys`, the text is first parsed by
   `terra-protocol::keys` into `Bytes`/`Delay` chunks and written in order.
 - Config: `~/.terra/config.toml` (`TERRA_CONFIG` overrides), read once at
   startup into `config.rs`. `[font] size, line_height`, `[text] bidi,
-  bidi_base, [text.bidi_quirks]`, `[profile.<name>] command, cwd, title`.
+  bidi_base, [text.bidi_quirks]`, `[tabs] icons, bar_with_one_tab,
+  transcript_kb`, `[profile.<name>] command, cwd, title`.
   Loading never fails — see `docs/config.example.toml`. Profiles are
   deserialized one at a time, so one broken profile is skipped with a warning
   rather than costing the rest; `command` is a string and is split into argv,
@@ -148,6 +164,7 @@ terra new [--title T] [--cwd D] [--profile P] [-- cmd args...]  # prints new tab
 terra kill <tab>
 terra send <tab> "text" [--keys] [--enter]  # --enter appends CR (like tmux send-keys ... Enter)
 terra capture <tab> [--scrollback N] [--cells]  # text, or the styled grid as JSON
+terra transcript <tab> [--tail N] [--raw]  # what the tab's program wrote, alt screen included
 terra rename <tab> "new title"
 terra select <tab>
 terra screenshot --out F [--pretty] [--bg hex1,hex2]  # PNG of the window
@@ -178,6 +195,15 @@ without it reaches the PTY byte for byte. `--cells` returns run-length-encoded
 runs carrying `fg`/`bg`/`flags` plus the cursor, with colours left as the
 program named them (`{"indexed":236}`, `{"named":"Background"}`, `"#3a3a3a"`)
 rather than resolved against the theme.
+
+`transcript` adds one request (`{"cmd":"transcript","tab":N}`, with `tail` and
+`raw` skipped when unset) and one additive `bytes` field on `Response::Ok` —
+base64, for the `--raw` payload, which is neither newline-free nor guaranteed
+valid UTF-8. Rendering happens app-side so `--tail` costs one round trip and
+the escape-stripper has a single implementation; `--tail N` is lines of the
+rendered form but *bytes* of `--raw`, since a full-screen program can repaint
+for minutes without emitting a newline. A tab whose transcript is switched off
+answers with an error naming `[tabs] transcript_kb`, never with silence.
 
 `screenshot` is the only request answered *by the UI thread*: the pixels exist
 because a frame was drawn. The IPC thread summons the window (the same

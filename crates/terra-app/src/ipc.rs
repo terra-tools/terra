@@ -371,7 +371,10 @@ fn dispatch(
     let summon = matches!(request, Request::Select { .. });
     // `List` and `Capture` only read; everything else changes what the window
     // should be showing.
-    let mutating = !matches!(request, Request::List | Request::Capture { .. });
+    let mutating = !matches!(
+        request,
+        Request::List | Request::Capture { .. } | Request::Transcript { .. }
+    );
 
     let response = {
         let mut tabs = lock(tabs);
@@ -544,6 +547,25 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
                 None => no_tab(tab),
             }
         }
+        // The readback `capture` cannot do: what a full-screen program
+        // painted, which the grid no longer holds. Rendered here rather than
+        // in the CLI so `--tail` costs one trip and the escape-stripper has
+        // one implementation (see `crate::transcript`).
+        Request::Transcript { tab, tail, raw } => match tabs.transcript(tab) {
+            None => no_tab(tab),
+            Some(None) => Response::err(
+                "transcripts are disabled: `[tabs] transcript_kb` is 0 in this terra's \
+                 config. Set it to a size in KB (512 is the default) and reload the \
+                 config; tabs opened after that keep a transcript.",
+            ),
+            Some(Some(bytes)) if raw => {
+                Response::ok_bytes(crate::transcript::tail_bytes(&bytes, tail))
+            }
+            Some(Some(bytes)) => Response::ok_text(crate::transcript::tail_lines(
+                &crate::transcript::render(&bytes),
+                tail,
+            )),
+        },
         Request::Rename { tab, title } => {
             if tabs.set_custom_title(tab, title) {
                 Response::ok()

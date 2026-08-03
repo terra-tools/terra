@@ -13,10 +13,12 @@ identity from setup_signing.py, else ad-hoc.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from build import ROOT, run  # sibling script; shared so the commands stay in one place
@@ -36,6 +38,30 @@ def signing_identity() -> str:
     return "terra-dev" if "terra-dev" in out else ""
 
 
+def prime_sudo(bin_dir: Path) -> threading.Event | None:
+    """Ask for the sudo password NOW if the CLI install will need it.
+
+    The build takes minutes; without this the password prompt appears at the
+    very end, long after the user has walked away. A background `sudo -n -v`
+    keeps the timestamp fresh so the eventual install never re-prompts. The
+    returned Event stops the refresher; None means sudo won't be needed.
+    """
+    if os.access(bin_dir if bin_dir.exists() else bin_dir.parent, os.W_OK):
+        return None
+    print(f"{bin_dir} needs sudo — asking for your password up front, "
+          "so the build can run unattended afterwards.")
+    subprocess.run(["sudo", "-v"], check=True)
+    stop = threading.Event()
+
+    def refresh() -> None:
+        while not stop.wait(60):
+            subprocess.run(["sudo", "-n", "-v"], check=False,
+                           stderr=subprocess.DEVNULL)
+
+    threading.Thread(target=refresh, daemon=True).start()
+    return stop
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -50,6 +76,8 @@ def main() -> int:
         print(f"{DEST} already exists. Re-run as 'just install 1' to replace it.",
               file=sys.stderr)
         return 1
+
+    sudo_refresher = prime_sudo(bin_dir)
 
     # Same commands as `just bundle` — app only; the dmg's local build pops a
     # Finder window (see the justfile's `bundle` comment).
@@ -80,6 +108,8 @@ def main() -> int:
     print("$ " + " ".join(install_cmd), flush=True)
     if subprocess.run(install_cmd, check=False, stderr=subprocess.DEVNULL).returncode != 0:
         run(["sudo", *install_cmd])
+    if sudo_refresher is not None:
+        sudo_refresher.set()
 
     print(f"installed {DEST} and {cli_dest} — first launch: right-click the app -> Open")
     return 0

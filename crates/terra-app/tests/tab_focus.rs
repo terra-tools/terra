@@ -101,6 +101,7 @@ fn cat(ctx: &egui::Context) -> (TerminalBackend, Receiver<(u64, PtyEvent)>) {
             shell: "/bin/cat".to_string(),
             args: Vec::new(),
             working_directory: None,
+            output_tap: None,
         },
     )
     .expect("spawn /bin/cat");

@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Line;
@@ -15,6 +16,7 @@ use serde::Serialize;
 use terra_protocol::TabInfo;
 
 use crate::config::{BidiMode, Profile};
+use crate::transcript::{self, Ring};
 
 /// Fallback when `$SHELL` is not set. Unix only — Windows never sets `SHELL`
 /// and has no `/bin`, so it takes [`WINDOWS_FALLBACK_SHELL`] instead.
@@ -306,6 +308,14 @@ pub struct Tab {
     /// which program is running, and one window routinely has a shell in one
     /// tab and an agent that does its own BiDi in another.
     pub bidi: Option<BidiMode>,
+    /// The tab's transcript ring — every byte its child has written, capped at
+    /// `[tabs] transcript_kb` and overwritten oldest-first. `None` when
+    /// transcripts are switched off, in which case no tap is installed either
+    /// and the bytes are never copied at all.
+    ///
+    /// Shared with the PTY reader thread, which is the only writer; the IPC
+    /// threads only ever snapshot it. See [`crate::transcript`].
+    pub transcript: Option<transcript::Shared>,
 }
 
 impl Tab {
@@ -672,6 +682,14 @@ pub struct TabManager {
     /// bar, which is drawn from a `&TabManager` and nothing else. The store
     /// stays the owner — `main.rs` pushes a fresh copy on load and on reload.
     profiles: BTreeMap<String, Profile>,
+    /// Bytes of PTY output each new tab retains for `terra transcript`; `0`
+    /// installs no tap at all. Mirrored from `[tabs] transcript_kb` the same
+    /// way (and for the same reason) as `profiles`.
+    ///
+    /// Read only by [`Self::open`]: a tab's ring is sized once, when it is
+    /// created, so a reload changes what the *next* tab gets rather than
+    /// silently discarding what an open tab has already recorded.
+    transcript_bytes: usize,
 }
 
 impl TabManager {
@@ -685,6 +703,7 @@ impl TabManager {
             ctx,
             pty_events,
             profiles: BTreeMap::new(),
+            transcript_bytes: crate::config::DEFAULT_TAB_TRANSCRIPT_KB * 1024,
         }
     }
 
@@ -732,6 +751,13 @@ impl TabManager {
     /// The profile table, alphabetical by name.
     pub fn profiles(&self) -> &BTreeMap<String, Profile> {
         &self.profiles
+    }
+
+    /// Set the per-tab transcript cap in bytes, `0` for off. Pushed from the
+    /// config at startup and after every reload, like [`Self::set_profiles`];
+    /// it takes effect for tabs opened from here on.
+    pub fn set_transcript_bytes(&mut self, bytes: usize) {
+        self.transcript_bytes = bytes;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1101,6 +1127,16 @@ impl TabManager {
         let typed_into = shell.clone();
 
         let id = self.next_id;
+        // The transcript ring, and the tap that fills it. Both are skipped
+        // entirely when the cap is 0, so the disabled case copies nothing and
+        // allocates nothing — and the ring itself allocates only once the tab
+        // first prints something (see `transcript::Ring`).
+        let transcript: Option<transcript::Shared> = (self.transcript_bytes > 0)
+            .then(|| Arc::new(Mutex::new(Ring::new(self.transcript_bytes))));
+        let output_tap: Option<egui_term::OutputTap> = transcript.clone().map(|ring| {
+            Arc::new(move |bytes: &[u8]| transcript::lock(&ring).push(bytes))
+                as egui_term::OutputTap
+        });
         let mut backend = TerminalBackend::new(
             id,
             self.ctx.clone(),
@@ -1109,6 +1145,7 @@ impl TabManager {
                 shell,
                 args,
                 working_directory: cwd.map(PathBuf::from).or_else(default_cwd),
+                output_tap,
             },
         )?;
         // Answer colour queries from the very first byte the shell writes.
@@ -1131,6 +1168,7 @@ impl TabManager {
             Tab {
                 backend,
                 bidi: None,
+                transcript,
                 spawn: command.join(" "),
                 title: Title {
                     shell: format!("terra {id}"),
@@ -1359,6 +1397,21 @@ impl TabManager {
         tab.backend.process_command(BackendCommand::Write(bytes));
         self.sync_visibility();
         true
+    }
+
+    /// Everything the tab's child has written, oldest byte first, capped at
+    /// `[tabs] transcript_kb`.
+    ///
+    /// Two layers of `Option`, like [`Self::bidi`]: `None` is "no such tab",
+    /// `Some(None)` is "this tab keeps no transcript" — the two need different
+    /// answers on the wire, and only the caller knows how to word them.
+    pub fn transcript(&self, id: u64) -> Option<Option<Vec<u8>>> {
+        let tab = self.tabs.get(&id)?;
+        Some(
+            tab.transcript
+                .as_ref()
+                .map(|ring| transcript::lock(ring).snapshot()),
+        )
     }
 
     /// Plain-text dump of the visible screen plus up to `scrollback` lines above it.

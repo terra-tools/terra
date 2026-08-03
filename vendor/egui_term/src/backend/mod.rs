@@ -1,4 +1,6 @@
 pub mod settings;
+// terra patch: the child->terminal byte tee (see tap.rs).
+pub mod tap;
 
 use crate::bidi::{self, BidiBase, RowMap};
 use crate::types::Size;
@@ -215,6 +217,10 @@ impl TerminalBackend {
             bidi: Vec::new(),
         };
         let term = Arc::new(FairMutex::new(term));
+        // terra patch: tee the child's output before the parser eats it, so
+        // terra can keep a transcript of a program that clears the screen.
+        // Nothing is copied when no tap is installed.
+        let pty = tap::TappedPty::new(pty, settings.output_tap);
         let pty_event_loop =
             EventLoop::new(term.clone(), event_proxy, pty, false, false)?;
         let notifier = Notifier(pty_event_loop.channel());
