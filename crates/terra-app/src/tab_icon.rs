@@ -117,6 +117,11 @@ pub enum TabIcon {
     OpenAi,
     /// OpenCode's own mark, for `opencode`.
     OpenCode,
+    /// VS Code's ribbon, for `code` — and for the "Edit Settings With" rows
+    /// that hand the config file to it (see [`crate::edit_tools`]).
+    VsCode,
+    /// Cursor's cube, for `cursor` and its settings row.
+    Cursor,
     /// The fallback `>_`. Not a logo — see the module docs on colour.
     Terminal,
     /// A gear, for the chevron menu's Settings row. Like [`Self::Terminal`]
@@ -143,6 +148,8 @@ impl TabIcon {
             Self::Rust => "rust",
             Self::OpenAi => "openai",
             Self::OpenCode => "opencode",
+            Self::VsCode => "vscode",
+            Self::Cursor => "cursor",
             Self::Terminal => "terminal",
             Self::Gear => "gear",
         }
@@ -165,6 +172,8 @@ impl TabIcon {
             Self::Rust => include_bytes!("../assets/tab-icons/rust-64.png"),
             Self::OpenAi => include_bytes!("../assets/tab-icons/openai-64.png"),
             Self::OpenCode => include_bytes!("../assets/tab-icons/opencode-64.png"),
+            Self::VsCode => include_bytes!("../assets/tab-icons/vscode-64.png"),
+            Self::Cursor => include_bytes!("../assets/tab-icons/cursor-64.png"),
             Self::Terminal => include_bytes!("../assets/tab-icons/terminal-64.png"),
             Self::Gear => include_bytes!("../assets/tab-icons/gear-64.png"),
         }
@@ -196,6 +205,8 @@ impl TabIcon {
         Self::Rust,
         Self::OpenAi,
         Self::OpenCode,
+        Self::VsCode,
+        Self::Cursor,
         Self::Terminal,
         Self::Gear,
     ];
@@ -260,6 +271,11 @@ const BY_PROCESS: &[(&str, TabIcon)] = &[
     ("rust-analyzer", TabIcon::Rust),
     ("codex", TabIcon::OpenAi),
     ("opencode", TabIcon::OpenCode),
+    // The two editors terra can hand the config file to. Exact-match only, and
+    // deliberately absent from `BY_KEYWORD`: "code" and "cursor" are ordinary
+    // English words, and a tab sitting in `~/src/code` is not VS Code.
+    ("code", TabIcon::VsCode),
+    ("cursor", TabIcon::Cursor),
 ];
 
 /// Keyword -> icon for the text fallback, **in priority order**.
@@ -714,6 +730,17 @@ fn texture(ctx: &Context, icon: TabIcon, px: usize) -> Option<TextureHandle> {
     let handle = ctx.load_texture(icon.key(), image, TextureOptions::LINEAR);
     ctx.data_mut(|d| d.insert_temp(key, handle.clone()));
     Some(handle)
+}
+
+/// The id of `icon`'s texture, for a painter that is not terra's own.
+///
+/// The command palette lives in its own crate (`terra-palette`) and knows
+/// nothing about assets or `TabIcon`; a `TextureId` is the whole of what it
+/// needs to draw a brand mark in a row. Always the full [`MASTER`] master —
+/// the palette's tile is 18pt and egui's linear filter does the rest, which is
+/// one texture for every size instead of one per DPI.
+pub fn texture_id(ctx: &Context, icon: TabIcon) -> Option<egui::TextureId> {
+    texture(ctx, icon, MASTER).map(|handle| handle.id())
 }
 
 /// Draw `icon` inside `rect`.

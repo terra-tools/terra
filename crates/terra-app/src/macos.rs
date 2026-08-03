@@ -106,6 +106,189 @@ pub fn activate_app() {
 pub fn activate_app() {}
 
 // ---------------------------------------------------------------------------
+// The application menu
+// ---------------------------------------------------------------------------
+//
+// winit installs no `NSMainMenu`, so terra has shipped with an empty menu bar:
+// the app name and nothing under it, not even Quit. That is fine for a
+// keyboard-driven terminal right up until there is something worth
+// *discovering* — "Edit Settings With ▸" is exactly that, since a user cannot
+// know terra found their agent unless terra says so somewhere they will look.
+//
+// Only the application menu is built. An Edit or Window menu would be a
+// second, worse implementation of things egui and winit already handle, and
+// every key equivalent in a menu is a key the terminal can no longer see.
+
+/// One row terra owns in the application menu. `tag` is what comes back out of
+/// [`take_menu_actions`]; the caller decides what it means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuSpec {
+    pub tag: isize,
+    pub title: String,
+    /// Key equivalent, lowercase and without modifiers (`","`, `"q"`); ⌘ is
+    /// implied, and an empty string means no shortcut.
+    pub key: &'static str,
+}
+
+/// Rows chosen since the last call, oldest first.
+///
+/// AppKit dispatches a menu choice on the main thread between frames, which is
+/// not a moment terra can do anything in — the app's state lives behind the
+/// frame callback. So the handler only records the tag, and the next frame
+/// drains it.
+#[cfg(target_os = "macos")]
+pub fn take_menu_actions() -> Vec<isize> {
+    std::mem::take(&mut *menu_queue().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn take_menu_actions() -> Vec<isize> {
+    Vec::new()
+}
+
+#[cfg(target_os = "macos")]
+fn menu_queue() -> &'static std::sync::Mutex<Vec<isize>> {
+    static QUEUE: std::sync::OnceLock<std::sync::Mutex<Vec<isize>>> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(Default::default)
+}
+
+#[cfg(target_os = "macos")]
+use objc2::runtime::NSObjectProtocol;
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    // SAFETY: NSObject imposes no subclassing requirements, and this type
+    // holds no instance variables and implements no `Drop`.
+    #[unsafe(super(objc2::runtime::NSObject))]
+    #[name = "TerraMenuTarget"]
+    struct MenuTarget;
+
+    impl MenuTarget {
+        /// Every terra-owned row points here; the row says which one it is
+        /// through its tag, so one selector serves the whole menu.
+        #[unsafe(method(terraMenuAction:))]
+        fn menu_action(&self, sender: &objc2::runtime::AnyObject) {
+            // SAFETY: the sender of a menu action is the `NSMenuItem`, and
+            // `-tag` is `NSInteger` on every `NSMenuItem`.
+            let tag: isize = unsafe { objc2::msg_send![sender, tag] };
+            menu_queue()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(tag);
+        }
+    }
+
+    unsafe impl NSObjectProtocol for MenuTarget {}
+);
+
+/// Build and install the application menu: About, terra's own `rows`, an
+/// "Edit Settings With ▸" submenu of `edit_with`, and the standard
+/// Hide/Quit block.
+///
+/// Called once, from the UI (main) thread, on the first frame after
+/// [`crate::edit_tools`] has finished probing — which is what makes the
+/// submenu's contents known.
+#[cfg(target_os = "macos")]
+pub fn install_app_menu(app_name: &str, rows: &[MenuSpec], edit_with: &[MenuSpec]) {
+    use objc2::rc::Retained;
+    use objc2::{sel, AnyThread, MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
+    use objc2_foundation::NSString;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        log::warn!("terra: the app menu can only be installed on the main thread");
+        return;
+    };
+
+    // Leaked on purpose: the menu holds an unretained `target`, AppKit's
+    // convention, so the object has to outlive the menu — which is the app.
+    static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let target: &MenuTarget = {
+        let ptr = *TARGET.get_or_init(|| {
+            let target: Retained<MenuTarget> =
+                unsafe { objc2::msg_send![MenuTarget::alloc(), init] };
+            Retained::into_raw(target) as usize
+        });
+        // SAFETY: the pointer came from `Retained::into_raw` above and was
+        // never released, so the object is alive for the process's lifetime.
+        unsafe { &*(ptr as *const MenuTarget) }
+    };
+
+    let ns = |s: &str| NSString::from_str(s);
+    let item = |title: &str, action: Option<objc2::runtime::Sel>, key: &str| {
+        // SAFETY: the designated initialiser for a menu item; all three
+        // arguments are exactly the types it declares.
+        unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &ns(title),
+                action,
+                &ns(key),
+            )
+        }
+    };
+    // A terra row: our selector, our target, and the tag that names it.
+    let owned = |spec: &MenuSpec| {
+        let row = item(&spec.title, Some(sel!(terraMenuAction:)), spec.key);
+        unsafe { row.setTarget(Some(target)) };
+        row.setTag(spec.tag);
+        row
+    };
+
+    let app_menu = NSMenu::new(mtm);
+    app_menu.setTitle(&ns(app_name));
+    app_menu.addItem(&item(
+        &format!("About {app_name}"),
+        Some(sel!(orderFrontStandardAboutPanel:)),
+        "",
+    ));
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    for spec in rows {
+        app_menu.addItem(&owned(spec));
+    }
+    if !edit_with.is_empty() {
+        let parent = item("Edit Settings With", None, "");
+        let submenu = NSMenu::new(mtm);
+        for spec in edit_with {
+            submenu.addItem(&owned(spec));
+        }
+        parent.setSubmenu(Some(&submenu));
+        app_menu.addItem(&parent);
+    }
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Standard responder-chain rows: no target, so AppKit walks up to NSApp.
+    app_menu.addItem(&item(&format!("Hide {app_name}"), Some(sel!(hide:)), "h"));
+    app_menu.addItem(&item("Show All", Some(sel!(unhideAllApplications:)), ""));
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Quit is terra's own row, not `terminate:`: the window fades out on the
+    // way down (see `CloseAnimation`), and `terminate:` would cut that.
+    app_menu.addItem(&owned(&MenuSpec {
+        tag: QUIT_TAG,
+        title: format!("Quit {app_name}"),
+        key: "q",
+    }));
+
+    let main_menu = NSMenu::new(mtm);
+    let app_item = NSMenuItem::new(mtm);
+    app_item.setSubmenu(Some(&app_menu));
+    main_menu.addItem(&app_item);
+    let app = NSApplication::sharedApplication(mtm);
+    app.setMainMenu(Some(&main_menu));
+    log::debug!(
+        "terra: app menu installed, {} top-level item(s), readback {}",
+        main_menu.numberOfItems(),
+        app.mainMenu().map_or(-1, |m| m.numberOfItems())
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn install_app_menu(_app_name: &str, _rows: &[MenuSpec], _edit_with: &[MenuSpec]) {}
+
+/// The tag [`install_app_menu`] gives its own Quit row. Callers own every
+/// other tag, so this one is out of the way at the top.
+pub const QUIT_TAG: isize = -1;
+
+// ---------------------------------------------------------------------------
 // Window open/close transition
 // ---------------------------------------------------------------------------
 //

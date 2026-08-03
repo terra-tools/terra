@@ -24,6 +24,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod edit_tools;
 mod fonts;
 mod ghostty_theme;
 mod ipc;
@@ -42,6 +43,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use egui_term::{PtyEvent, TerminalView};
 use terra_palette::{Palette, PaletteAction, PaletteEvent, PaletteIcon};
 
+use crate::edit_tools::EditTool;
 use crate::ipc::IpcServer;
 use crate::screenshot::Screenshots;
 use crate::scrollbar::ScrollbarState;
@@ -82,19 +84,8 @@ const FOREGROUND_POLL_SECS: f64 = 0.5;
 /// warning-free by the config tests), so a first-timer lands in working
 /// docs instead of an empty buffer.
 fn open_config_in_editor(path: &std::path::Path) {
-    if !path.exists() {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let example = include_str!("../../../docs/config.example.toml");
-        if let Err(err) = std::fs::write(path, example) {
-            log::warn!("terra: cannot create {}: {err}", path.display());
-            return;
-        }
-        log::info!(
-            "terra: created {} from the documented example",
-            path.display()
-        );
+    if !ensure_config_file(path) {
+        return;
     }
     #[cfg(target_os = "macos")]
     {
@@ -129,6 +120,32 @@ fn open_config_in_editor(path: &std::path::Path) {
     if let Err(err) = std::process::Command::new("xdg-open").arg(path).spawn() {
         log::warn!("terra: cannot open {}: {err}", path.display());
     }
+}
+
+/// Make sure there is a file at `path` before handing it to anything, seeding
+/// a missing one with the documented example. Returns whether there is now a
+/// file to open — the one failure (an unwritable `~/.terra`) is logged here.
+///
+/// Split out of [`open_config_in_editor`] because every "edit the settings"
+/// route needs it: an agent asked to open a file that does not exist starts by
+/// arguing with the user about it.
+fn ensure_config_file(path: &std::path::Path) -> bool {
+    if path.exists() {
+        return true;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let example = include_str!("../../../docs/config.example.toml");
+    if let Err(err) = std::fs::write(path, example) {
+        log::warn!("terra: cannot create {}: {err}", path.display());
+        return false;
+    }
+    log::info!(
+        "terra: created {} from the documented example",
+        path.display()
+    );
+    true
 }
 
 fn lock(tabs: &Mutex<TabManager>) -> MutexGuard<'_, TabManager> {
@@ -183,6 +200,29 @@ fn dev_mark() -> &'static str {
     })
 }
 
+/// Whether `TERRA_NO_ACTIVATE` asks this launch to start *behind* whatever the
+/// user is doing.
+///
+/// Same dev-instance story as [`dev_mark`]: a second terra is opened
+/// constantly while working on terra — by `just restart`, by an agent
+/// verifying a change — and macOS activates a launching app, which yanks focus
+/// out of the editor or terminal the user was typing in. Setting this makes a
+/// launch quiet: the window opens, takes no focus, and is still fully
+/// drivable over its socket (`terra ls`, `terra screenshot`).
+///
+/// Only the *activation* is suppressed. The activation policy stays `Regular`,
+/// so terra keeps its Dock tile, its ⌘-Tab entry and — the reason this is not
+/// `Accessory` — its menu bar: an accessory app owns no menu bar at all, which
+/// would silently delete the application menu (see `macos::install_app_menu`).
+///
+/// No-op off macOS, where nothing steals focus on launch.
+fn no_activate() -> bool {
+    matches!(
+        std::env::var("TERRA_NO_ACTIVATE").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    )
+}
+
 /// The window/taskbar icon. (The Dock icon on macOS comes from the .app
 /// bundle's `terra.icns` instead — see `just bundle`.)
 fn app_icon() -> egui::IconData {
@@ -198,7 +238,7 @@ fn app_icon() -> egui::IconData {
 
 fn main() -> eframe::Result {
     env_logger::init();
-    let native_options = eframe::NativeOptions {
+    let mut native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([480.0, 320.0])
@@ -206,6 +246,17 @@ fn main() -> eframe::Result {
             .with_icon(app_icon()),
         ..Default::default()
     };
+    if no_activate() {
+        native_options.event_loop_builder = Some(Box::new(|builder| {
+            #[cfg(target_os = "macos")]
+            {
+                use winit::platform::macos::EventLoopBuilderExtMacOS;
+                builder.with_activate_ignoring_other_apps(false);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = builder;
+        }));
+    }
     eframe::run_native(
         "terra",
         native_options,
@@ -256,6 +307,41 @@ struct App {
     /// Directory currently behind the titlebar proxy icon, so we only bother
     /// AppKit when it actually moves.
     last_represented_path: Option<std::path::PathBuf>,
+    /// Whether the macOS application menu has been built yet. It cannot be
+    /// built at launch: half of it is the list of installed agents/editors,
+    /// which `edit_tools` is still probing for on a background thread.
+    app_menu_installed: bool,
+}
+
+/// Tag of the plain "Settings…" row in the application menu. The
+/// "Edit Settings With ▸" rows are tagged by their index in
+/// [`EditTool::ALL`], so this sits clear of them.
+const MENU_TAG_SETTINGS: isize = 1000;
+
+/// The menu tag naming `tool`: its position in [`EditTool::ALL`], which is a
+/// compile-time constant and so cannot drift between the two ends.
+fn tool_tag(tool: EditTool) -> isize {
+    EditTool::ALL
+        .iter()
+        .position(|t| *t == tool)
+        .expect("every tool is in ALL") as isize
+}
+
+/// The "Edit Settings With ▸" rows for a probe result.
+///
+/// Split out of [`App::sync_app_menu`] so the menu's *contents* are testable
+/// without AppKit. They have to be: a native menu bar cannot be screenshotted
+/// — the OS only renders the frontmost app's, and terra must never steal
+/// focus to be looked at (see `TERRA_NO_ACTIVATE`).
+fn edit_with_specs(found: &[edit_tools::Found]) -> Vec<macos::MenuSpec> {
+    found
+        .iter()
+        .map(|f| macos::MenuSpec {
+            tag: tool_tag(f.tool),
+            title: f.tool.label().to_owned(),
+            key: "",
+        })
+        .collect()
 }
 
 impl App {
@@ -265,6 +351,9 @@ impl App {
         // — later than this and there is a flash to see.
         macos::prime_open(cc);
         fonts::install(&cc.egui_ctx);
+        // A shell start and a couple of LaunchServices lookups; off the main
+        // thread so the first frame does not wait on them.
+        edit_tools::prime();
         let (pty_sender, pty_events) = mpsc::channel();
         let config = config::ConfigStore::load();
         let cached_font = terminal_font(&config.get().font);
@@ -287,6 +376,7 @@ impl App {
             closing: macos::CloseAnimation::default(),
             last_window_title: String::new(),
             last_represented_path: None,
+            app_menu_installed: false,
         }
     }
 
@@ -378,7 +468,7 @@ impl App {
         }
     }
 
-    fn palette_actions(&self) -> Vec<PaletteAction> {
+    fn palette_actions(&self, ctx: &egui::Context) -> Vec<PaletteAction> {
         // Section *declaration* order fixes both the group order in the list
         // and each group's accent colour, so neither moves while filtering.
         const TABS: &str = "Tabs";
@@ -509,13 +599,36 @@ impl App {
         actions.push(
             PaletteAction::new("config.open", "Open Config File", Some("⌘,"))
                 .in_section(SETTINGS)
-                .with_icon(PaletteIcon::Pencil),
+                // The gear that used to head the chevron menu's Settings row,
+                // now heading the palette's — see `edit_tools`. It is chrome,
+                // not a brand, so it takes the section's accent.
+                .with_icon(
+                    tab_icon::texture_id(ctx, tab_icon::TabIcon::Gear)
+                        .map_or(PaletteIcon::Pencil, PaletteIcon::Mask),
+                ),
         );
         actions.push(
             PaletteAction::new("config.reload", "Reload Config File", None)
                 .in_section(SETTINGS)
                 .with_icon(PaletteIcon::ArrowRight),
         );
+        // One row per tool actually installed (see `edit_tools`), each wearing
+        // its own brand mark rather than a stroked glyph — the same mark the
+        // tab an agent row opens will wear.
+        for found in edit_tools::detected() {
+            let tool = found.tool;
+            let icon = tab_icon::texture_id(ctx, tool.icon())
+                .map_or(PaletteIcon::Pencil, PaletteIcon::Image);
+            actions.push(
+                PaletteAction::new(
+                    format!("config.edit.{}", tool.slug()),
+                    format!("Config: Edit with {}", tool.label()),
+                    None,
+                )
+                .in_section(SETTINGS)
+                .with_icon(icon),
+            );
+        }
         if !self.config.warnings().is_empty() {
             actions.push(
                 PaletteAction::new(
@@ -565,6 +678,12 @@ impl App {
                     "config.reload" => actions.push(AppAction::ReloadConfig),
                     "config.open" => actions.push(AppAction::OpenConfig),
                     "config.warnings" => actions.push(AppAction::ShowConfigWarnings),
+                    edit if edit.starts_with("config.edit.") => {
+                        match EditTool::from_slug(&edit["config.edit.".len()..]) {
+                            Some(tool) => actions.push(AppAction::EditConfigWith(tool)),
+                            None => log::warn!("terra: unknown edit tool {edit}"),
+                        }
+                    }
                     "app.quit" => actions.push(AppAction::Quit),
                     // `tab.new` (exact) is handled above; `tab.new.<name>` is
                     // one profile, as `tab.select.<id>` is one tab.
@@ -658,7 +777,70 @@ impl App {
                 }
             }
             AppAction::OpenConfig => open_config_in_editor(self.config.path()),
+            AppAction::EditConfigWith(tool) => self.edit_config_with(tool),
             other => log::warn!("terra: {other:?} is not a config action"),
+        }
+    }
+
+    /// Build the macOS application menu, once, on the first frame after the
+    /// tool probe lands. Before that there is nothing to put in the submenu,
+    /// and a menu built empty would stay empty for the session.
+    fn sync_app_menu(&mut self) {
+        if self.app_menu_installed {
+            return;
+        }
+        let Some(found) = edit_tools::ready() else {
+            return;
+        };
+        let settings = macos::MenuSpec {
+            tag: MENU_TAG_SETTINGS,
+            title: "Settings…".to_owned(),
+            key: ",",
+        };
+        let edit_with = edit_with_specs(found);
+        macos::install_app_menu(&format!("Terra{}", dev_mark()), &[settings], &edit_with);
+        self.app_menu_installed = true;
+    }
+
+    /// Turn menu choices made since the last frame into actions.
+    fn drain_menu_actions(&self, actions: &mut Vec<AppAction>) {
+        for tag in macos::take_menu_actions() {
+            match tag {
+                MENU_TAG_SETTINGS => actions.push(AppAction::OpenConfig),
+                macos::QUIT_TAG => actions.push(AppAction::Quit),
+                tag => match EditTool::ALL.get(tag.unsigned_abs()) {
+                    Some(tool) => actions.push(AppAction::EditConfigWith(*tool)),
+                    None => log::warn!("terra: unknown menu tag {tag}"),
+                },
+            }
+        }
+    }
+
+    /// Hand the config file to one detected tool.
+    ///
+    /// An *agent* gets a terra tab of its own, opened the ordinary way
+    /// (`TabManager::open` types the command into a login shell), so it
+    /// inherits exactly the environment a user-opened tab would — which is the
+    /// only reason `claude` is runnable at all from a Finder-launched app. It
+    /// is handed one positional argument, [`edit_tools::EDIT_PROMPT`], and
+    /// starts its first turn on it. An *editor* is simply given the file and
+    /// no tab.
+    fn edit_config_with(&mut self, tool: EditTool) {
+        let path = self.config.path().to_path_buf();
+        if !ensure_config_file(&path) {
+            return;
+        }
+        if !tool.is_agent() {
+            return edit_tools::open_file_with(tool, &path);
+        }
+        let Some(arc) = self.tabs.clone() else { return };
+        let command = vec![tool.cli().to_owned(), edit_tools::edit_prompt(&path)];
+        // The title says what the tab is for; the icon comes from the process
+        // table a moment later and agrees with it (see `tab_icon`).
+        let title = format!("config \u{b7} {}", tool.cli());
+        let opened = lock(&arc).open(&command, None, Some(title));
+        if let Err(err) = opened {
+            log::error!("terra: cannot open a {} tab: {err}", tool.label());
         }
     }
 
@@ -763,7 +945,7 @@ impl App {
 
     /// Every arm takes the lock for exactly as long as it needs it — never
     /// across a call that would want it again (`palette_actions`).
-    fn apply(&mut self, action: AppAction) {
+    fn apply(&mut self, ctx: &egui::Context, action: AppAction) {
         // Config actions touch no tab, so they must not be gated on one
         // existing — otherwise they would silently no-op before the first
         // shell has spawned.
@@ -774,6 +956,7 @@ impl App {
             | AppAction::ResetSession
             | AppAction::ReloadConfig
             | AppAction::OpenConfig
+            | AppAction::EditConfigWith(_)
             | AppAction::ShowConfigWarnings => return self.apply_config(action),
             _ => {}
         }
@@ -852,7 +1035,7 @@ impl App {
                 };
             }
             AppAction::OpenPalette => {
-                let actions = self.palette_actions();
+                let actions = self.palette_actions(ctx);
                 self.palette.open(actions);
             }
             AppAction::RenameActive => {
@@ -872,6 +1055,7 @@ impl App {
             | AppAction::ResetSession
             | AppAction::ReloadConfig
             | AppAction::OpenConfig
+            | AppAction::EditConfigWith(_)
             | AppAction::ShowConfigWarnings => unreachable!("handled above"),
             // The tabs are *not* torn down here: the window fades out first,
             // and an empty window is not what should be fading. Closing them
@@ -890,6 +1074,9 @@ struct RenderEnv {
     /// DFS index of the focused group, read once — the walk itself never
     /// changes focus.
     focused_group: usize,
+    /// `[tabs] bar_with_one_tab`, read once a frame like the rest of this
+    /// struct, so a config reload lands on the very next frame.
+    bar_with_one_tab: bool,
 }
 
 /// The recursive renderer for one frame: the split tree becomes nested rects
@@ -1061,6 +1248,7 @@ impl TreeFrame<'_> {
             group,
             focused,
             self.icons,
+            self.env.bar_with_one_tab,
             self.actions,
         );
 
@@ -1068,7 +1256,11 @@ impl TreeFrame<'_> {
         // the familiar margins.
         let area = col_ui.available_rect_before_wrap();
         self.geoms.push(ui::GroupGeometry {
-            bar: if ui::bar_visible(self.tabs.group_tabs(group).len(), self.tabs.group_count()) {
+            bar: if ui::bar_visible(
+                self.tabs.group_tabs(group).len(),
+                self.tabs.group_count(),
+                self.env.bar_with_one_tab,
+            ) {
                 egui::Rect::from_min_size(
                     column.min,
                     egui::vec2(column.width(), ui::TAB_BAR_HEIGHT),
@@ -1162,14 +1354,19 @@ impl eframe::App for App {
         self.sync_window_title(&ctx, frame);
         self.sync_config_cache();
 
+        self.sync_app_menu();
+
         let mut actions: Vec<AppAction> = Vec::new();
+        // The application menu dispatches between frames, so its choices are
+        // collected first and applied with everything else this frame.
+        self.drain_menu_actions(&mut actions);
         // Global shortcuts are consumed before the terminal widget reads events.
         if !self.palette.is_open() {
             actions.extend(ui::consume_shortcuts(ui));
         }
         self.handle_palette(&ctx, &mut actions);
         for action in std::mem::take(&mut actions) {
-            self.apply(action);
+            self.apply(&ctx, action);
         }
 
         // One process-table snapshot for the whole window: every group's bar
@@ -1185,6 +1382,7 @@ impl eframe::App for App {
         let palette_open = self.palette.is_open();
         let bidi = self.active_bidi(&ctx);
         let bidi_base = self.config.get().text.bidi_base;
+        let bar_with_one_tab = self.config.get().tabs.bar_with_one_tab;
         let font = self.cached_font.clone();
         let tabs_arc = self.tabs.clone();
         let icons = &self.tab_icons;
@@ -1211,6 +1409,7 @@ impl eframe::App for App {
                         bidi_base,
                         font: font.clone(),
                         focused_group: tabs.focused_group(),
+                        bar_with_one_tab,
                     },
                     tabs: &mut tabs,
                     icons,
@@ -1226,7 +1425,7 @@ impl eframe::App for App {
                 ui::tab_drag_overlay(ui, &tabs, icons, &geoms, panel_actions);
             });
         for action in std::mem::take(&mut actions) {
-            self.apply(action);
+            self.apply(&ctx, action);
         }
 
         // Last tab gone (or Quit chosen) -> the app is done. Not while the
@@ -1243,6 +1442,72 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::dev_suffix;
+    use super::*;
+
+    /// Every menu tag the application menu can hand back maps to exactly one
+    /// action, and the three families never collide: Settings is 1000, Quit is
+    /// negative, and the tools are small indices.
+    #[test]
+    fn every_menu_tag_names_one_thing() {
+        let mut seen = vec![MENU_TAG_SETTINGS, macos::QUIT_TAG];
+        for tool in EditTool::ALL {
+            let tag = tool_tag(*tool);
+            assert!(!seen.contains(&tag), "tag {tag} is used twice");
+            assert!(EditTool::ALL.get(tag.unsigned_abs()) == Some(tool));
+            seen.push(tag);
+        }
+    }
+
+    /// The submenu is the probe's answer, one row per installed tool, in
+    /// declaration order and labelled the way the palette labels it. Stands in
+    /// for a screenshot: a native menu bar only renders for the frontmost app.
+    #[test]
+    fn the_edit_settings_with_submenu_is_one_row_per_detected_tool() {
+        let found: Vec<edit_tools::Found> = [EditTool::ClaudeCode, EditTool::Cursor]
+            .into_iter()
+            .map(|tool| edit_tools::Found { tool, cli: None })
+            .collect();
+        let specs = edit_with_specs(&found);
+        assert_eq!(
+            specs.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+            ["Claude Code", "Cursor"]
+        );
+        // No key equivalents: these rows are discovery, not muscle memory, and
+        // every ⌘-something in a menu is a key the terminal stops receiving.
+        assert!(specs.iter().all(|s| s.key.is_empty()));
+        // Each row's tag round-trips to the tool it names.
+        for (spec, f) in specs.iter().zip(&found) {
+            assert_eq!(EditTool::ALL.get(spec.tag.unsigned_abs()), Some(&f.tool));
+        }
+        // Nothing detected, nothing offered — and `install_app_menu` then
+        // leaves the submenu out entirely.
+        assert!(edit_with_specs(&[]).is_empty());
+    }
+
+    /// `TERRA_NO_ACTIVATE` is opt-in and only for the spellings a human or a
+    /// recipe would actually write; anything else keeps today's behaviour.
+    #[test]
+    fn only_a_truthy_no_activate_suppresses_activation() {
+        let saved = std::env::var("TERRA_NO_ACTIVATE").ok();
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("", false),
+        ] {
+            // SAFETY: single-threaded test, and the variable is restored below.
+            unsafe { std::env::set_var("TERRA_NO_ACTIVATE", value) };
+            assert_eq!(no_activate(), expected, "TERRA_NO_ACTIVATE={value:?}");
+        }
+        unsafe { std::env::remove_var("TERRA_NO_ACTIVATE") };
+        assert!(!no_activate());
+        if let Some(saved) = saved {
+            unsafe { std::env::set_var("TERRA_NO_ACTIVATE", saved) };
+        }
+    }
 
     /// The daily driver — default socket, no override — is unmarked.
     #[test]

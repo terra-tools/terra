@@ -38,9 +38,11 @@ png = { workspace = true }
 # costs nothing on the other platforms.
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
 objc2-app-kit = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-quartz-core = { workspace = true }
+winit = { workspace = true }
 libc = { workspace = true }
 
 # ToolHelp32, to find the program running in a tab (see

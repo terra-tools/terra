@@ -58,12 +58,14 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   middle-click, trailing `+` button, and a `⌄` beside it opening that group's
   profile menu (`ui::chevron_menu` — ui + rect + salt + `[MenuEntry]` in,
   chosen `AppAction` out, so it re-anchors to any `+`; the rows open in the
-  group whose bar was clicked). Keep it clean/dark. With a single group
-  holding a single tab the bar hides entirely; a second tab or a second group
-  brings every bar back.
+  group whose bar was clicked). Keep it clean/dark. A single group
+  holding a single tab shows its bar unless `[tabs] bar_with_one_tab = false`
+  turns that off; only the lone *empty* group is ever bare unconditionally,
+  and a second tab or a second group brings every bar back either way
+  (`ui::bar_visible`).
 - Keybindings: Cmd+T new tab, Cmd+W close active, Cmd+Shift+P open palette,
-  Cmd+, open the config file in the OS's editor (the chevron menu's trailing
-  "Settings" row and palette `config.open` do the same; a missing file is
+  Cmd+, open the config file in the OS's editor (the macOS app menu's
+  "Settings…" row and palette `config.open` do the same; a missing file is
   seeded from docs/config.example.toml first),
   Cmd+\ split right (move the active tab into a new group),
   Cmd+Alt+Left/Up and Cmd+Alt+Right/Down focus the previous/next leaf in DFS
@@ -75,7 +77,31 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   mode, prompt id "rename"), `tab.next`, `tab.prev`, `tab.select.<id>` (one per
   open tab across all groups, label = title, prefixed with the group ordinal —
   "2: htop" — when there is more than one group), `split.right`, `split.left`,
-  `split.down`, `split.up`, `group.next`, `group.prev`, `app.quit`.
+  `split.down`, `split.up`, `group.next`, `group.prev`, `app.quit`,
+  `config.edit.<slug>` (one per installed agent/editor — `claude`, `codex`,
+  `vscode`, `cursor`).
+- "Edit Settings With" (`edit_tools.rs`): probes once at launch, on a
+  background thread, for `claude`/`codex`/`code`/`cursor` on the *login
+  shell's* PATH (a Finder-launched app has launchd's, which has none of them)
+  plus `~/.local/bin`, `~/bin`, `/opt/homebrew/bin`, `/usr/local/bin`; on
+  macOS an editor also counts if LaunchServices knows its application bundle
+  (`open -Ra`), so a user without the `code` shim still gets the row. An agent
+  row opens a `config · <cli>` tab running the CLI with one positional prompt
+  (`edit_tools::EDIT_PROMPT`, the same sentence for both); an editor row just
+  opens the file. Rows appear in the palette and in the macOS application
+  menu's "Edit Settings With ▸" submenu.
+- macOS application menu (`macos::install_app_menu`): winit installs none, so
+  terra builds its own — About, Settings… (Cmd+,), "Edit Settings With ▸",
+  Hide/Show All, Quit. Built on the first frame after the tool probe lands
+  (its contents depend on it). Rows carry a tag; `macos::take_menu_actions`
+  drains the choices on the next frame, because AppKit dispatches between
+  frames. Only the application menu exists: every extra key equivalent is a
+  key the terminal stops receiving.
+- `TERRA_NO_ACTIVATE=1` starts the window without stealing focus (winit's
+  `with_activate_ignoring_other_apps(false)`; the activation policy stays
+  `Regular`, since an `Accessory` app owns no menu bar). `just run`/`just
+  restart` set it — a dev instance opening on top of what you were typing in
+  is the single most disruptive thing about working on terra.
 - Drag & drop: a pill dragged within a bar reorders that bar; dropped on
   another group's bar it *moves* there (slot under the cursor, becomes that
   group's active tab); dropped on a terminal it splits — four drop zones per

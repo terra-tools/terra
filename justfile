@@ -26,15 +26,17 @@ build:
 release:
     cargo build --release
 
-# Run the GUI app (debug build) beside the installed release
+# Run the GUI app (debug build) beside the installed release.
+# TERRA_NO_ACTIVATE keeps the launch from stealing focus: the dev window opens
+# behind whatever you were typing in, and is still fully drivable via `just t`.
 run:
-    TERRA_SOCKET='{{dev-socket}}' cargo run -p terra-app
+    TERRA_SOCKET='{{dev-socket}}' TERRA_NO_ACTIVATE=1 cargo run -p terra-app
 
 # Kill the running *dev* app (never the installed one) and start a fresh debug build
 restart: build
     -pkill -f '{{dev-pattern}}'
     sleep 1
-    (TERRA_SOCKET='{{dev-socket}}' nohup ./target/debug/terra-app > /tmp/terra-app.log 2>&1 &)
+    (TERRA_SOCKET='{{dev-socket}}' TERRA_NO_ACTIVATE=1 nohup ./target/debug/terra-app > /tmp/terra-app.log 2>&1 &)
     echo "terra-app (dev) restarted on {{dev-socket}} (log: /tmp/terra-app.log)"
 
 # Type-check the whole workspace
@@ -61,9 +63,12 @@ pre-commit: fmt lint test
 t *args:
     TERRA_SOCKET='{{dev-socket}}' cargo run -q -p terra-cli -- {{args}}
 
-# Cross-platform bundles via cargo-packager (.app + .dmg on macOS)
+# The .app bundle via cargo-packager. App only on purpose: the manifest's
+# default formats include the dmg, whose local (non-CI) build runs a Finder
+# AppleScript that pops a window mid-`just upgrade`. Releases build the dmg
+# in CI, where CI=true skips that styling.
 bundle: release
-    cargo packager -p terra-app --release
+    cargo packager -p terra-app --release -f app
 
 # One-time: mint a stable self-signed "terra-dev" signing identity, so macOS
 # recognises the app across upgrades and TCC permission grants survive.

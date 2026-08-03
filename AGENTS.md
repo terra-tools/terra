@@ -20,6 +20,11 @@ tasks (`just pre-commit` before committing).
   runs that.
 - Develop against the dev instance: `just run` / `just restart` — own socket,
   `(dev)` window title, safe to kill. Drive it with `just t ls|new|send|capture`.
+- Launch it with `TERRA_NO_ACTIVATE=1` (both recipes already do). macOS
+  activates a launching app, so without it every restart yanks focus out of
+  whatever the user is typing in. Never take focus another way either — no
+  `terra select`, no `osascript ... frontmost`, no `screencapture`; verify with
+  `terra screenshot --out` instead, which needs no focus at all.
 
 ## Verification
 
@@ -28,6 +33,16 @@ tasks (`just pre-commit` before committing).
   `.claude/skills/verify-tui/SKILL.md`.
 - Visual claims need pixels: `terra screenshot --out f.png`, then look at it.
   Never assume.
+- NEVER steal the user's focus to verify: no `terra select` against your dev
+  instance, no `osascript ... frontmost`, no `open -a`, no bare
+  `screencapture`. `terra screenshot` renders the window offscreen without
+  focus — it covers everything drawn inside the egui window (palette, menus,
+  tabs). For the native macOS menu bar, use the Accessibility API against the
+  BACKGROUND process — it reads (and can AXPress) menus without activating:
+  `osascript -e 'tell application "System Events" to get name of every menu
+  item of menu 1 of menu bar item "<Menu>" of menu bar 1 of process
+  "terra-app"'`. Verify an item fires by AXPress + observing the effect
+  (`terra ls`, capture) — never by watching the screen.
 
 ## Conventions
 

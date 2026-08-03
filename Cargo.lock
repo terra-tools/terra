@@ -2915,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "terra-app"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2926,6 +2926,7 @@ dependencies = [
  "interprocess",
  "libc",
  "log",
+ "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "objc2-quartz-core 0.3.2",
@@ -2937,11 +2938,12 @@ dependencies = [
  "terra-protocol",
  "toml",
  "windows-sys 0.61.2",
+ "winit",
 ]
 
 [[package]]
 name = "terra-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2954,14 +2956,14 @@ dependencies = [
 
 [[package]]
 name = "terra-palette"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "terra-protocol"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "base64",

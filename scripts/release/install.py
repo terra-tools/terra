@@ -51,9 +51,10 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    # Same commands as `just bundle`.
+    # Same commands as `just bundle` — app only; the dmg's local build pops a
+    # Finder window (see the justfile's `bundle` comment).
     run(["cargo", "build", "--release"])
-    run(["cargo", "packager", "-p", "terra-app", "--release"])
+    run(["cargo", "packager", "-p", "terra-app", "--release", "-f", "app"])
 
     identity = signing_identity()
     if identity:

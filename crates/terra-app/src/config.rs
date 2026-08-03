@@ -74,6 +74,15 @@ pub const DEFAULT_BIDI: BidiMode = BidiMode::Off;
 /// logos in chrome noisy — should be able to say so. Off costs the walk too:
 /// nothing polls when this is false.
 pub const DEFAULT_TAB_ICONS: bool = true;
+/// Show the tab bar even when a lone group holds a single tab.
+///
+/// On by default: the bar is where the `+` button, the profile chevron and the
+/// tab's own title live, and a window that only grows chrome once you own two
+/// tabs hides the way to open the second one — and shifts the terminal down by
+/// a bar's height the moment you find it. Off restores the older, Ghostty-like
+/// behaviour, where one tab means no chrome at all. Either way a second tab, or
+/// a second group, always shows every bar.
+pub const DEFAULT_TAB_BAR_WITH_ONE_TAB: bool = true;
 /// Autodetect the paragraph direction per row.
 ///
 /// `Ltr` keeps a shell prompt provably immobile, but it strands RTL sentence
@@ -246,7 +255,7 @@ const LINE_HEIGHT_RANGE: (f32, f32) = (0.5, 3.0);
 const KNOWN: &[(&str, &[&str])] = &[
     ("font", &["size", "line_height"]),
     ("text", &["bidi", "bidi_base", "bidi_quirks"]),
-    ("tabs", &["icons"]),
+    ("tabs", &["icons", "bar_with_one_tab"]),
 ];
 
 /// The section holding the named ways to open a tab: `[profile.<name>]`.
@@ -421,6 +430,8 @@ pub struct TabsFile {
     /// spelling. A non-boolean costs the `[tabs]` section its defaults and
     /// warns, which `section` already does.
     pub icons: Option<bool>,
+    /// Typed as `bool` for the same reason as `icons` above.
+    pub bar_with_one_tab: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +472,11 @@ pub struct TextConfig {
 pub struct TabsConfig {
     /// Whether the tab bar draws a per-tab icon. See [`DEFAULT_TAB_ICONS`].
     pub icons: bool,
+    /// Whether a lone group holding one tab still shows its bar. See
+    /// [`DEFAULT_TAB_BAR_WITH_ONE_TAB`]; ask [`crate::ui::bar_visible`] rather
+    /// than reading this directly, since a second group shows every bar
+    /// regardless.
+    pub bar_with_one_tab: bool,
 }
 
 impl Default for Config {
@@ -477,6 +493,7 @@ impl Default for Config {
             },
             tabs: TabsConfig {
                 icons: DEFAULT_TAB_ICONS,
+                bar_with_one_tab: DEFAULT_TAB_BAR_WITH_ONE_TAB,
             },
             profiles: BTreeMap::new(),
         }
@@ -700,6 +717,12 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
         .or(file.tabs.icons)
         .unwrap_or(DEFAULT_TAB_ICONS);
 
+    let bar_with_one_tab = session
+        .tabs
+        .bar_with_one_tab
+        .or(file.tabs.bar_with_one_tab)
+        .unwrap_or(DEFAULT_TAB_BAR_WITH_ONE_TAB);
+
     Config {
         font: FontConfig { size, line_height },
         text: TextConfig {
@@ -707,7 +730,10 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
             bidi_base,
             quirks: quirks(file, session, warnings),
         },
-        tabs: TabsConfig { icons },
+        tabs: TabsConfig {
+            icons,
+            bar_with_one_tab,
+        },
         profiles: profiles(file, warnings),
     }
 }
@@ -1409,6 +1435,29 @@ mod tests {
         assert!(resolved("[font]\nsize = 12.0\n").tabs.icons);
         assert!(!resolved("[tabs]\nicons = false\n").tabs.icons);
         assert!(resolved("[tabs]\nicons = true\n").tabs.icons);
+    }
+
+    /// The single-tab bar is shown unless the file opts out, and opting out of
+    /// it leaves the section's other key alone.
+    #[test]
+    fn the_single_tab_bar_defaults_on_and_is_switchable_off() {
+        assert!(Config::default().tabs.bar_with_one_tab);
+        assert!(resolved("").tabs.bar_with_one_tab);
+        assert!(resolved("[tabs]\nicons = false\n").tabs.bar_with_one_tab);
+        assert!(
+            !resolved("[tabs]\nbar_with_one_tab = false\n")
+                .tabs
+                .bar_with_one_tab
+        );
+        assert!(
+            resolved("[tabs]\nbar_with_one_tab = true\n")
+                .tabs
+                .bar_with_one_tab
+        );
+
+        let both = resolved("[tabs]\nicons = false\nbar_with_one_tab = false\n").tabs;
+        assert!(!both.icons);
+        assert!(!both.bar_with_one_tab);
     }
 
     /// The fault-isolation contract, applied to the new section: a `[tabs]`

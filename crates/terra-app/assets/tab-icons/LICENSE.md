@@ -34,6 +34,7 @@ redistributed without permission or attribution.
 | `neovim.svg` | `neovim` | `nvim`, `neovim` |
 | `tmux.svg` | `tmux` | `tmux`, `screen`, `zellij` |
 | `rust.svg` | `rust` | `cargo`, `rustc`, `rustup` |
+| `cursor.svg` | `cursor` | `cursor`, and its "Edit Settings With" row |
 
 ### Brand-guideline caveat
 
@@ -77,6 +78,26 @@ covers the file; it does not license the trademark.
 
 Its colour is `#000000`, so — exactly like Rust's — `readable_on_dark` lifts it
 toward white at load so it is visible on the dark bar.
+
+Cursor's mark, in the table above, is `#000000` for the same reason and gets
+the same lift.
+
+## `vscode.svg` — hand-authored
+
+**Not** from Simple Icons either: Simple Icons carries no `visualstudiocode`
+entry (it 404s on v16.28.0, having been dropped upstream), so there was no
+CC0 file to take. `vscode.svg` is therefore drawn here, by hand, from the
+mark's plain geometry: a chevron fold and the bar beside it, one path with an
+even-odd hole, in VS Code's `#0098FF`. It is a simplified rendition rather
+than a copy of Microsoft's artwork — no gradients, no exact control points —
+and it exists for one purpose, the same as every other file here: saying which
+program a tab or a menu row is about.
+
+"Visual Studio Code" and its logo are Microsoft trademarks, and the
+brand-guideline caveat above applies in full. terra uses this shape only as an
+indicator, never as terra's own branding, and never to imply that Microsoft
+endorses or is affiliated with terra. If Microsoft objects, delete the file
+and its `TabIcon::VsCode` row; the generic glyph takes over automatically.
 
 | file | drawn for |
 | --- | --- |

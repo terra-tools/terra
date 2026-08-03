@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.0.3"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 
@@ -56,6 +56,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSWindow",
     "NSApplication",
     "NSRunningApplication",
+    # The application menu (see crates/terra-app/src/macos.rs). winit installs
+    # none, so terra builds its own — About, Settings, "Edit Settings With ▸".
+    "NSMenu",
+    "NSMenuItem",
     # The window's open/close transition: `NSAnimationContext` + the
     # `animator()` proxy from `NSAnimation`, with the easing curve coming from
     # QuartzCore (hence the `objc2-quartz-core` bridge feature).
@@ -66,6 +70,9 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     # the CoreFoundation bridge feature.
     "objc2-core-foundation",
 ] }
+# `define_class!` for the menu's action target, plus `MainThreadMarker`/`sel!`.
+# Already in the tree at this version under objc2-app-kit, so it costs no build.
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSString",
@@ -77,6 +84,11 @@ objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "std",
     "CAMediaTimingFunction",
 ] }
+
+# `TERRA_NO_ACTIVATE`: the one winit knob eframe does not re-export
+# (`EventLoopBuilderExtMacOS`), so terra names winit directly. Pinned to what
+# eframe already resolves, so it adds no crate and no extra compilation.
+winit = { version = "0.30.13", default-features = false }
 
 # One `sysctl(KERN_PROC_ALL)` to find the program running in a tab (see
 # crates/terra-app/src/procinfo.rs). Already in the tree via winit/eframe, so
