@@ -77,7 +77,16 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
-            libwayland-dev
+            libwayland-dev \
+            tmux
+
+      # The PTY harness suites (tmux_mouse_chain, osc52_clipboard,
+      # issue_paste_repro) drive a real tmux; the macOS runner image does not
+      # ship one. Linux gets it through apt above; Windows never runs those
+      # suites (they are #![cfg(unix)]).
+      - name: Install tmux (macOS)
+        if: matrix.platform == 'macos'
+        run: brew install tmux
 
       # `cargo install cargo-packager` is 80-220s per job; the binary is the
       # only thing it leaves behind, so cache that instead. The version is in
