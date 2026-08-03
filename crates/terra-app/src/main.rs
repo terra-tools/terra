@@ -24,6 +24,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod confirm_close;
 mod edit_tools;
 mod fonts;
 mod ghostty_theme;
@@ -151,6 +152,38 @@ fn ensure_config_file(path: &std::path::Path) -> bool {
 
 fn lock(tabs: &Mutex<TabManager>) -> MutexGuard<'_, TabManager> {
     tabs.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+/// Whether closing the window right now would take a running program down
+/// with it — the world half of the "Close Window?" decision, with the
+/// judgement itself left to [`confirm_close::should_confirm`].
+///
+/// One process-table snapshot answers for every tab at once (see
+/// [`procinfo::foreground_commands`]), and the switch is checked before the
+/// snapshot so `confirm_close = false` reads nothing at all.
+fn close_would_kill_work(enabled: bool, tabs: Option<&Arc<Mutex<TabManager>>>) -> bool {
+    if !enabled {
+        return false;
+    }
+    let Some(arc) = tabs else {
+        return false;
+    };
+    let pids: Vec<u32> = {
+        let tabs = lock(arc);
+        tabs.ids()
+            .iter()
+            .filter_map(|id| tabs.shell_pid(*id))
+            .collect()
+    };
+    if pids.is_empty() {
+        return false;
+    }
+    let foreground = procinfo::foreground_commands(&pids);
+    let names: Vec<Option<&str>> = foreground
+        .iter()
+        .map(|fg| fg.as_ref().map(|fg| fg.name.as_str()))
+        .collect();
+    confirm_close::should_confirm(enabled, &names)
 }
 
 /// Ghostty-like readability: bright foreground on a soft dark background
@@ -304,6 +337,10 @@ struct App {
     /// window fades, and only then is the close let through. See
     /// `macos::CloseAnimation`.
     closing: macos::CloseAnimation,
+    /// The "Close Window?" question, and whether one is outstanding. Sits
+    /// *in front of* `closing`: a close is confirmed first and animated
+    /// second, so a canceled close never fades anything.
+    confirm_close: confirm_close::ConfirmClose,
     last_window_title: String,
     /// Directory currently behind the titlebar proxy icon, so we only bother
     /// AppKit when it actually moves.
@@ -375,6 +412,7 @@ impl App {
             quitting: false,
             opening: macos::OpenAnimation::default(),
             closing: macos::CloseAnimation::default(),
+            confirm_close: confirm_close::ConfirmClose::default(),
             last_window_title: String::new(),
             last_represented_path: None,
             app_menu_installed: false,
@@ -939,6 +977,22 @@ impl App {
             .poll(now, &facts, procinfo::foreground_commands);
     }
 
+    /// A close request arrived: hold it back behind the "Close Window?"
+    /// dialog, or let it through?
+    ///
+    /// The process table is walked here rather than read off `tab_icons`,
+    /// which is a *cache* on a one-second clock and is empty outright when
+    /// `[tabs] icons = false`. A close happens once; one `sysctl` at the
+    /// moment it does is both cheap and the only way to be current.
+    fn ask_before_closing(&mut self) -> bool {
+        // `requested` calls this at most once per question — never while a
+        // dialog is already up, and never after the user has approved.
+        let enabled = self.config.get().window.confirm_close;
+        let tabs = self.tabs.clone();
+        self.confirm_close
+            .requested(|| close_would_kill_work(enabled, tabs.as_ref()))
+    }
+
     /// Rebuild anything derived from the config, but only when it moved.
     fn sync_config_cache(&mut self) {
         if self.cached_config_generation == self.config.generation() {
@@ -1072,7 +1126,9 @@ impl App {
 
 /// Everything one frame's split-tree walk reads but does not mutate.
 struct RenderEnv {
-    palette_open: bool,
+    /// The command palette or the close-confirmation dialog is up, so the
+    /// terminal must not hold focus (see `TerminalView::set_focus`).
+    modal_open: bool,
     bidi: bool,
     bidi_base: egui_term::BidiBase,
     font: egui_term::TerminalFont,
@@ -1227,7 +1283,7 @@ impl TreeFrame<'_> {
 
         // Clicking anywhere in the leaf — bar or grid — focuses its group.
         // Read, not consumed: the click still reaches whatever it landed on.
-        let pressed_here = !self.env.palette_open
+        let pressed_here = !self.env.modal_open
             && ui.input(|i| {
                 i.pointer.primary_pressed()
                     && i.pointer.interact_pos().is_some_and(|p| column.contains(p))
@@ -1287,7 +1343,7 @@ impl TreeFrame<'_> {
                 // Only the focused group's view takes the keyboard; the
                 // palette beats them all.
                 let view = TerminalView::new(&mut term_ui, &mut tab.backend)
-                    .set_focus(!self.env.palette_open && focused)
+                    .set_focus(!self.env.modal_open && focused)
                     .set_theme(terminal_theme())
                     .set_font(self.env.font.clone())
                     .set_bidi(self.env.bidi)
@@ -1321,7 +1377,26 @@ impl eframe::App for App {
             macos::OpenStep::Done => {}
         }
 
-        let step = if ctx.input(|i| i.viewport().close_requested()) {
+        // Both ways out of terra land on `close_requested`: the red traffic
+        // light raises it directly, and ⌘Q — the app menu's Quit row, the
+        // palette's `app.quit` — sets `self.quitting`, which sends
+        // `ViewportCommand::Close` at the end of the frame and raises it on
+        // the next one. So one interception here covers both.
+        //
+        // It sits *in front of* the fade: a close the user then cancels must
+        // not have animated anything, and the fade's own re-issued request
+        // must not be mistaken for a fresh one (`ConfirmClose` remembers the
+        // answer instead of re-asking).
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        let held = close_requested && self.ask_before_closing();
+        if held {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            // A pending Quit would otherwise re-issue the close every frame,
+            // leaving the dialog answering a question that keeps coming back.
+            self.quitting = false;
+            ctx.request_repaint();
+        }
+        let step = if close_requested && !held {
             self.closing.requested(now, || macos::animate_close(frame))
         } else {
             self.closing.tick(now)
@@ -1361,12 +1436,24 @@ impl eframe::App for App {
 
         self.sync_app_menu();
 
+        // Before the shortcut table reads the keyboard and before the terminal
+        // is composed: while the dialog is up, Return and Escape are answers
+        // to it and must reach nothing else.
+        if self.confirm_close.is_open() {
+            if let Some(choice) = confirm_close::show(&ctx) {
+                self.confirm_close.answer(choice);
+                if choice == confirm_close::Choice::Close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
         let mut actions: Vec<AppAction> = Vec::new();
         // The application menu dispatches between frames, so its choices are
         // collected first and applied with everything else this frame.
         self.drain_menu_actions(&mut actions);
         // Global shortcuts are consumed before the terminal widget reads events.
-        if !self.palette.is_open() {
+        if !self.palette.is_open() && !self.confirm_close.is_open() {
             actions.extend(ui::consume_shortcuts(ui));
         }
         self.handle_palette(&ctx, &mut actions);
@@ -1384,7 +1471,8 @@ impl eframe::App for App {
         // Re-read after the actions above, so a toggle applied this frame is
         // the one this frame paints with.
         self.sync_config_cache();
-        let palette_open = self.palette.is_open();
+        // Either modal takes the keyboard away from the terminal.
+        let modal_open = self.palette.is_open() || self.confirm_close.is_open();
         let bidi = self.active_bidi(&ctx);
         let bidi_base = self.config.get().text.bidi_base;
         let bar_with_one_tab = self.config.get().tabs.bar_with_one_tab;
@@ -1409,7 +1497,7 @@ impl eframe::App for App {
                 let full = ui.available_rect_before_wrap();
                 let mut frame = TreeFrame {
                     env: RenderEnv {
-                        palette_open,
+                        modal_open,
                         bidi,
                         bidi_base,
                         font: font.clone(),
@@ -1437,6 +1525,12 @@ impl eframe::App for App {
         // window is already fading out, though: re-asking every frame would
         // count as the user insisting, and cut the animation short.
         let empty = self.tabs.as_ref().is_some_and(|tabs| lock(tabs).is_empty());
+        // The last tab exiting while the dialog is up answers the question:
+        // there is nothing left to protect, so the window must not be stuck
+        // behind a modal about sessions that no longer exist.
+        if empty && self.confirm_close.is_open() {
+            self.confirm_close.answer(confirm_close::Choice::Close);
+        }
         if (self.quitting || empty) && !self.closing.is_fading() {
             self.ipc = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

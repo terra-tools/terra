@@ -71,6 +71,17 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   Cmd+Alt+Left/Up and Cmd+Alt+Right/Down focus the previous/next leaf in DFS
   order (order-based, not spatial). Tab-scoped bindings act on the *focused
   group*: Cmd+1..9 select nth in its bar, Cmd+Shift+[ / ] cycle its bar.
+- Closing the window (`confirm_close.rs`): both ways out — the red traffic
+  light and ⌘Q/Quit, which routes through `AppAction::Quit` and one
+  `ViewportCommand::Close` — raise `close_requested`, so `App::ui` intercepts
+  once, in front of the close fade. `should_confirm` (pure: per-tab foreground
+  command names + `[window] confirm_close`) decides whether the close would
+  kill anything; a window of bare shell prompts closes silently, Ghostty-style.
+  When it would, `ConfirmClose` holds the request (`CancelClose`) and the
+  palette-styled "Close Window?" dialog goes up: Esc / Cancel / a click outside
+  abandons the close entirely (the next attempt asks again), Return / Close
+  approves it and every request from then on — including the one the fade
+  re-issues — passes straight through.
 - Palette actions (ids): `tab.new`, `tab.new.<name>`
   (one per config profile, label "New Tab: <name>", opens in the focused
   group), `tab.close`, `tab.rename` (opens prompt
@@ -146,7 +157,8 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
 - Config: `~/.terra/config.toml` (`TERRA_CONFIG` overrides), read once at
   startup into `config.rs`. `[font] size, line_height`, `[text] bidi,
   bidi_base, [text.bidi_quirks]`, `[tabs] icons, bar_with_one_tab,
-  transcript_kb`, `[profile.<name>] command, cwd, title`.
+  transcript_kb`, `[window] confirm_close`, `[profile.<name>] command, cwd,
+  title`.
   Loading never fails — see `docs/config.example.toml`. Profiles are
   deserialized one at a time, so one broken profile is skipped with a warning
   rather than costing the rest; `command` is a string and is split into argv,
