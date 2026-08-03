@@ -40,6 +40,9 @@ enum InputAction {
 #[derive(Clone, Default)]
 pub struct TerminalViewState {
     is_dragged: bool,
+    /// terra patch: a press that went to the program as a mouse report, so
+    /// its release must go there too. See `process_left_button`.
+    is_reported_press: bool,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
 }
@@ -779,18 +782,35 @@ fn process_left_button(
     modifiers: &Modifiers,
     pressed: bool,
 ) -> InputAction {
-    let terminal_mode = backend.last_content().terminal_mode;
-    if terminal_mode.intersects(TermMode::MOUSE_MODE)
-        && !selection_override(modifiers)
-    {
+    // terra patch: who owns a click is decided **once, at press time**, and
+    // the release follows the press. Deciding it again on release reads the
+    // modifiers as they are then, which need not be how they were: let go of
+    // Shift before the mouse button and the program that never saw the press
+    // gets an orphan release (it believes the button is still down), while
+    // the selection started by that press is never finished — `is_dragged`
+    // stays set and the next pointer move keeps extending it.
+    if pressed {
+        let terminal_mode = backend.last_content().terminal_mode;
+        state.is_reported_press = terminal_mode
+            .intersects(TermMode::MOUSE_MODE)
+            && !selection_override(modifiers);
+        if state.is_reported_press {
+            return InputAction::BackendCall(BackendCommand::MouseReport(
+                MouseButton::LeftButton,
+                *modifiers,
+                state.current_mouse_position_on_grid,
+                true,
+            ));
+        }
+        process_left_button_pressed(state, layout, position)
+    } else if state.is_reported_press {
+        state.is_reported_press = false;
         InputAction::BackendCall(BackendCommand::MouseReport(
             MouseButton::LeftButton,
             *modifiers,
             state.current_mouse_position_on_grid,
-            pressed,
+            false,
         ))
-    } else if pressed {
-        process_left_button_pressed(state, layout, position)
     } else {
         process_left_button_released(
             state,
@@ -892,27 +912,24 @@ fn process_mouse_move(
     );
 
     let mut actions = vec![];
-    // Handle command or selection update based on terminal mode and modifiers
+    // terra patch: the drag belongs to whoever the press gave it to.
+    // `is_dragged` is set only by a press that took the selection path, so a
+    // Shift-drag keeps extending the selection even if Shift is released
+    // mid-drag; a reported press keeps reporting motion even if Shift is
+    // pressed mid-drag, so the program's press/motion/release stay coherent.
     if state.is_dragged {
-        let terminal_mode = terminal_content.terminal_mode;
-        // Same rule as the press, or a drag begun with Shift/Option held
-        // would start a selection and then report motion to the program.
-        let cmd = if terminal_mode.contains(TermMode::MOUSE_MOTION)
-            && !selection_override(modifiers)
-        {
-            InputAction::BackendCall(BackendCommand::MouseReport(
-                MouseButton::LeftMove,
-                *modifiers,
-                state.current_mouse_position_on_grid,
-                true,
-            ))
-        } else {
-            InputAction::BackendCall(BackendCommand::SelectUpdate(
-                cursor_x, cursor_y,
-            ))
-        };
-
-        actions.push(cmd);
+        actions.push(InputAction::BackendCall(BackendCommand::SelectUpdate(
+            cursor_x, cursor_y,
+        )));
+    } else if state.is_reported_press
+        && terminal_content.terminal_mode.contains(TermMode::MOUSE_MOTION)
+    {
+        actions.push(InputAction::BackendCall(BackendCommand::MouseReport(
+            MouseButton::LeftMove,
+            *modifiers,
+            state.current_mouse_position_on_grid,
+            true,
+        )));
     }
 
     // Handle link hover if applicable

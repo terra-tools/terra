@@ -83,6 +83,21 @@ pub const DEFAULT_TAB_ICONS: bool = true;
 /// behaviour, where one tab means no chrome at all. Either way a second tab, or
 /// a second group, always shows every bar.
 pub const DEFAULT_TAB_BAR_WITH_ONE_TAB: bool = true;
+/// Kilobytes of raw PTY output kept per tab for `terra transcript`.
+///
+/// 512 KiB is roughly a full-screen program's last few hundred repaints, or
+/// tens of thousands of lines of ordinary shell output — enough to answer
+/// "what did that agent say twenty minutes ago?" and small enough that twenty
+/// tabs cost 10 MiB in the worst case. The ring is allocated on a tab's first
+/// byte of output, never at tab creation, so idle tabs cost nothing.
+///
+/// `0` disables the feature outright: no ring, no tap, nothing allocated, and
+/// `terra transcript` answers with an error that says so.
+pub const DEFAULT_TAB_TRANSCRIPT_KB: usize = 512;
+/// Ceiling on `[tabs] transcript_kb`, per tab. A transcript is held in RAM
+/// forever, so a slipped decimal point ("512000") must cost a warning rather
+/// than the machine's memory.
+pub const TRANSCRIPT_KB_MAX: usize = 65_536;
 /// Autodetect the paragraph direction per row.
 ///
 /// `Ltr` keeps a shell prompt provably immobile, but it strands RTL sentence
@@ -255,7 +270,7 @@ const LINE_HEIGHT_RANGE: (f32, f32) = (0.5, 3.0);
 const KNOWN: &[(&str, &[&str])] = &[
     ("font", &["size", "line_height"]),
     ("text", &["bidi", "bidi_base", "bidi_quirks"]),
-    ("tabs", &["icons", "bar_with_one_tab"]),
+    ("tabs", &["icons", "bar_with_one_tab", "transcript_kb"]),
 ];
 
 /// The section holding the named ways to open a tab: `[profile.<name>]`.
@@ -432,6 +447,10 @@ pub struct TabsFile {
     pub icons: Option<bool>,
     /// Typed as `bool` for the same reason as `icons` above.
     pub bar_with_one_tab: Option<bool>,
+    /// Kilobytes of raw PTY output kept per tab for `terra transcript`; `0`
+    /// disables transcripts. Typed, like the two above — it is a size, and
+    /// TOML has integers. Clamped to [`TRANSCRIPT_KB_MAX`] with a warning.
+    pub transcript_kb: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +496,17 @@ pub struct TabsConfig {
     /// than reading this directly, since a second group shows every bar
     /// regardless.
     pub bar_with_one_tab: bool,
+    /// Kilobytes of raw PTY output each tab retains for `terra transcript`.
+    /// `0` means transcripts are off. See [`DEFAULT_TAB_TRANSCRIPT_KB`].
+    pub transcript_kb: usize,
+}
+
+impl TabsConfig {
+    /// The per-tab transcript cap in bytes — what [`crate::transcript::Ring`]
+    /// takes. `0` when transcripts are disabled.
+    pub fn transcript_bytes(&self) -> usize {
+        self.transcript_kb.saturating_mul(1024)
+    }
 }
 
 impl Default for Config {
@@ -494,6 +524,7 @@ impl Default for Config {
             tabs: TabsConfig {
                 icons: DEFAULT_TAB_ICONS,
                 bar_with_one_tab: DEFAULT_TAB_BAR_WITH_ONE_TAB,
+                transcript_kb: DEFAULT_TAB_TRANSCRIPT_KB,
             },
             profiles: BTreeMap::new(),
         }
@@ -723,6 +754,22 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
         .or(file.tabs.bar_with_one_tab)
         .unwrap_or(DEFAULT_TAB_BAR_WITH_ONE_TAB);
 
+    let transcript_kb = session
+        .tabs
+        .transcript_kb
+        .or(file.tabs.transcript_kb)
+        .map(|kb| {
+            if kb > TRANSCRIPT_KB_MAX {
+                warnings.push(format!(
+                    "`tabs.transcript_kb` {kb} is above the {TRANSCRIPT_KB_MAX} KB ceiling; using {TRANSCRIPT_KB_MAX}"
+                ));
+                TRANSCRIPT_KB_MAX
+            } else {
+                kb
+            }
+        })
+        .unwrap_or(DEFAULT_TAB_TRANSCRIPT_KB);
+
     Config {
         font: FontConfig { size, line_height },
         text: TextConfig {
@@ -733,6 +780,7 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
         tabs: TabsConfig {
             icons,
             bar_with_one_tab,
+            transcript_kb,
         },
         profiles: profiles(file, warnings),
     }
@@ -1458,6 +1506,49 @@ mod tests {
         let both = resolved("[tabs]\nicons = false\nbar_with_one_tab = false\n").tabs;
         assert!(!both.icons);
         assert!(!both.bar_with_one_tab);
+    }
+
+    /// Transcripts are on at the default size unless the file says otherwise,
+    /// `0` turns them off, and the ceiling protects a slipped decimal point.
+    #[test]
+    fn the_transcript_cap_defaults_and_is_switchable_off() {
+        assert_eq!(
+            Config::default().tabs.transcript_kb,
+            DEFAULT_TAB_TRANSCRIPT_KB
+        );
+        assert_eq!(resolved("").tabs.transcript_kb, DEFAULT_TAB_TRANSCRIPT_KB);
+        assert_eq!(
+            resolved("[tabs]\nicons = false\n").tabs.transcript_kb,
+            DEFAULT_TAB_TRANSCRIPT_KB
+        );
+        assert_eq!(
+            resolved("[tabs]\ntranscript_kb = 4\n").tabs.transcript_kb,
+            4
+        );
+
+        // 0 is the off switch, and it must survive resolution as 0 rather
+        // than falling back to the default the way a missing key does.
+        let off = resolved("[tabs]\ntranscript_kb = 0\n").tabs;
+        assert_eq!(off.transcript_kb, 0);
+        assert_eq!(off.transcript_bytes(), 0);
+        assert!(warnings_for("[tabs]\ntranscript_kb = 0\n").is_empty());
+
+        // Kilobytes, not bytes.
+        assert_eq!(
+            resolved("[tabs]\ntranscript_kb = 512\n")
+                .tabs
+                .transcript_bytes(),
+            512 * 1024
+        );
+    }
+
+    #[test]
+    fn an_absurd_transcript_cap_is_clamped_and_warned() {
+        let text = "[tabs]\ntranscript_kb = 512000\n";
+        assert_eq!(resolved(text).tabs.transcript_kb, TRANSCRIPT_KB_MAX);
+        let warnings = warnings_for(text);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("transcript_kb"), "{warnings:?}");
     }
 
     /// The fault-isolation contract, applied to the new section: a `[tabs]`

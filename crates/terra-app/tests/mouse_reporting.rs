@@ -67,6 +67,7 @@ fn mouse_reporting_cat(ctx: &egui::Context) -> (TerminalBackend, Receiver<(u64, 
                 r"printf '\033[?1049h\033[?1000h\033[?1006h'; cat".to_string(),
             ],
             working_directory: None,
+            output_tap: None,
         },
     )
     .expect("spawn /bin/sh");

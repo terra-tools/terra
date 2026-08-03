@@ -774,6 +774,7 @@ dependencies = [
  "egui",
  "open",
  "png 0.17.16",
+ "polling",
  "skrifa 0.45.1",
  "unicode-bidi",
 ]
@@ -2915,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "terra-app"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2943,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "terra-cli"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2956,14 +2957,14 @@ dependencies = [
 
 [[package]]
 name = "terra-palette"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "terra-protocol"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64",

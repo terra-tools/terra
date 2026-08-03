@@ -248,6 +248,27 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cells: bool,
     },
+    /// Read back a tab's transcript: the raw bytes its child process has
+    /// written, capped by the app's `[tabs] transcript_kb`.
+    ///
+    /// What [`Request::Capture`] cannot answer. A full-screen program paints
+    /// on the alternate screen, which by definition has no scrollback, so once
+    /// it clears or exits the terminal holds nothing of what it showed. The
+    /// app has the bytes — they arrived through it — and keeps a bounded ring
+    /// of them per tab. The reply is [`Response::Ok`]'s `text` (rendered to
+    /// plain text, escape sequences stripped) or, with `raw`, its `bytes`
+    /// (base64, verbatim).
+    Transcript {
+        tab: u64,
+        /// Limit the answer: the last N *lines* of the rendered form, or the
+        /// last N *bytes* with `raw`. `None` is everything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tail: Option<usize>,
+        /// Return the bytes exactly as the program wrote them, escape
+        /// sequences and all, instead of the rendered text.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        raw: bool,
+    },
     /// Rename a tab (sets a user title that overrides the shell-reported one).
     Rename { tab: u64, title: String },
     /// Focus/activate a tab.
@@ -295,6 +316,17 @@ pub enum Response {
         /// PNG contains both newlines and invalid UTF-8; see [`encode_png`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         png: Option<String>,
+        /// Arbitrary binary, base64 — the reply to a raw
+        /// [`Request::Transcript`].
+        ///
+        /// Additive and skipped when absent, like `png` above, and base64 for
+        /// the same reason: the transport is one JSON object per line, and a
+        /// transcript is neither newline-free nor guaranteed to be valid
+        /// UTF-8 (the ring's front edge cuts wherever the cap falls). Kept
+        /// separate from `png` so a field never has to be interpreted by
+        /// guessing which request produced it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes: Option<String>,
     },
     Err {
         error: String,
@@ -308,6 +340,7 @@ impl Response {
             text: None,
             tab: None,
             png: None,
+            bytes: None,
         }
     }
     pub fn ok_tab(id: u64) -> Self {
@@ -316,6 +349,7 @@ impl Response {
             text: None,
             tab: Some(id),
             png: None,
+            bytes: None,
         }
     }
     pub fn ok_tabs(tabs: Vec<TabInfo>) -> Self {
@@ -324,6 +358,7 @@ impl Response {
             text: None,
             tab: None,
             png: None,
+            bytes: None,
         }
     }
     pub fn ok_text(text: String) -> Self {
@@ -332,6 +367,7 @@ impl Response {
             text: Some(text),
             tab: None,
             png: None,
+            bytes: None,
         }
     }
     /// A PNG reply. `png` is the encoded file, *not* base64 — the encoding is
@@ -342,6 +378,20 @@ impl Response {
             text: None,
             tab: None,
             png: Some(encode_png(png)),
+            bytes: None,
+        }
+    }
+
+    /// A binary reply — the raw transcript. `bytes` is the payload itself,
+    /// *not* base64; the encoding is applied here so the two sides cannot
+    /// disagree about the alphabet (same rule as [`Self::ok_png`]).
+    pub fn ok_bytes(bytes: &[u8]) -> Self {
+        Response::Ok {
+            tabs: None,
+            text: None,
+            tab: None,
+            png: None,
+            bytes: Some(encode_binary(bytes)),
         }
     }
     pub fn err(e: impl std::fmt::Display) -> Self {
@@ -363,6 +413,13 @@ pub fn encode_png(png: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(png)
 }
 
+/// Base64, for any binary payload that is not an image — currently the raw
+/// transcript. Same alphabet as [`encode_png`], so `terra transcript 1 --raw
+/// --json | jq -r .bytes | base64 -d` works from a shell.
+pub fn encode_binary(bytes: &[u8]) -> String {
+    encode_png(bytes)
+}
+
 /// Inverse of [`encode_png`]. Fails on anything that is not valid base64;
 /// whether the bytes are a *PNG* is the caller's problem.
 pub fn decode_png(encoded: &str) -> Result<Vec<u8>> {
@@ -370,6 +427,15 @@ pub fn decode_png(encoded: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(encoded.trim())
         .context("the screenshot payload is not valid base64")
+}
+
+/// Inverse of [`encode_binary`]. Same alphabet as [`decode_png`]; only the
+/// error message differs, so a bad payload names the thing that was asked for.
+pub fn decode_binary(encoded: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .context("the transcript payload is not valid base64")
 }
 
 /// Blocking client used by the CLI: connect, send one request, read one
@@ -657,6 +723,92 @@ mod tests {
         }
     }
 
+    // --- transcript -------------------------------------------------------
+
+    /// The plain form is the verb and the tab, nothing else: `tail` and `raw`
+    /// only appear when they were asked for.
+    #[test]
+    fn a_transcript_request_carries_only_what_was_asked_for() {
+        let json = serde_json::to_string(&Request::Transcript {
+            tab: 3,
+            tail: None,
+            raw: false,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"cmd":"transcript","tab":3}"#);
+
+        let json = serde_json::to_string(&Request::Transcript {
+            tab: 3,
+            tail: Some(40),
+            raw: true,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"cmd":"transcript","tab":3,"tail":40,"raw":true}"#);
+    }
+
+    #[test]
+    fn a_transcript_request_round_trips() {
+        for (tail, raw) in [(None, false), (Some(0), false), (Some(4096), true)] {
+            let req = Request::Transcript { tab: 7, tail, raw };
+            let back: Request =
+                serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            match back {
+                Request::Transcript {
+                    tab,
+                    tail: got_tail,
+                    raw: got_raw,
+                } => {
+                    assert_eq!(tab, 7);
+                    assert_eq!(got_tail, tail);
+                    assert_eq!(got_raw, raw);
+                }
+                other => panic!("expected Transcript, got {other:?}"),
+            }
+        }
+    }
+
+    /// The bare form must parse for a client that writes nothing optional.
+    #[test]
+    fn a_minimal_transcript_request_deserialises() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"transcript","tab":1}"#).unwrap();
+        match req {
+            Request::Transcript { tab, tail, raw } => {
+                assert_eq!(tab, 1);
+                assert!(tail.is_none());
+                assert!(!raw);
+            }
+            other => panic!("expected Transcript, got {other:?}"),
+        }
+    }
+
+    /// `bytes` is additive exactly like `png`: absent from every other reply,
+    /// so an older client parsing a newer server sees what it always saw.
+    #[test]
+    fn the_bytes_field_is_only_serialised_when_present() {
+        assert_eq!(
+            serde_json::to_string(&Response::ok()).unwrap(),
+            r#"{"status":"ok"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::ok_text("hi".into())).unwrap(),
+            r#"{"status":"ok","text":"hi"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::ok_bytes(b"\x1b[2J")).unwrap(),
+            r#"{"status":"ok","bytes":"G1sySg=="}"#
+        );
+    }
+
+    #[test]
+    fn transcript_payloads_round_trip_through_base64() {
+        // Everything a PTY can produce: NULs, newlines, invalid UTF-8.
+        let bytes: Vec<u8> = (0u8..=255).chain(b"\n\r\0\xff".iter().copied()).collect();
+        let encoded = encode_binary(&bytes);
+        assert!(!encoded.contains('\n'), "the payload must fit on one line");
+        assert_eq!(decode_binary(&encoded).unwrap(), bytes);
+        assert!(decode_binary("not base64!!").is_err());
+    }
+
     // --- addressing -------------------------------------------------------
     //
     // `resolve` takes the platform as an argument, so both halves are checked
@@ -692,9 +844,14 @@ mod tests {
     fn a_backslash_in_the_user_name_cannot_repoint_the_pipe() {
         let addr = resolve(None, &home(), r"CONTOSO\ada", true);
         let tag = semver_compat_tag(env!("CARGO_PKG_VERSION"));
-        assert_eq!(addr, Address::Namespaced(format!("terra-CONTOSO_ada-{tag}")));
+        assert_eq!(
+            addr,
+            Address::Namespaced(format!("terra-CONTOSO_ada-{tag}"))
+        );
         // The point of the test: no separator survives into the name.
-        let Address::Namespaced(name) = &addr else { panic!("expected a pipe") };
+        let Address::Namespaced(name) = &addr else {
+            panic!("expected a pipe")
+        };
         assert!(!name.contains('\\'), "{name} can repoint the pipe");
     }
 

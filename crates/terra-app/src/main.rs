@@ -34,6 +34,7 @@ mod screenshot;
 mod scrollbar;
 mod tab_icon;
 mod tabs;
+mod transcript;
 mod ui;
 
 use std::collections::HashMap;
@@ -411,6 +412,7 @@ impl App {
         // Scoped so the guard is dropped before `ensure_started` returns —
         // every other caller takes this lock too.
         lock(&tabs).set_profiles(self.config.get().profiles.clone());
+        lock(&tabs).set_transcript_bytes(self.config.get().tabs.transcript_bytes());
         let spawned = lock(&tabs).open(&[], None, None);
         if let Err(err) = spawned {
             log::error!("terra: cannot spawn the initial shell: {err}");
@@ -768,6 +770,9 @@ impl App {
                 // reloaded one or they would answer from the old file forever.
                 if let Some(arc) = self.tabs.clone() {
                     lock(&arc).set_profiles(self.config.get().profiles.clone());
+                    // Sizes the *next* tab's ring; open tabs keep the one they
+                    // were created with rather than losing what they recorded.
+                    lock(&arc).set_transcript_bytes(self.config.get().tabs.transcript_bytes());
                 }
                 log::info!("terra: reloaded {}", self.config.path().display());
             }
