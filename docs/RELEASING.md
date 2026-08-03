@@ -1,5 +1,42 @@
 # Releasing
 
+## The checklist
+
+Every release, in this order — each line has burned us once:
+
+1. **Start the Windows signing server first** (skip only for an unsigned
+   release). On the Mac with the YubiKey plugged in:
+   `uv run scripts/sign-server/sign_server.py`, and keep the machine awake for
+   the whole run — the v1.3.2 Windows job failed with Cloudflare 530/1033
+   because the tunnel's host was asleep. Smoke-test from outside:
+   `curl -s -o /dev/null -w '%{http_code}' -A terra-release-sign/1.0 -X POST
+   <SIGN_TUNNEL_URL>/sign` must print `401` (reachable, secret required) —
+   `530` means the tunnel is down. Ctrl+C the server when the run is done.
+2. **Bump the workspace version** in the root `Cargo.toml` (one place; every
+   crate inherits it) and let `cargo check` refresh `Cargo.lock`.
+3. **Branch, commit, open a PR** titled in the house style:
+   `release: vX.Y.Z — <what changed, one clause>`.
+4. **Wait for the PR's CI to go green before merging.** CI covers what a
+   macOS-only local run cannot: the Linux runner (where `command` means Ctrl —
+   input semantics genuinely differ) and the Windows build. The v1.4.0 tag was
+   pushed on a merge that had never seen Linux CI, and the release run died on
+   tests that could not fail on the author's machine.
+5. **Squash-merge** with the PR title as the commit message, `git pull`.
+6. **Tag the squash commit**: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+7. Watch the run: `gh run watch $(gh run list --workflow=release.yml -L1
+   --json databaseId -q '.[0].databaseId')`. If one platform fails on
+   infrastructure (signing tunnel, runner flake), fix the cause and
+   `gh run rerun <id> --failed` — the tag does not need to move. If the
+   *commit* is broken: fix on a new PR, then move the tag
+   (`git tag -f vX.Y.Z && git push -f origin vX.Y.Z`) only if the release was
+   never published; otherwise bump the patch version.
+
+Test-environment note: the PTY harness suites drive a **real tmux**. CI
+installs it on Linux (apt) and macOS (brew) — see the workflows — and the
+suites are `#![cfg(unix)]`, so Windows skips them.
+
+## The machinery
+
 A release is a tag push. Everything else is automatic:
 
 ```sh

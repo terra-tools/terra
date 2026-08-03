@@ -36,6 +36,23 @@ const SCREEN: Rect = Rect {
 /// is unmistakable on a grid full of shell noise.
 const PAYLOAD: &str = "PASTE-PAYLOAD-123";
 
+/// The modifiers a real paste carries. ⌘ on macOS, where Ctrl never reaches
+/// the clipboard path at all; Ctrl+Shift everywhere else, where a *bare*
+/// Ctrl+V deliberately stays the terminal's literal ^V (egui_term's
+/// `clipboard_key_is_passthrough`) — which is exactly what these tests were
+/// accidentally exercising on the Linux runner when they held plain COMMAND.
+const PASTE_MODS: Modifiers = if cfg!(target_os = "macos") {
+    Modifiers::COMMAND
+} else {
+    Modifiers {
+        alt: false,
+        ctrl: true,
+        shift: true,
+        mac_cmd: false,
+        command: true,
+    }
+};
+
 fn frame(
     ctx: &egui::Context,
     backend: &mut TerminalBackend,
@@ -123,7 +140,7 @@ fn paste(ctx: &egui::Context, backend: &mut TerminalBackend, text: &str) {
         ctx,
         backend,
         vec![Event::Paste(text.to_string())],
-        Modifiers::COMMAND,
+        PASTE_MODS,
     );
     for _ in 0..60 {
         std::thread::sleep(Duration::from_millis(20));
@@ -178,7 +195,7 @@ fn paste_into_an_unfocused_view_is_ignored() {
     let input = egui::RawInput {
         screen_rect: Some(SCREEN),
         events: vec![Event::Paste(PAYLOAD.to_string())],
-        modifiers: Modifiers::COMMAND,
+        modifiers: PASTE_MODS,
         ..Default::default()
     };
     let _ = ctx.run_ui(input, |ui: &mut egui::Ui| {
@@ -280,12 +297,7 @@ fn a_large_paste_arrives_whole() {
     });
 
     let big = "x".repeat(5000);
-    frame(
-        &ctx,
-        &mut backend,
-        vec![Event::Paste(big)],
-        Modifiers::COMMAND,
-    );
+    frame(&ctx, &mut backend, vec![Event::Paste(big)], PASTE_MODS);
     wait_for(&ctx, &mut backend, "all 5000 bytes to arrive", 30, |b| {
         screen_text(b).contains("GOT-ALL")
     });
