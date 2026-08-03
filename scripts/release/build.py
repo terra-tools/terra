@@ -19,8 +19,10 @@ run rather than falling back to unsigned.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -131,6 +133,8 @@ def macos(_args: argparse.Namespace) -> None:
              f"target/x86_64-apple-darwin/release/{binary}"])
         run(["lipo", "-info", str(UNIVERSAL / binary)])
 
+    presign_cli(signing)
+
     # One invocation for both formats. The dmg packager does not rebuild the
     # .app — it reuses the one already in out_dir (verified against 0.11.8's
     # src/package/mod.rs, which only packages `app` for a dmg when no app output
@@ -151,6 +155,101 @@ def macos(_args: argparse.Namespace) -> None:
 
     stage(sole("*.dmg", ROOT / UNIVERSAL), "terra-macos-universal.dmg")
     list_dist()
+
+
+def presign_cli(signing: bool) -> None:
+    """Sign the universal `terra` before cargo-packager touches the bundle.
+
+    cargo-packager signs every Mach-O in the .app, sorted by path depth alone
+    (`impl Ord for SignTarget`, src/codesign/macos.rs) and pushed through a
+    BinaryHeap. `Contents/MacOS/terra` and `Contents/MacOS/terra-app` are the
+    same depth, so the tie breaks whichever way the heap feels like — and half
+    the time that is terra-app first. codesign, pointed at a bundle's *main*
+    executable, validates the whole bundle, so an unsigned sibling aborts the
+    run with "code object is not signed at all / In subcomponent:
+    Contents/MacOS/terra". That is what failed the v1.0.2 macOS job.
+
+    Signing the CLI here means the copy the packager puts in the bundle is
+    already valid whichever order it then picks; the packager re-signs it with
+    --force afterwards, which is a no-op in effect.
+
+    This is not a CI-only quirk that a local run would catch: the arm64 linker
+    ad-hoc signs what it produces, so a native build hides the problem. `lipo`
+    output does not carry a signature, and neither does a cross-compiled slice.
+
+    Ad-hoc is not a shortcut for the signed path — notarisation rejects a bundle
+    with an ad-hoc signed binary inside it — so this signs with the real
+    identity, from its own keychain, when there is one.
+    """
+    cli = UNIVERSAL / "terra"
+    # The same flags cargo-packager uses for a native binary, so the signature
+    # it finds is the signature it would have made.
+    flags = ["codesign", "--force", "--options", "runtime", "--timestamp"]
+
+    if not signing:
+        run([*flags, "--sign", "-", str(cli)])
+    else:
+        identity = os.environ.get("APPLE_SIGNING_IDENTITY", "")
+        if not identity and not DRY_RUN:
+            fail("APPLE_SIGNING_IDENTITY is required when signing is enabled")
+        with presign_keychain() as keychain:
+            run([*flags, "--sign", identity, "--keychain", str(keychain), str(cli)])
+
+    run(["codesign", "--verify", "--strict", "--verbose=2", str(cli)])
+
+
+@contextlib.contextmanager
+def presign_keychain():
+    """A throwaway keychain holding $APPLE_CERTIFICATE, for one codesign call.
+
+    cargo-packager builds its own `cargo-packager.keychain` when it signs, and
+    deletes it afterwards; this one is separate and separately named so the two
+    cannot collide, and it is gone again before the packager starts.
+    """
+    keychain = runner_temp() / "terra-presign.keychain-db"
+    p12 = runner_temp() / "presign.p12"
+    password = secrets.token_urlsafe(24)
+    certificate_password = os.environ.get("APPLE_CERTIFICATE_PASSWORD", "")
+    others: list[str] = []
+
+    try:
+        run(["security", "create-keychain", "-p", password, str(keychain)], mask=[password])
+        # -lut 21600: no auto-relock for six hours; the default five minutes is
+        # shorter than the build around it.
+        run(["security", "set-keychain-settings", "-lut", "21600", str(keychain)])
+        run(["security", "unlock-keychain", "-p", password, str(keychain)], mask=[password])
+
+        act(f"decode APPLE_CERTIFICATE into {p12}",
+            lambda: p12.write_bytes(base64.b64decode(os.environ["APPLE_CERTIFICATE"])))
+        run(["security", "import", str(p12), "-k", str(keychain),
+             "-P", certificate_password,
+             "-T", "/usr/bin/codesign", "-T", "/usr/bin/security"],
+            mask=[certificate_password])
+        act(f"rm {p12}", lambda: p12.unlink(missing_ok=True))
+        # Without set-key-partition-list codesign blocks on a GUI prompt nobody
+        # can answer on a headless runner.
+        run(["security", "set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
+             "-s", "-k", password, str(keychain)], mask=[password])
+
+        # Prepend rather than replace, so the default keychains still resolve.
+        existing = run(["security", "list-keychains", "-d", "user"], capture=True)
+        others = [line.strip().strip('"') for line in existing.splitlines() if line.strip()]
+        run(["security", "list-keychains", "-d", "user", "-s", str(keychain), *others])
+
+        # "1 matching identity, 0 valid identities" here means the Developer ID
+        # G2 intermediate is missing from the .p12, not that the ACL is wrong.
+        run(["security", "find-identity", "-v", "-p", "codesigning", str(keychain)])
+        yield keychain
+    finally:
+        # The certificate must not survive a failed run either, and the search
+        # list must not keep pointing at a keychain that is about to be gone.
+        if others:
+            run(["security", "list-keychains", "-d", "user", "-s", *others],
+                allow_fail=True)
+        print(f"$ security delete-keychain {keychain}", flush=True)
+        if not DRY_RUN:
+            subprocess.run(["security", "delete-keychain", str(keychain)], check=False)
+            p12.unlink(missing_ok=True)
 
 
 @contextlib.contextmanager

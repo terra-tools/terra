@@ -15,6 +15,7 @@ section below cites the vibe file it came from.
 - [What users see today (unsigned)](#what-users-see-today-unsigned)
 - [How the opt-in works](#how-the-opt-in-works)
 - [macOS: Developer ID + notarisation](#macos-developer-id--notarisation)
+  - [The CLI has to be signed twice](#the-cli-has-to-be-signed-twice)
 - [Windows: YubiKey signing server](#windows-yubikey-signing-server)
 - [Verifying a release](#verifying-a-release)
 
@@ -160,8 +161,15 @@ App-Specific Passwords. A regular Apple ID password gets a 401 from
 ### What the workflow then does
 
 vibe gets all of this for free from `tauri-action`; terra gets it from
-cargo-packager, which grew the same machinery. One `cargo packager -f app
--f dmg` call, and inside it:
+cargo-packager, which grew the same machinery. Almost all of it happens inside
+one `cargo packager -f app -f dmg` call. The exception comes first:
+
+0. **Pre-sign the `terra` CLI**, in `build.py`, in its own throwaway
+   `terra-presign.keychain-db`, deleted again before the packager starts. See
+   [The CLI has to be signed twice](#the-cli-has-to-be-signed-twice) below —
+   without this the release fails outright, roughly half the time.
+
+Then, inside the packager:
 
 1. **Import** the `.p12` into a `cargo-packager.keychain`, with
    `security set-key-partition-list` so `codesign` does not block on a GUI
@@ -175,6 +183,47 @@ cargo-packager, which grew the same machinery. One `cargo packager -f app
    --wait`, then `xcrun stapler staple` the bundle.
 4. **Build the `.dmg`** around the stapled bundle and sign the image.
 5. **Delete the keychain**, on success and on failure.
+
+### The CLI has to be signed twice
+
+cargo-packager collects every Mach-O in the bundle and sorts them **by path
+depth alone** before signing — `impl Ord for SignTarget` in
+`src/codesign/macos.rs` compares `path.components().count()` and nothing else,
+and the result goes through a `BinaryHeap`. `Contents/MacOS/terra` and
+`Contents/MacOS/terra-app` sit at the same depth, so they tie, and the heap
+returns them in whatever order it likes. The `binaries` order in the manifest
+has no effect; neither does renaming.
+
+That matters because `codesign`, pointed at a bundle's **main** executable,
+validates the whole bundle rather than just that one file. If it reaches
+`terra-app` while `terra` is still unsigned, the run dies with:
+
+```
+Contents/MacOS/terra-app: code object is not signed at all
+In subcomponent: Contents/MacOS/terra
+```
+
+which is exactly what failed the v1.0.2 macOS job. So `build.py` signs the CLI
+before packaging; the packager then re-signs it with `--force`, harmlessly.
+
+Two traps worth writing down:
+
+- **A local build hides this.** The arm64 linker ad-hoc signs what it produces,
+  so a native `cargo packager` run finds the sibling already signed and works.
+  `lipo` output carries no signature and neither does a cross-compiled slice,
+  so CI hits it and your laptop does not. To reproduce, `codesign
+  --remove-signature` both binaries first.
+- **Ad-hoc is not a shortcut here.** Notarisation rejects a bundle containing an
+  ad-hoc signed binary, so the pre-sign has to use the real identity on the
+  signed path. The unsigned path pre-signs ad-hoc, which is all it needs — that
+  path fails the same way without it.
+
+### Not covered by a rehearsal
+
+A `workflow_dispatch` run has no secrets, so it exercises only the ad-hoc path.
+The Developer ID path — `.p12` import, `set-key-partition-list`, notarisation,
+stapling — is first exercised by a real tag push, and the same is true of the
+Windows tunnel. Check the first tagged release after any change here.
 
 One difference from the old flow, worth knowing: cargo-packager submits the
 `.app`, not the `.dmg`, so the image ends up signed but without a stapled
