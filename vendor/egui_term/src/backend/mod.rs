@@ -187,6 +187,17 @@ impl TerminalBackend {
             "TERM_PROGRAM_VERSION".into(),
             env!("CARGO_PKG_VERSION").into(),
         );
+        // The same argument as TERM_PROGRAM, but load-bearing: TERM must
+        // describe the terminal the child is *in*, not the one terra was
+        // launched from — inherit it and a terra started from a tmux shell
+        // hands every tab TERM=screen; started where no TERM exists at all
+        // (Finder, a CI runner) the child gets none and curses programs
+        // refuse to run ("terminal does not support clear" from tmux).
+        // alacritty the app solves this with `tty::setup_env`, which terra
+        // never calls. xterm-256color is what terra actually emulates and
+        // what its docs advertise.
+        env.insert("TERM".into(), "xterm-256color".into());
+        env.insert("COLORTERM".into(), "truecolor".into());
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(settings.shell, settings.args)),
             working_directory: settings.working_directory,

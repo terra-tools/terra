@@ -326,6 +326,18 @@
     Guarded by `terra-app/tests/hover_scroll.rs` and `accepts_tests`. Worth
     upstreaming.
 
+15. backend/mod.rs: **the PTY env names the terminal — `TERM` and `COLORTERM`
+    included**. The spawn already inserted `TERM_PROGRAM`/`_VERSION` so
+    children stop believing they run in whatever launched terra; but `TERM`
+    itself was still inherited. A terra started from a tmux shell handed every
+    tab `TERM=screen`; started where no TERM exists (Finder, a CI runner) the
+    child got none, and curses programs refuse a blank terminal — the CI
+    symptom was tmux's "open terminal failed: terminal does not support
+    clear" in the PTY harness suites. alacritty the app fixes this by calling
+    `tty::setup_env()` at startup, which nothing in terra ever did. The env
+    map now pins `TERM=xterm-256color` (what terra emulates and documents)
+    and `COLORTERM=truecolor`.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to
