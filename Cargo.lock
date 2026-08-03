@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "terra-app"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2944,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "terra-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2957,14 +2957,14 @@ dependencies = [
 
 [[package]]
 name = "terra-palette"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "egui",
 ]
 
 [[package]]
 name = "terra-protocol"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "base64",

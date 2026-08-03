@@ -76,6 +76,26 @@ bar_with_one_tab = true
 # Capped at 65536 (64 MB per tab).
 transcript_kb = 512
 
+[window]
+# Ask before closing a window that is running something.
+#
+# The red close button sits a few pixels from the tab bar's ×, and ⌘Q sits next
+# to ⌘W. Either slip takes down every session in the window at once — a build,
+# an ssh login, an agent halfway through a task — and a terminal has nothing
+# like an unsaved-document prompt to get them back. So terra asks first, and
+# Esc, the Cancel button or a click outside the dialog abandons the close
+# entirely; Return or Close goes through with it.
+#
+# It only asks when there is something to protect. terra looks at what is
+# actually running in each tab — the same walk down the process tree that
+# `[tabs] icons` and `[text.bidi_quirks]` use — and a window whose tabs are all
+# sitting at a bare shell prompt just closes, with no dialog at all. That is
+# Ghostty's rule, and it is what keeps the question meaningful instead of
+# training you to hit Return without reading it.
+#
+# Set this to false to never ask.
+confirm_close = true
+
 [text]
 # Reorder right-to-left text (Hebrew, Arabic, …) for display, per the Unicode
 # Bidirectional Algorithm, UAX #9: https://unicode.org/reports/tr9/

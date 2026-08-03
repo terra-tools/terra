@@ -98,6 +98,19 @@ pub const DEFAULT_TAB_TRANSCRIPT_KB: usize = 512;
 /// forever, so a slipped decimal point ("512000") must cost a warning rather
 /// than the machine's memory.
 pub const TRANSCRIPT_KB_MAX: usize = 65_536;
+/// Ask before closing a window that is running something.
+///
+/// On by default, and Ghostty's default too: the red button sits a few pixels
+/// from the tab bar's `×`, ⌘Q sits next to ⌘W, and either mistake takes down
+/// every session in the window at once — a build, an ssh login, an agent
+/// halfway through a task. A terminal has no unsaved-document machinery to
+/// recover from that, so the one cheap protection is a question.
+///
+/// Deliberately *not* a question every time: a window whose tabs are all
+/// sitting at a bare shell prompt protects nothing, and a dialog there is pure
+/// nagging that trains the reflex to dismiss it. See
+/// [`crate::confirm_close::should_confirm`]. `false` never asks at all.
+pub const DEFAULT_WINDOW_CONFIRM_CLOSE: bool = true;
 /// Autodetect the paragraph direction per row.
 ///
 /// `Ltr` keeps a shell prompt provably immobile, but it strands RTL sentence
@@ -271,6 +284,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("font", &["size", "line_height"]),
     ("text", &["bidi", "bidi_base", "bidi_quirks"]),
     ("tabs", &["icons", "bar_with_one_tab", "transcript_kb"]),
+    ("window", &["confirm_close"]),
 ];
 
 /// The section holding the named ways to open a tab: `[profile.<name>]`.
@@ -397,6 +411,7 @@ pub struct ConfigFile {
     pub font: FontFile,
     pub text: TextFile,
     pub tabs: TabsFile,
+    pub window: WindowFile,
     /// `[profile.<name>]`, keyed on the name in the section header. Filled by
     /// [`parse`] one profile at a time; always empty in the session layer,
     /// which has no runtime toggle that could write a profile.
@@ -453,6 +468,14 @@ pub struct TabsFile {
     pub transcript_kb: Option<usize>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WindowFile {
+    /// Typed as `bool`, like the `[tabs]` switches: there is one spelling of
+    /// yes and one of no, and TOML already owns both.
+    pub confirm_close: Option<bool>,
+}
+
 // ---------------------------------------------------------------------------
 // Resolved types — what the app reads; no Options, no egui
 // ---------------------------------------------------------------------------
@@ -462,6 +485,7 @@ pub struct Config {
     pub font: FontConfig,
     pub text: TextConfig,
     pub tabs: TabsConfig,
+    pub window: WindowConfig,
     /// The named ways to open a tab, by name. A `BTreeMap` so every consumer —
     /// the chevron menu, the palette, the unknown-profile error — lists them
     /// alphabetically without sorting again.
@@ -501,6 +525,15 @@ pub struct TabsConfig {
     pub transcript_kb: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowConfig {
+    /// Whether closing the window asks first when a tab is running something.
+    /// See [`DEFAULT_WINDOW_CONFIRM_CLOSE`]; ask
+    /// [`crate::confirm_close::should_confirm`] rather than reading this
+    /// directly, since a window of idle shells never asks either way.
+    pub confirm_close: bool,
+}
+
 impl TabsConfig {
     /// The per-tab transcript cap in bytes — what [`crate::transcript::Ring`]
     /// takes. `0` when transcripts are disabled.
@@ -525,6 +558,9 @@ impl Default for Config {
                 icons: DEFAULT_TAB_ICONS,
                 bar_with_one_tab: DEFAULT_TAB_BAR_WITH_ONE_TAB,
                 transcript_kb: DEFAULT_TAB_TRANSCRIPT_KB,
+            },
+            window: WindowConfig {
+                confirm_close: DEFAULT_WINDOW_CONFIRM_CLOSE,
             },
             profiles: BTreeMap::new(),
         }
@@ -638,6 +674,7 @@ pub fn parse(text: &str) -> (ConfigFile, Vec<String>) {
         font: section(&root, "font", &mut warnings),
         text: section(&root, "text", &mut warnings),
         tabs: section(&root, "tabs", &mut warnings),
+        window: section(&root, "window", &mut warnings),
         profiles: profiles_section(&root, &mut warnings),
     };
     (file, warnings)
@@ -770,6 +807,12 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
         })
         .unwrap_or(DEFAULT_TAB_TRANSCRIPT_KB);
 
+    let confirm_close = session
+        .window
+        .confirm_close
+        .or(file.window.confirm_close)
+        .unwrap_or(DEFAULT_WINDOW_CONFIRM_CLOSE);
+
     Config {
         font: FontConfig { size, line_height },
         text: TextConfig {
@@ -782,6 +825,7 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
             bar_with_one_tab,
             transcript_kb,
         },
+        window: WindowConfig { confirm_close },
         profiles: profiles(file, warnings),
     }
 }
@@ -1561,6 +1605,47 @@ mod tests {
         let warnings = warnings_for(text);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("[tabs]"), "{warnings:?}");
+    }
+
+    /// Closing a window that is running something asks first unless the file
+    /// opts out. A file that says nothing — or that only talks about tabs —
+    /// must not switch the protection off.
+    #[test]
+    fn confirm_close_defaults_on_and_is_switchable_off() {
+        assert!(Config::default().window.confirm_close);
+        assert!(resolved("").window.confirm_close);
+        assert!(resolved("[tabs]\nicons = false\n").window.confirm_close);
+        assert!(
+            !resolved("[window]\nconfirm_close = false\n")
+                .window
+                .confirm_close
+        );
+        assert!(
+            resolved("[window]\nconfirm_close = true\n")
+                .window
+                .confirm_close
+        );
+    }
+
+    /// Fault isolation again: a `[window]` that will not deserialize costs
+    /// you that section's default and nothing else.
+    #[test]
+    fn a_non_boolean_confirm_close_warns_and_keeps_the_default() {
+        let text = "[font]\nsize = 12.0\n\n[window]\nconfirm_close = \"yes\"\n";
+        assert!(resolved(text).window.confirm_close);
+        assert_eq!(resolved(text).font.size, 12.0);
+        let warnings = warnings_for(text);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[window]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_unknown_key_under_window_is_reported() {
+        let warnings = warnings_for("[window]\nconfirm_quit = true\n");
+        assert_eq!(
+            warnings,
+            vec!["unknown key `window.confirm_quit`".to_string()]
+        );
     }
 
     #[test]

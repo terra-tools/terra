@@ -134,7 +134,8 @@ fn learn_text() -> String {
          ------\n\
          ~/.terra/config.toml: [font] size, line_height; [text] bidi,\n\
          bidi_base, [text.bidi_quirks]; [tabs] icons, bar_with_one_tab,\n\
-         transcript_kb; [profile.<name>] command, cwd, title.\n\
+         transcript_kb; [window] confirm_close; [profile.<name>] command,\n\
+         cwd, title.\n\
          Every key optional; a broken file yields defaults plus a warning.\n\
          Template: docs/config.example.toml.\n\n\
          Profiles\n\
