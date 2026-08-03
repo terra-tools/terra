@@ -566,7 +566,7 @@ impl App {
     /// while the window is occluded titles go stale and a tab whose shell has
     /// exited stays in `terra ls` until the window is drawn again — both catch
     /// up on the next frame, and neither can strand a request.
-    fn drain_pty_events(&mut self) {
+    fn drain_pty_events(&mut self, ctx: &egui::Context) {
         let Some(arc) = self.tabs.clone() else {
             return;
         };
@@ -577,6 +577,14 @@ impl App {
                 PtyEvent::Exit => {
                     tabs.close(id);
                 }
+                // OSC 52: the program asked for text to go on the system
+                // clipboard — how tmux (`set -g set-clipboard on`) and vim
+                // hand a copy back out, over ssh included, where there is no
+                // other route from the far end to this Mac's pasteboard.
+                // Both pasteboards a program can name (`c` and `p`/`s`) are
+                // the one macOS pasteboard, which is also what Ghostty does.
+                // The *read* direction is refused inside egui_term.
+                PtyEvent::ClipboardStore(_, text) => ctx.copy_text(text),
                 _ => {}
             }
         }
@@ -1265,6 +1273,42 @@ struct RenderEnv {
     /// `[tabs] bar_with_one_tab`, read once a frame like the rest of this
     /// struct, so a config reload lands on the very next frame.
     bar_with_one_tab: bool,
+    /// `[input] focus_follows_mouse`, read the same way — flipping it in the
+    /// config file changes the very next frame's answer.
+    focus_follows_mouse: bool,
+}
+
+/// Focus follows the mouse: does this frame's input hand the keyboard to the
+/// pane whose terminal occupies `terminal`?
+///
+/// Three rules, and the first is the one that makes this safe:
+///
+/// * the trigger is a **`PointerMoved` event landing inside the rect**, never
+///   "the pointer is resting there". egui raises `PointerMoved` only when the
+///   OS says the pointer actually moved, so a stationary cursor keeps its
+///   focus while panes are split, resized, closed or scrolled out from under
+///   it — and a window opening beneath wherever the cursor happens to sit
+///   focuses nothing. Only a move *into* a pane switches.
+/// * **no pointer button may be down**. A drag that starts in one pane and
+///   crosses into its neighbour is one gesture belonging to the pane it began
+///   in — a selection must not be cut in half by the pane boundary, and a tab
+///   pill dragged across the window must not focus every group it passes over.
+/// * the rect is the pane's **terminal**, not its whole column, so travelling
+///   over a tab bar (or the strip of window chrome above one) changes nothing.
+///   The caller decides the rect; a modal open anywhere suppresses the whole
+///   question, since the keyboard belongs to the modal either way.
+fn hover_focus(
+    enabled: bool,
+    events: &[egui::Event],
+    button_down: bool,
+    terminal: egui::Rect,
+) -> bool {
+    if !enabled || button_down {
+        return false;
+    }
+    events
+        .iter()
+        .any(|event| matches!(event, egui::Event::PointerMoved(pos) if terminal.contains(*pos)))
 }
 
 /// The recursive renderer for one frame: the split tree becomes nested rects
@@ -1415,9 +1459,6 @@ impl TreeFrame<'_> {
                 i.pointer.primary_pressed()
                     && i.pointer.interact_pos().is_some_and(|p| column.contains(p))
             });
-        if pressed_here && !focused {
-            self.actions.push(AppAction::FocusGroup(group));
-        }
 
         // Salted by the leaf's stable id, not its DFS index: a split
         // renumbers every group after it, and any egui state hanging off
@@ -1458,6 +1499,29 @@ impl TreeFrame<'_> {
             },
             terminal: area,
         });
+
+        // Focus follows the mouse: the pointer moving into this pane's
+        // terminal focuses its group, no click required. `[input]
+        // focus_follows_mouse = false` turns just this off — the wheel still
+        // goes to the pane under the pointer either way — and leaves
+        // click-to-focus as the only way in. Decided against
+        // `area` — the whole region below the tab bar, scrollbar strip
+        // included — so the answer does not change under the terminal's inner
+        // margins, and grazing the scrollbar of the pane you are aiming at
+        // never bounces the keyboard back. See [`hover_focus`] for the rules.
+        let moved_here = !self.env.modal_open
+            && col_ui.input(|i| {
+                hover_focus(
+                    self.env.focus_follows_mouse,
+                    &i.events,
+                    i.pointer.any_down(),
+                    area,
+                )
+            });
+        if (pressed_here || moved_here) && !focused {
+            self.actions.push(AppAction::FocusGroup(group));
+        }
+
         let grid = egui::Rect::from_min_max(
             egui::pos2(area.left() + 10.0, area.top() + 8.0),
             egui::pos2(area.right() - 4.0, area.bottom() - 4.0),
@@ -1563,7 +1627,7 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        self.drain_pty_events();
+        self.drain_pty_events(&ctx);
         self.sync_window_title(&ctx, frame);
         self.sync_config_cache();
 
@@ -1619,6 +1683,7 @@ impl eframe::App for App {
         let bidi = self.active_bidi(&ctx);
         let bidi_base = self.config.get().text.bidi_base;
         let bar_with_one_tab = self.config.get().tabs.bar_with_one_tab;
+        let focus_follows_mouse = self.config.get().input.focus_follows_mouse;
         let font = self.cached_font.clone();
         let tabs_arc = self.tabs.clone();
         let icons = &self.tab_icons;
@@ -1646,6 +1711,7 @@ impl eframe::App for App {
                         font: font.clone(),
                         focused_group: tabs.focused_group(),
                         bar_with_one_tab,
+                        focus_follows_mouse,
                     },
                     tabs: &mut tabs,
                     icons,
@@ -1693,6 +1759,69 @@ impl eframe::App for App {
 mod tests {
     use super::dev_suffix;
     use super::*;
+
+    fn pane() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(400.0, 32.0), egui::pos2(800.0, 600.0))
+    }
+
+    fn moved(x: f32, y: f32) -> egui::Event {
+        egui::Event::PointerMoved(egui::pos2(x, y))
+    }
+
+    /// The gesture the feature exists for: the pointer travels into a pane and
+    /// the pane takes the keyboard.
+    #[test]
+    fn a_move_into_the_terminal_focuses_it() {
+        assert!(hover_focus(true, &[moved(600.0, 300.0)], false, pane()));
+    }
+
+    /// `[input] focus_follows_mouse = false` restores pure click-to-focus:
+    /// the same move that would otherwise hand over the keyboard does nothing.
+    #[test]
+    fn the_config_switch_off_suppresses_the_whole_rule() {
+        assert!(!hover_focus(false, &[moved(600.0, 300.0)], false, pane()));
+    }
+
+    /// …and nothing else does. A frame with no pointer motion cannot move
+    /// focus, which is what keeps a resting cursor's pane focused while splits
+    /// re-layout the window or output scrolls underneath it.
+    #[test]
+    fn a_stationary_pointer_never_moves_focus() {
+        assert!(!hover_focus(true, &[], false, pane()));
+        // Keystrokes, wheel events and clicks are not motion either.
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::Vec2::new(0.0, 1.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        };
+        assert!(!hover_focus(true, &[wheel], false, pane()));
+        assert!(!hover_focus(
+            true,
+            &[egui::Event::Text("a".into())],
+            false,
+            pane()
+        ));
+    }
+
+    /// A move that lands somewhere else — the neighbouring pane, the tab bar
+    /// above this one — is not this pane's business.
+    #[test]
+    fn a_move_outside_the_terminal_is_ignored() {
+        // Left of the pane, and above it in the tab bar strip.
+        assert!(!hover_focus(true, &[moved(200.0, 300.0)], false, pane()));
+        assert!(!hover_focus(true, &[moved(600.0, 10.0)], false, pane()));
+    }
+
+    /// A held button means a gesture in progress — a selection drag, a tab
+    /// pill being carried across the window — and it belongs to the pane it
+    /// started in until the button comes back up.
+    #[test]
+    fn a_drag_crossing_the_pane_keeps_its_focus_where_it_started() {
+        assert!(!hover_focus(true, &[moved(600.0, 300.0)], true, pane()));
+        // Released: the very next move focuses normally again.
+        assert!(hover_focus(true, &[moved(601.0, 300.0)], false, pane()));
+    }
 
     /// Every menu tag the application menu can hand back maps to exactly one
     /// action, and the three families never collide: Settings is 1000, Quit is

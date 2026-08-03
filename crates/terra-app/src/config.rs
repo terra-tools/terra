@@ -98,6 +98,26 @@ pub const DEFAULT_TAB_TRANSCRIPT_KB: usize = 512;
 /// forever, so a slipped decimal point ("512000") must cost a warning rather
 /// than the machine's memory.
 pub const TRANSCRIPT_KB_MAX: usize = 65_536;
+/// Move the keyboard to the pane the pointer moves into.
+///
+/// On by default: with the window split, a terminal you are *looking* at is
+/// the terminal you mean, and having to click first is a step that exists only
+/// to tell the app something the cursor already said. It is the X11 and tmux
+/// (`set -g focus-follows-mouse`) behaviour, and the one that makes a two-pane
+/// layout feel like two terminals rather than one with a modal switch.
+///
+/// It is a switch because the opposite taste is just as reasonable: a cursor
+/// parked over a pane while you read another one becomes a trap the moment you
+/// nudge the mouse, and users who type in one pane while the mouse rests
+/// wherever they last left it want the keyboard to stay put. `false` restores
+/// pure click-to-focus.
+///
+/// The *wheel* is not governed by this: it goes to the pane under the pointer
+/// either way (egui_term's `accepts`, PATCHES 14). Scrolling what you point at
+/// is not a matter of taste, and it is also what makes `false` liveable — you
+/// can still read another pane's scrollback without taking the keyboard from
+/// the one you are typing in.
+pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = true;
 /// Ask before closing a window that is running something.
 ///
 /// On by default, and Ghostty's default too: the red button sits a few pixels
@@ -284,6 +304,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("font", &["size", "line_height"]),
     ("text", &["bidi", "bidi_base", "bidi_quirks"]),
     ("tabs", &["icons", "bar_with_one_tab", "transcript_kb"]),
+    ("input", &["focus_follows_mouse"]),
     ("window", &["confirm_close"]),
 ];
 
@@ -411,6 +432,7 @@ pub struct ConfigFile {
     pub font: FontFile,
     pub text: TextFile,
     pub tabs: TabsFile,
+    pub input: InputFile,
     pub window: WindowFile,
     /// `[profile.<name>]`, keyed on the name in the section header. Filled by
     /// [`parse`] one profile at a time; always empty in the session layer,
@@ -470,6 +492,14 @@ pub struct TabsFile {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct InputFile {
+    /// Typed as `bool`, like the `[tabs]` switches — there is one spelling of
+    /// yes and one of no.
+    pub focus_follows_mouse: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct WindowFile {
     /// Typed as `bool`, like the `[tabs]` switches: there is one spelling of
     /// yes and one of no, and TOML already owns both.
@@ -485,6 +515,7 @@ pub struct Config {
     pub font: FontConfig,
     pub text: TextConfig,
     pub tabs: TabsConfig,
+    pub input: InputConfig,
     pub window: WindowConfig,
     /// The named ways to open a tab, by name. A `BTreeMap` so every consumer —
     /// the chevron menu, the palette, the unknown-profile error — lists them
@@ -526,6 +557,14 @@ pub struct TabsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct InputConfig {
+    /// Whether moving the pointer into a pane's terminal focuses that pane.
+    /// See [`DEFAULT_FOCUS_FOLLOWS_MOUSE`]; the rules that decide *which*
+    /// moves count live in `main.rs::hover_focus`.
+    pub focus_follows_mouse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowConfig {
     /// Whether closing the window asks first when a tab is running something.
     /// See [`DEFAULT_WINDOW_CONFIRM_CLOSE`]; ask
@@ -558,6 +597,9 @@ impl Default for Config {
                 icons: DEFAULT_TAB_ICONS,
                 bar_with_one_tab: DEFAULT_TAB_BAR_WITH_ONE_TAB,
                 transcript_kb: DEFAULT_TAB_TRANSCRIPT_KB,
+            },
+            input: InputConfig {
+                focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             },
             window: WindowConfig {
                 confirm_close: DEFAULT_WINDOW_CONFIRM_CLOSE,
@@ -677,6 +719,7 @@ pub fn parse(text: &str) -> (ConfigFile, Vec<String>) {
         font: section(&root, "font", &mut warnings),
         text: section(&root, "text", &mut warnings),
         tabs: section(&root, "tabs", &mut warnings),
+        input: section(&root, "input", &mut warnings),
         window: section(&root, "window", &mut warnings),
         profiles: profiles_section(&root, &mut warnings),
     };
@@ -810,6 +853,12 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
         })
         .unwrap_or(DEFAULT_TAB_TRANSCRIPT_KB);
 
+    let focus_follows_mouse = session
+        .input
+        .focus_follows_mouse
+        .or(file.input.focus_follows_mouse)
+        .unwrap_or(DEFAULT_FOCUS_FOLLOWS_MOUSE);
+
     let confirm_close = session
         .window
         .confirm_close
@@ -827,6 +876,9 @@ pub fn resolve(file: &ConfigFile, session: &ConfigFile, warnings: &mut Vec<Strin
             icons,
             bar_with_one_tab,
             transcript_kb,
+        },
+        input: InputConfig {
+            focus_follows_mouse,
         },
         window: WindowConfig { confirm_close },
         profiles: profiles(file, warnings),
@@ -1608,6 +1660,50 @@ mod tests {
         let warnings = warnings_for(text);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("[tabs]"), "{warnings:?}");
+    }
+
+    /// Focus follows the mouse unless the file says otherwise, and nothing
+    /// else in the file can switch it off by accident.
+    #[test]
+    fn focus_follows_mouse_defaults_on_and_is_switchable_off() {
+        assert!(Config::default().input.focus_follows_mouse);
+        assert!(resolved("").input.focus_follows_mouse);
+        assert!(
+            resolved("[tabs]\nicons = false\n")
+                .input
+                .focus_follows_mouse
+        );
+        assert!(
+            !resolved("[input]\nfocus_follows_mouse = false\n")
+                .input
+                .focus_follows_mouse
+        );
+        assert!(
+            resolved("[input]\nfocus_follows_mouse = true\n")
+                .input
+                .focus_follows_mouse
+        );
+    }
+
+    /// Fault isolation, as everywhere else: a `[input]` that will not
+    /// deserialize costs that section its default and nothing else.
+    #[test]
+    fn a_non_boolean_focus_follows_mouse_warns_and_keeps_the_default() {
+        let text = "[font]\nsize = 12.0\n\n[input]\nfocus_follows_mouse = \"yes\"\n";
+        assert!(resolved(text).input.focus_follows_mouse);
+        assert_eq!(resolved(text).font.size, 12.0);
+        let warnings = warnings_for(text);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[input]"), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_unknown_key_under_input_is_reported() {
+        let warnings = warnings_for("[input]\nfocus_follows_pointer = true\n");
+        assert_eq!(
+            warnings,
+            vec!["unknown key `input.focus_follows_pointer`".to_string()]
+        );
     }
 
     /// Closing a window that is running something asks first unless the file

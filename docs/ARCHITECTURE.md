@@ -52,6 +52,24 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   with a draggable hairline between siblings on both axes (resize cursor per
   axis, no child below 0.15 of its split, weights per split via
   `split_weights`/`set_split_weights(path, …)`).
+- **The pointer picks the pane** (`main.rs::hover_focus`, `[input]
+  focus_follows_mouse`, default on): moving the mouse
+  into a leaf's terminal focuses that leaf — focus-follows-mouse, no click —
+  and the wheel is routed to whatever the pointer is over regardless of focus
+  (egui_term's `accepts`, PATCHES 14). The trigger is a `PointerMoved` event
+  landing in the terminal rect, so a *resting* cursor never moves the keyboard:
+  splitting, resizing, closing a pane or output scrolling underneath it all
+  leave focus alone, and a window opening under the cursor focuses nothing.
+  Suppressed while any pointer button is down — a drag belongs to the pane it
+  started in, whether it is a selection or a tab pill crossing the window — and
+  while a modal is up. Moves over a tab bar do not count; the rect is the
+  terminal (scrollbar strip included, so grazing the thumb of the pane you are
+  aiming at does not bounce the keyboard back). Click-to-focus is unchanged and
+  still covers the whole leaf, bar included. The wheel routing is the fallback
+  in every suppressed case — the pane under the cursor scrolls even when it
+  cannot take the keyboard — which is also why `[input] focus_follows_mouse =
+  false` governs only the focus half: scrolling what you point at is not a
+  matter of taste, and it is what makes the switch liveable.
 - Tab bar: one per group, across the top of the group's column —
   Ghostty-like rounded "pill" buttons, active tab highlighted (the *group's*
   active tab; the focused group's bar is the brighter one), close on
@@ -123,6 +141,14 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   `Regular`, since an `Accessory` app owns no menu bar). `just run`/`just
   restart` set it — a dev instance opening on top of what you were typing in
   is the single most disruptive thing about working on terra.
+- Selecting and copying: Shift or Option hands a drag back to terra's own
+  selection inside a program that grabbed the mouse (egui_term's
+  `selection_override`). Inside tmux the plain drag also works, because tmux
+  makes the selection itself and copies it back out with **OSC 52** — which
+  `drain_pty_events` turns into `ctx.copy_text`, both `ClipboardType`s onto the
+  one macOS pasteboard. The read direction (`ESC]52;c;?`) is refused inside
+  egui_term: it would hand this Mac's clipboard to whatever is on the far end of
+  an ssh connection.
 - Drag & drop: a pill dragged within a bar reorders that bar; dropped on
   another group's bar it *moves* there (slot under the cursor, becomes that
   group's active tab); dropped on a terminal it splits — four drop zones per
@@ -167,8 +193,8 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
 - Config: `~/.terra/config.toml` (`TERRA_CONFIG` overrides), read once at
   startup into `config.rs`. `[font] size, line_height`, `[text] bidi,
   bidi_base, [text.bidi_quirks]`, `[tabs] icons, bar_with_one_tab,
-  transcript_kb`, `[window] confirm_close`, `[profile.<name>] command, cwd,
-  title`.
+  transcript_kb`, `[input] focus_follows_mouse`, `[window] confirm_close`,
+  `[profile.<name>] command, cwd, title`.
   Loading never fails — see `docs/config.example.toml`. Profiles are
   deserialized one at a time, so one broken profile is skipped with a warning
   rather than costing the rest; `command` is a string and is split into argv,

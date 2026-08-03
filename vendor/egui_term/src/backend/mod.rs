@@ -33,6 +33,9 @@ use std::sync::{mpsc, Arc};
 pub type TerminalMode = TermMode;
 pub type PtyEvent = Event;
 pub type SelectionType = AlacrittySelectionType;
+/// terra patch: which pasteboard an OSC 52 store names. Re-exported because
+/// `PtyEvent::ClipboardStore` carries it and the embedder has to match on it.
+pub type ClipboardType = term::ClipboardType;
 
 #[derive(Debug, Clone)]
 pub enum BackendCommand {
@@ -252,7 +255,22 @@ impl TerminalBackend {
                         panic!("pty_event_subscription_{}: sending PtyEvent is failed", id)
                     });
                 if visible_in_thread.load(std::sync::atomic::Ordering::Relaxed)
-                    || matches!(event, Event::Exit | Event::Title(_))
+                    || matches!(
+                        event,
+                        Event::Exit
+                            | Event::Title(_)
+                            // terra patch: a clipboard write is acted on by
+                            // the UI thread (egui owns the pasteboard), so an
+                            // OSC 52 copy arriving in a tab that is not the
+                            // one on screen must still ask for a frame.
+                            // Measured caveat: a *fully occluded* window is
+                            // parked by AppKit and a requested repaint does
+                            // not unpark it, so that copy lands on the next
+                            // frame the window draws. The gesture this exists
+                            // for — a drag the user is watching — always has
+                            // one.
+                            | Event::ClipboardStore(..)
+                    )
                 {
                     app_context.clone().request_repaint();
                 }
@@ -277,6 +295,21 @@ impl TerminalBackend {
                         if let Some(rgb) = rgb {
                             pty_notifier.notify(format(rgb).into_bytes());
                         }
+                    }
+                    // terra patch: OSC 52 *read* (`ESC]52;c;?`). The write
+                    // direction is forwarded to the embedder as a `PtyEvent`
+                    // and put on the system clipboard; this direction hands a
+                    // remote program whatever the user last copied — an ssh
+                    // session on a machine they do not trust exfiltrating
+                    // passwords by asking politely — so terra answers with an
+                    // empty string and nothing else.
+                    //
+                    // alacritty's `term::Config` already defaults to
+                    // `Osc52::OnlyCopy`, which denies the load before it ever
+                    // becomes an event, so this arm is belt and braces against
+                    // a future config that turns the read on.
+                    Event::ClipboardLoad(_, format) => {
+                        pty_notifier.notify(format("").into_bytes());
                     }
                     _ => {}
                 }

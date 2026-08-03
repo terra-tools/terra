@@ -180,6 +180,152 @@
     and one `Option` check per read), so it is applied unconditionally and
     `[tabs] transcript_kb = 0` costs nothing.
 
+11. view.rs `process_keyboard_event` (+ the new `paste_bytes` /
+    `clipboard_key_is_passthrough`): **bracketed paste, and a Ctrl+V that
+    pastes**. Upstream wrote the clipboard text to the PTY raw, whatever the
+    terminal's mode. A program that had set DECSET 2004 (`ESC[?2004h`) asked to
+    be told where a paste begins and ends, so it can take the text as *data*
+    rather than as typing — and every shell, editor and agent that gates on the
+    marker (readline, zsh, vim, codex, claude) treated a paste as a burst of
+    keystrokes instead: a multi-line snippet ran line by line. This is the
+    reported "I can't paste into terra".
+
+    `paste_bytes(text, bracketed)` is the whole decision, as a pure function:
+
+    * `BRACKETED_PASTE` set → `ESC[200~` + payload + `ESC[201~`.
+    * Line endings are normalised to `\r` in **both** modes. A paste is not a
+      key sequence, and the byte the Enter key produces is CR; alacritty does
+      this for unbracketed pastes, and iTerm2 and xterm do it inside the
+      brackets too, where a payload full of LFs makes readline's paste handler
+      and tmux's buffer disagree about how many lines arrived.
+    * The payload is sanitised the way xterm sanitises it: neither marker may
+      appear *inside* the brackets, or a crafted snippet could close the bracket
+      early and have its remainder run as typing. Stripping loops to a fixpoint,
+      because removing one marker can splice a fresh one out of its neighbours
+      (`ESC[20` + `ESC[201~` + `1~`). Alacritty instead deletes every `\x1b` and
+      `\x03` from a bracketed payload, which is blunter — it eats the SGR
+      colours in text copied out of another terminal — for the same protection.
+
+    The other half is the non-macOS branch, whose logic was inverted. `egui_winit`
+    turns `modifiers.command + C/V` into `Event::Copy`/`Event::Paste` and swallows
+    the `Event::Key`, and off macOS `command` **is** Ctrl. Upstream's fix was to
+    write `^V` (and `^C`) unless `COMMAND | SHIFT` was held. Keeping a passthrough
+    is right — a Linux terminal where Ctrl+C copies instead of interrupting is
+    unusable, and Ctrl+Shift+C / Ctrl+Shift+V is what gnome-terminal, konsole and
+    xterm do — but "everything that is not Ctrl+Shift" was too wide: Windows'
+    Shift+Insert and Ctrl+Insert, and the dedicated `Key::Copy`/`Key::Paste` media
+    keys, carry no command modifier and so pasted a `^V`. `clipboard_key_is_passthrough`
+    now names the exact spelling — command held, shift not — and everything else
+    reaches the clipboard. **On macOS it is always false**: ⌘ is the clipboard
+    modifier, Ctrl+C/Ctrl+V never arrive as `Copy`/`Paste` at all, and a paste is
+    always a paste. Guarded by `view.rs`'s `paste_tests` / `clipboard_key_tests`
+    and `terra-app/tests/issue_paste_repro.rs`. Worth upstreaming.
+
+12. backend/mod.rs + lib.rs: **OSC 52, the clipboard *write* direction** — how a
+    program hands text out to the terminal's clipboard, and the missing half of
+    "a plain mouse drag inside tmux should copy, like Ghostty". Inside `ssh` →
+    `tmux` (`mouse on`) a drag belongs to tmux: tmux paints the selection and, on
+    release, emits `ESC]52;c;<base64>BEL` upstream. It is the only route from the
+    far end of an ssh connection to this Mac's pasteboard, and terra dropped it,
+    leaving a selection the user could see and could not paste.
+
+    Almost no plumbing was needed: alacritty already raises
+    `Event::ClipboardStore(ClipboardType, String)` with the payload decoded, and
+    the pty event thread already forwards every alacritty event to the embedder
+    as a `PtyEvent`. Three changes make it usable:
+
+    * `ClipboardType` is re-exported (`lib.rs`), since the event carries it and
+      the embedder has to match on it. terra-app maps both `Clipboard` and
+      `Selection` onto the one macOS pasteboard via `ctx.copy_text`, which is the
+      same route ⌘C already takes.
+    * `ClipboardStore` joins `Exit` and `Title` in the set of events that request
+      a repaint even while the tab is not the one on screen — the store is acted
+      on by the UI thread, which only runs during a frame. Measured caveat: a
+      *fully occluded* window is parked by AppKit and a requested repaint does
+      not unpark it, so a copy made there lands on the next frame the window
+      draws. The gesture this exists for — a drag the user is watching — always
+      has one.
+    * `Event::ClipboardLoad` — the *read* direction, `ESC]52;c;?` — is answered
+      with an **empty string** and nothing else. A program asking to read the
+      clipboard is asking terra to hand whatever the user last copied (a
+      password, a token) to code running on the far end of an ssh connection.
+      alacritty's `term::Config` already defaults to `Osc52::OnlyCopy`, which
+      denies the load before it becomes an event at all; the arm is belt and
+      braces against that default ever moving.
+
+    Guarded by `terra-app/tests/osc52_clipboard.rs`, which drives both the bare
+    sequence and a real tmux server. Measured finding worth recording: tmux 3.5a
+    needs **no configuration** for the copy-out direction — `set-clipboard`
+    already defaults to `external`, and tmux's built-in
+    `terminal-features[0] xterm*:clipboard` grants the `Ms` capability to terra's
+    `TERM=xterm-256color` without consulting terminfo (macOS's system
+    `xterm-256color` entry has no `Ms`). `set -s set-clipboard on` governs the
+    opposite direction — whether tmux *accepts* OSC 52 from programs inside it.
+
+13. view.rs `process_mouse_move`: **motion reports under button-event tracking
+    (DECSET 1002)**. Upstream only forwarded drag motion when the program had
+    asked for *any-motion* tracking (1003), but the mode every mouse-aware TUI
+    actually sets — tmux, vim, htop — is 1002, motion-while-a-button-is-held.
+    Terra therefore delivered a drag as press…silence…release: two clicks at
+    different cells. tmux cannot start its mouse selection from that, which is
+    why a plain drag inside `tmux` (`mouse on`) selected nothing while the same
+    drag in Ghostty selected and copied (item 12 carries the copy half). The
+    gate is now `MOUSE_DRAG | MOUSE_MOTION` — the press that starts the gesture
+    is a *reported* press, so the button is held by construction and reporting
+    under either mode is correct. `MouseButton::LeftMove` (32) already encoded
+    the motion flag; it simply never fired.
+
+14. view.rs `process_input` / `accepts` (+ the new `track_grid_position`):
+    **the wheel is routed by hover, not by focus**. With the window split into
+    panes only the focused one scrolled, because item 5 left the whole function
+    behind an early `if !layout.has_focus() { return }`: the wheel over any
+    other pane went nowhere, and the user had to click a pane before the mouse
+    worked in it. iTerm2 and Ghostty both scroll whatever is under the cursor
+    and leave the keyboard where it is, which is what a wheel is *for* — it
+    names its target by pointing at it.
+
+    `accepts` now takes `focused` as well as `hovered`, and the three kinds
+    separate cleanly:
+
+    * keyboard (`Text`, `Key`, `Copy`, `Paste`) → **focus alone**, wherever the
+      pointer rests (item 5's fix, unchanged).
+    * `MouseWheel` → **hover alone**. Only one view can contain the pointer, so
+      exactly one pane acts on a given wheel event; the focused pane no longer
+      gets a copy of a scroll aimed elsewhere.
+    * `PointerButton` / `PointerMoved` → **hover *and* focus**, which is what
+      they already effectively required. Click-to-focus (terra-app watches the
+      press itself) and drag-selection therefore behave exactly as before: a
+      drag still starts only in the pane that holds focus, and loosening the
+      wheel does not silently loosen the selection with it.
+
+    The early return survives as `if !focused && !hovered`, so a pane that is
+    neither still costs nothing.
+
+    One thing had to move for the alternate-screen half to be right. Wheel
+    *reports* (item 6) are sent at `state.current_mouse_position_on_grid`,
+    which only `process_mouse_move` maintains — and an unfocused view takes no
+    pointer events, so its cached cell is wherever the pointer was when it last
+    held focus, or the default (0, 0). The pixel→cell conversion is now
+    `track_grid_position`, called from the `MouseWheel` arm too when the view
+    is unfocused, so a program in mouse mode in a hovered pane is told the cell
+    the pointer is actually over. Nothing else about reporting changes: the
+    reports go to that pane's PTY and to no other.
+
+    Nothing in terra-app had to move for this. `set_focus` still names the
+    focused group only, and `scrollbar.rs` was already hover-driven
+    (`rect_contains_pointer`) and reads its own group's backend, so the hovered
+    pane's thumb is the one that reacts.
+
+    terra went a step further *on top of* this patch — `main.rs::hover_focus`
+    moves the keyboard to the pane the pointer moves into, so in the ordinary
+    case the hovered pane is also the focused one. That is deliberately terra
+    policy and not part of this patch: a `TerminalView` still learns about
+    focus only through `set_focus`, and hover routing remains the layer
+    underneath, the one that keeps the wheel working in the cases where focus
+    is *not* allowed to follow — a modal is up, or a drag is in progress.
+    Guarded by `terra-app/tests/hover_scroll.rs` and `accepts_tests`. Worth
+    upstreaming.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to
