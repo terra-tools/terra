@@ -116,9 +116,10 @@ focus_follows_mouse = true
 # training you to hit Return without reading it.
 #
 #
-# Closing the last tab (its ✕, ⌘W, the palette) closes the window too, so it
-# asks the same question. Any other tab closes without one, and `terra kill`
-# never asks at all.
+# Closing a tab (its ✕, a middle-click, ⌘W, the palette) asks the same question
+# of that one tab: a prompt closes silently, a running command asks first —
+# "Close Tab?", or "Close Window?" when it is the last tab and the window goes
+# with it. `terra kill` never asks at all.
 #
 # Set this to false to never ask.
 confirm_close = true

@@ -1263,7 +1263,7 @@ impl TabManager {
     }
 
     // (No `close_active` wrapper: the app resolves the active id itself, so
-    // it can ask the last-tab question before the close happens — see
+    // it can ask the confirm-close question before the close happens — see
     // `App::close_tab`.)
 
     pub fn clear(&mut self) {

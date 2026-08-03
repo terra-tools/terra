@@ -186,14 +186,15 @@ fn close_would_kill_work(enabled: bool, tabs: Option<&Arc<Mutex<TabManager>>>) -
     confirm_close::should_confirm(enabled, &names)
 }
 
-/// The same question for a *tab* close: would closing tab `id` take the whole
-/// window — and a running program — down with it?
+/// The same question for a *tab* close: would closing tab `id` take a running
+/// program down with it?
 ///
 /// The window's other doors (the red traffic light, ⌘Q, the Apple event) all
 /// land on `close_requested` and share [`close_would_kill_work`]. A tab close
 /// does not: it goes through `TabManager::close`, and an emptied window quits
-/// on its own, so the last tab is a third door onto the same decision. One pid
-/// is read here rather than the whole table — only that tab is going away.
+/// on its own, so every tab close is a separate door onto the same decision.
+/// One pid is read here rather than the whole table — only that tab is going
+/// away, whether or not the window goes with it.
 fn tab_close_would_kill_work(
     enabled: bool,
     tabs: Option<&Arc<Mutex<TabManager>>>,
@@ -205,16 +206,7 @@ fn tab_close_would_kill_work(
     let Some(arc) = tabs else {
         return false;
     };
-    let (count, pid) = {
-        let tabs = lock(arc);
-        (tabs.ids().len(), tabs.shell_pid(id))
-    };
-    // Cheap guard first: closing any tab but the last never asks, so a busy
-    // window with two tabs never walks the process table at all.
-    if count != 1 {
-        return false;
-    }
-    let Some(pid) = pid else {
+    let Some(pid) = lock(arc).shell_pid(id) else {
         return false;
     };
     let foreground = procinfo::foreground_commands(&[pid]);
@@ -222,7 +214,7 @@ fn tab_close_would_kill_work(
         .first()
         .and_then(|fg| fg.as_ref())
         .map(|fg| fg.name.as_str());
-    confirm_close::should_confirm_tab_close(enabled, count, name)
+    confirm_close::should_confirm_tab_close(enabled, name)
 }
 
 /// `window.confirm_close`, mirrored for the AppKit termination hook.
@@ -385,14 +377,12 @@ struct App {
     /// window fades, and only then is the close let through. See
     /// `macos::CloseAnimation`.
     closing: macos::CloseAnimation,
-    /// The "Close Window?" question, and whether one is outstanding. Sits
+    /// The "Close Window?" / "Close Tab?" question, whether one is outstanding
+    /// and what it is about (`confirm_close::Subject` — the held close's
+    /// payload lives in there, so there is exactly one pending close). Sits
     /// *in front of* `closing`: a close is confirmed first and animated
     /// second, so a canceled close never fades anything.
     confirm_close: confirm_close::ConfirmClose,
-    /// The tab whose close raised the dialog, held until the answer is in.
-    /// `None` while the question is the window's own (the traffic light, ⌘Q),
-    /// which needs no payload — it just stops being cancelled.
-    pending_tab_close: Option<u64>,
     last_window_title: String,
     /// Directory currently behind the titlebar proxy icon, so we only bother
     /// AppKit when it actually moves.
@@ -471,7 +461,6 @@ impl App {
             opening: macos::OpenAnimation::default(),
             closing: macos::CloseAnimation::default(),
             confirm_close: confirm_close::ConfirmClose::default(),
-            pending_tab_close: None,
             last_window_title: String::new(),
             last_represented_path: None,
             app_menu_installed: false,
@@ -1080,17 +1069,19 @@ impl App {
         let enabled = self.config.get().window.confirm_close;
         let tabs = self.tabs.clone();
         self.confirm_close
-            .requested(|| close_would_kill_work(enabled, tabs.as_ref()))
+            .requested(confirm_close::Subject::Window, || {
+                close_would_kill_work(enabled, tabs.as_ref())
+            })
     }
 
-    /// Close a tab — every in-window door does, so the last-tab question is
-    /// asked in exactly one place.
+    /// Close a tab — every in-window door does, so the question is asked in
+    /// exactly one place.
     ///
     /// The doors: the tab's ✕ and a middle-click on it (`AppAction::CloseTab`),
     /// ⌘W and the palette's "Close Tab" (`AppAction::CloseActive`). Not the
     /// IPC `Request::Kill` behind `terra kill` — see `ipc::handle`.
     fn close_tab(&mut self, ctx: &egui::Context, arc: &Arc<Mutex<TabManager>>, id: u64) {
-        if self.hold_last_tab_close(id) {
+        if self.hold_tab_close(id) {
             // The tab bar drew this frame already; the dialog goes up on the
             // next one, which a parked terra would otherwise never paint.
             ctx.request_repaint();
@@ -1099,26 +1090,28 @@ impl App {
         lock(arc).close(id);
     }
 
-    /// Is this tab close the window's last one, with work in it? Then hold it
-    /// behind the same "Close Window?" dialog — the title is right, because
-    /// the window is what a lone tab's close actually shuts.
+    /// Is there work in this tab? Then hold its close behind the dialog.
+    ///
+    /// The last tab's close is the same code path wearing a different title:
+    /// it empties the window, so what it really shuts is the window, and
+    /// `Subject::Tab { last: true }` says "Close Window?" for it.
     ///
     /// Returns `true` when the caller must *not* close the tab. The answer
     /// arrives in `App::ui`, which runs the close then.
-    fn hold_last_tab_close(&mut self, id: u64) -> bool {
+    fn hold_tab_close(&mut self, id: u64) -> bool {
         let enabled = self.config.get().window.confirm_close;
         let tabs = self.tabs.clone();
+        // Every group's tabs, not the focused group's: the window is empty
+        // only when the very last one goes.
+        let last = tabs
+            .as_ref()
+            .is_some_and(|arc| lock(arc).ids().as_slice() == [id]);
         // A dialog already up owns the pending payload: a tab close arriving
         // mid-question is held (like any second request) but must not rewrite
-        // what "Close" will mean.
-        let asking = self.confirm_close.is_open();
-        let held = self
-            .confirm_close
-            .requested(|| tab_close_would_kill_work(enabled, tabs.as_ref(), id));
-        if held && !asking {
-            self.pending_tab_close = Some(id);
-        }
-        held
+        // what "Close" will mean. `ConfirmClose` enforces that itself.
+        self.confirm_close.tab_requested(id, last, || {
+            tab_close_would_kill_work(enabled, tabs.as_ref(), id)
+        })
     }
 
     /// Rebuild anything derived from the config, but only when it moved.
@@ -1637,18 +1630,29 @@ impl eframe::App for App {
         // is composed: while the dialog is up, Return and Escape are answers
         // to it and must reach nothing else.
         if self.confirm_close.is_open() {
-            if let Some(choice) = confirm_close::show(&ctx) {
-                self.confirm_close.answer(choice);
+            let subject = self.confirm_close.subject();
+            if let Some(choice) = confirm_close::show(&ctx, subject) {
                 // Cancel drops the payload with the question: nothing closes,
                 // and the next attempt asks from scratch.
-                let pending = self.pending_tab_close.take();
+                self.confirm_close.answer(choice);
                 if choice == confirm_close::Choice::Close {
-                    match pending {
-                        // The last tab: run the close that was held. Emptying
-                        // the window is what closes it, down today's path —
-                        // `empty` below sends the close, and the state machine
-                        // is Approved now, so it is not questioned again.
-                        Some(id) => self.apply(&ctx, AppAction::CloseTab(id)),
+                    match subject.tab_id() {
+                        // Run the close that was held. `ConfirmClose` is
+                        // Approved now, so `close_tab` lets it straight
+                        // through rather than asking the same question again.
+                        // If that was the last tab, emptying the window is
+                        // what closes it, down today's path: `empty` below
+                        // sends the close, unquestioned for the same reason.
+                        Some(id) => {
+                            self.apply(&ctx, AppAction::CloseTab(id));
+                            // The window survived it, so this answer must not
+                            // outlive the tab it was about: the next busy tab
+                            // gets its own question.
+                            let alive = self.tabs.as_ref().is_some_and(|t| !lock(t).is_empty());
+                            if alive {
+                                self.confirm_close.reset();
+                            }
+                        }
                         None => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     }
                 }
@@ -1737,11 +1741,24 @@ impl eframe::App for App {
         // The last tab exiting while the dialog is up answers the question:
         // there is nothing left to protect, so the window must not be stuck
         // behind a modal about sessions that no longer exist.
-        // (Which also covers a held *tab* close whose process exits on its
-        // own: the tab is gone, so the payload is stale and goes with it.)
+        // (Which also covers a held *last tab* close whose process exits on
+        // its own: the tab is gone, so the payload is stale and goes with it —
+        // `answer` drops it.)
         if empty && self.confirm_close.is_open() {
             self.confirm_close.answer(confirm_close::Choice::Close);
-            self.pending_tab_close = None;
+        } else if self.confirm_close.is_open() {
+            // The same staleness one tab down: the tab the question is about
+            // exited on its own while the dialog was up. Nothing is left to
+            // protect and nothing left to close, so the question goes and the
+            // window carries on.
+            let gone = self.confirm_close.subject().tab_id().is_some_and(|id| {
+                self.tabs
+                    .as_ref()
+                    .is_some_and(|tabs| !lock(tabs).ids().contains(&id))
+            });
+            if gone {
+                self.confirm_close.reset();
+            }
         }
         if (self.quitting || empty) && !self.closing.is_fading() {
             // The listener is *not* dropped here. A quit only becomes a close

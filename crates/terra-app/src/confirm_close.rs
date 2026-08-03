@@ -1,13 +1,15 @@
-//! "Close Window?" — the question terra asks before a close takes a running
-//! session down with it.
+//! "Close Window?" / "Close Tab?" — the question terra asks before a close
+//! takes a running session down with it.
 //!
 //! Three pieces, deliberately separable:
 //!
-//! - [`should_confirm`] — the *decision*. Pure: per-tab foreground process
-//!   names plus the config key in, ask/don't-ask out. Nothing to mock.
+//! - [`should_confirm`] — the *decision*. Pure: foreground process names plus
+//!   the config key in, ask/don't-ask out. Nothing to mock.
 //! - [`ConfirmClose`] — the *state machine*. Idle → Asking → Approved, driven
 //!   from the frame loop, so `main.rs` holds one close request back, keeps the
-//!   window alive, and then lets the *next* one through untouched.
+//!   window alive, and then lets the *next* one through untouched. It carries
+//!   the [`Subject`] too: what the held close was *for*, which is both the
+//!   dialog's wording and the work "Close" runs.
 //! - [`show`] — the *dialog*, drawn in egui and styled like the command
 //!   palette (see `terra-palette`): the same glass panel over the same scrim,
 //!   scaled down to a question and two buttons.
@@ -78,26 +80,70 @@ pub fn should_confirm(enabled: bool, foreground: &[Option<&str>]) -> bool {
 
 /// Should closing *this tab* ask first?
 ///
-/// A tab close is a window close in disguise when it is the last tab in the
-/// window (the last tab of the last group — `tab_count` counts every group's
-/// tabs, not the focused group's): the tabs path tears the window down without
-/// ever raising `close_requested`, so the red traffic light's dialog would
-/// never get a say. Same switch, same shell list, same `None` reading as
-/// [`should_confirm`] — this only adds the "is it the last one" question.
+/// The same question [`should_confirm`] answers for a window, asked of one
+/// tab's foreground process: same switch, same shell list, same "no opinion"
+/// reading of `None`. A tab is a session, and a session with work in it is
+/// worth one question whether or not other tabs happen to survive it.
 ///
-/// Closing a tab that is *not* the last is deliberately never held back. Some
-/// terminals ask there too; terra does not, because a window that survives the
-/// close still shows every other session and the cost of a mistake is one tab,
-/// not the workspace. This is scope, not an oversight — widening it means
-/// giving the dialog per-tab wording ("Close Tab?"), not just relaxing this
-/// condition.
-pub fn should_confirm_tab_close(enabled: bool, tab_count: usize, foreground: Option<&str>) -> bool {
-    tab_count == 1 && should_confirm(enabled, &[foreground])
+/// The last tab is not a special case here, only a special *wording* one (see
+/// [`Subject`]): closing it tears the window down without ever raising
+/// `close_requested`, so it is the door the red traffic light's dialog would
+/// otherwise never get a say at.
+pub fn should_confirm_tab_close(enabled: bool, foreground: Option<&str>) -> bool {
+    should_confirm(enabled, &[foreground])
 }
 
 // ---------------------------------------------------------------------------
 // The state machine
 // ---------------------------------------------------------------------------
+
+/// What the held close would do, if approved — the dialog's wording and the
+/// caller's to-do list in one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Subject {
+    /// The window itself: the red traffic light, ⌘Q, the Apple event.
+    #[default]
+    Window,
+    /// One tab, by id. `last` when it is the only tab left in the window
+    /// across every group — closing it empties the window, which is what
+    /// actually shuts terra, so the question is still the window's.
+    Tab { id: u64, last: bool },
+}
+
+impl Subject {
+    /// The tab this close would take, if it is a tab close at all.
+    pub fn tab_id(self) -> Option<u64> {
+        match self {
+            Subject::Window => None,
+            Subject::Tab { id, .. } => Some(id),
+        }
+    }
+
+    /// Whether approving this close ends the window rather than a tab in it.
+    /// The dialog's wording follows this, not "is it a tab".
+    pub fn closes_window(self) -> bool {
+        match self {
+            Subject::Window => true,
+            Subject::Tab { last, .. } => last,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        if self.closes_window() {
+            TITLE_WINDOW
+        } else {
+            TITLE_TAB
+        }
+    }
+
+    pub fn body(self) -> &'static str {
+        if self.closes_window() {
+            BODY_WINDOW
+        } else {
+            BODY_TAB
+        }
+    }
+}
 
 /// What the user chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,10 +167,14 @@ enum State {
     Approved,
 }
 
-/// Holds one close request back while the dialog is up. See the module docs.
+/// Holds one close request back while the dialog is up, together with what
+/// that request was for. See the module docs.
 #[derive(Debug, Default)]
 pub struct ConfirmClose {
     state: State,
+    /// What the held close would do. Only meaningful while [`State::Asking`];
+    /// cleared with the answer, so a stale payload can never be run twice.
+    subject: Subject,
 }
 
 impl ConfirmClose {
@@ -135,7 +185,11 @@ impl ConfirmClose {
     /// Returns `true` when the caller must cancel the close and keep the
     /// window alive; `false` lets it proceed exactly as it did before this
     /// feature existed.
-    pub fn requested(&mut self, needed: impl FnOnce() -> bool) -> bool {
+    ///
+    /// Only one close is ever pending: a request arriving while the dialog is
+    /// up is held like any other, but leaves the recorded `subject` alone, so
+    /// "Close" keeps meaning what the question on screen says it means.
+    pub fn requested(&mut self, subject: Subject, needed: impl FnOnce() -> bool) -> bool {
         match self.state {
             State::Approved => false,
             // A second request while the dialog is up (clicking the red button
@@ -144,6 +198,7 @@ impl ConfirmClose {
             State::Idle => {
                 if needed() {
                     self.state = State::Asking;
+                    self.subject = subject;
                     true
                 } else {
                     false
@@ -152,10 +207,21 @@ impl ConfirmClose {
         }
     }
 
+    /// [`Self::requested`] for a tab close, which is every in-window door:
+    /// the tab's ✕, a middle-click on it, ⌘W, the palette's `tab.close`.
+    pub fn tab_requested(&mut self, id: u64, last: bool, needed: impl FnOnce() -> bool) -> bool {
+        self.requested(Subject::Tab { id, last }, needed)
+    }
+
     /// Whether the dialog should be drawn — and, for the caller, whether the
     /// terminal underneath must go unfocused.
     pub fn is_open(&self) -> bool {
         self.state == State::Asking
+    }
+
+    /// What the outstanding question is about. Read it *before* [`Self::answer`].
+    pub fn subject(&self) -> Subject {
+        self.subject
     }
 
     /// Record the user's answer. Cancelling returns to [`State::Idle`], which
@@ -165,6 +231,18 @@ impl ConfirmClose {
             Choice::Cancel => State::Idle,
             Choice::Close => State::Approved,
         };
+        self.subject = Subject::default();
+    }
+
+    /// Forget everything: no question outstanding, no answer on record.
+    ///
+    /// This is what keeps an approved *tab* close from silencing the next one.
+    /// [`State::Approved`] is deliberately permissive — it exists so the fade
+    /// can re-issue the window close without being asked again — but a window
+    /// that survives the close it just approved has to be able to ask again,
+    /// so the caller resets once the tab is actually gone.
+    pub fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -172,8 +250,12 @@ impl ConfirmClose {
 // The dialog
 // ---------------------------------------------------------------------------
 
-pub const TITLE: &str = "Close Window?";
-pub const BODY: &str = "All terminal sessions in this window will be terminated.";
+pub const TITLE_WINDOW: &str = "Close Window?";
+pub const BODY_WINDOW: &str = "All terminal sessions in this window will be terminated.";
+/// A tab close the window survives: one session, and the wording says so
+/// rather than overstating what is at stake.
+pub const TITLE_TAB: &str = "Close Tab?";
+pub const BODY_TAB: &str = "The terminal session in this tab will be terminated.";
 pub const CANCEL_LABEL: &str = "Cancel";
 pub const CLOSE_LABEL: &str = "Close";
 
@@ -242,7 +324,7 @@ fn ui_font(size: f32, medium: bool) -> FontId {
 /// Keys are read with `consume_key` *before* anything else, exactly as the
 /// palette does: Return and Escape are answers here, and must not also reach
 /// the app's shortcut table or the terminal below.
-pub fn show(ctx: &Context) -> Option<Choice> {
+pub fn show(ctx: &Context, subject: Subject) -> Option<Choice> {
     let (escape, enter) = ctx.input_mut(|i| {
         (
             i.consume_key(Modifiers::NONE, Key::Escape),
@@ -290,7 +372,7 @@ pub fn show(ctx: &Context) -> Option<Choice> {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
-                    clicked = contents(ui);
+                    clicked = contents(ui, subject);
                 })
                 .response
                 .rect
@@ -331,14 +413,14 @@ pub fn show(ctx: &Context) -> Option<Choice> {
 }
 
 /// Title, body and the button row.
-fn contents(ui: &mut egui::Ui) -> Option<Choice> {
+fn contents(ui: &mut egui::Ui, subject: Subject) -> Option<Choice> {
     let full = ui.available_width();
 
     let (rect, _) = ui.allocate_exact_size(Vec2::new(full, FONT_TITLE * 1.3), Sense::hover());
     ui.painter().text(
         rect.left_center(),
         Align2::LEFT_CENTER,
-        TITLE,
+        subject.title(),
         ui_font(FONT_TITLE, true),
         FG_TITLE,
     );
@@ -346,7 +428,7 @@ fn contents(ui: &mut egui::Ui) -> Option<Choice> {
 
     // Wrapped, so a narrow window folds the sentence instead of clipping it.
     let galley = ui.painter().layout(
-        BODY.to_owned(),
+        subject.body().to_owned(),
         ui_font(FONT_BODY, false),
         FG_BODY,
         full.max(1.0),
@@ -479,31 +561,50 @@ mod tests {
     /// The bug this exists for: the lone tab running `claude` is the window,
     /// and closing it must ask.
     #[test]
-    fn closing_the_last_busy_tab_asks() {
-        assert!(should_confirm_tab_close(true, 1, Some("claude")));
-        assert!(should_confirm_tab_close(true, 1, Some("sleep")));
+    fn closing_a_busy_tab_asks() {
+        assert!(should_confirm_tab_close(true, Some("claude")));
+        assert!(should_confirm_tab_close(true, Some("sleep")));
     }
 
-    /// Any other tab close is out of scope: the window survives it.
+    /// The widening: a tab with work in it is worth a question whether or not
+    /// other tabs survive the close. Position in the bar never came into it.
     #[test]
-    fn closing_a_tab_that_is_not_the_last_never_asks() {
-        assert!(!should_confirm_tab_close(true, 2, Some("claude")));
-        assert!(!should_confirm_tab_close(true, 7, Some("cargo")));
+    fn a_tab_that_is_not_the_last_asks_on_the_same_terms() {
+        // Same call, and there is no tab-count argument left to differ on.
+        assert!(should_confirm_tab_close(true, Some("cargo")));
+        assert!(!should_confirm_tab_close(true, Some("zsh")));
     }
 
-    /// A lone idle prompt closes instantly, exactly as it always did.
+    /// An idle prompt closes instantly, exactly as it always did.
     #[test]
-    fn closing_the_last_idle_tab_never_asks() {
-        assert!(!should_confirm_tab_close(true, 1, Some("zsh")));
-        assert!(!should_confirm_tab_close(true, 1, Some("fish")));
+    fn closing_an_idle_tab_never_asks() {
+        assert!(!should_confirm_tab_close(true, Some("zsh")));
+        assert!(!should_confirm_tab_close(true, Some("fish")));
         // No answer from the process table is not evidence of work.
-        assert!(!should_confirm_tab_close(true, 1, None));
+        assert!(!should_confirm_tab_close(true, None));
     }
 
-    /// The same switch governs both doors.
+    /// The same switch governs every door — no second config key.
     #[test]
-    fn the_config_switch_also_wins_over_a_last_tab_close() {
-        assert!(!should_confirm_tab_close(false, 1, Some("claude")));
+    fn the_config_switch_also_wins_over_a_tab_close() {
+        assert!(!should_confirm_tab_close(false, Some("claude")));
+    }
+
+    /// The wording follows what the close actually shuts, not whether the
+    /// gesture happened to be a tab's.
+    #[test]
+    fn the_last_tab_is_worded_as_the_window_it_closes() {
+        assert_eq!(Subject::Window.title(), TITLE_WINDOW);
+        assert_eq!(
+            Subject::Tab { id: 7, last: true }.title(),
+            TITLE_WINDOW,
+            "the last tab *is* the window"
+        );
+        assert_eq!(Subject::Tab { id: 7, last: false }.title(), TITLE_TAB);
+        assert_eq!(Subject::Tab { id: 7, last: false }.body(), BODY_TAB);
+        assert_eq!(Subject::Tab { id: 7, last: true }.body(), BODY_WINDOW);
+        assert_eq!(Subject::Tab { id: 7, last: false }.tab_id(), Some(7));
+        assert_eq!(Subject::Window.tab_id(), None);
     }
 
     /// A tab close routed through the dialog and approved runs the close
@@ -512,12 +613,33 @@ mod tests {
     #[test]
     fn approving_a_last_tab_close_lets_the_window_close_follow() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.requested(|| true), "the tab close is held");
+        assert!(confirm.tab_requested(1, true, || true), "the close is held");
+        assert_eq!(confirm.subject(), Subject::Tab { id: 1, last: true });
         confirm.answer(Choice::Close);
         // The close itself, then the empty-window close, then the fade's retry.
-        assert!(!confirm.requested(|| panic!("must not re-decide")));
-        assert!(!confirm.requested(|| panic!("must not re-decide")));
-        assert!(!confirm.requested(|| panic!("must not re-decide")));
+        for _ in 0..3 {
+            assert!(!confirm.requested(Subject::Window, || panic!("must not re-decide")));
+        }
+    }
+
+    /// The window survived the tab it just took: `reset` puts the gate back,
+    /// so the *next* busy tab gets its own question rather than inheriting
+    /// this one's answer.
+    #[test]
+    fn approving_a_tab_close_does_not_silence_the_next_one() {
+        let mut confirm = ConfirmClose::default();
+        assert!(confirm.tab_requested(1, false, || true));
+        confirm.answer(Choice::Close);
+        // The caller runs the close, sees the window is still there, resets.
+        confirm.reset();
+
+        let mut asked = 0;
+        assert!(confirm.tab_requested(2, false, || {
+            asked += 1;
+            true
+        }));
+        assert_eq!(asked, 1, "the next tab close re-reads the world");
+        assert_eq!(confirm.subject(), Subject::Tab { id: 2, last: false });
     }
 
     /// The happy path: ask, say yes, and the close that follows is not
@@ -525,13 +647,16 @@ mod tests {
     #[test]
     fn approving_lets_this_close_and_its_retry_through() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.requested(|| true), "the first request is held");
+        assert!(
+            confirm.requested(Subject::Window, || true),
+            "the first request is held"
+        );
         assert!(confirm.is_open());
 
         confirm.answer(Choice::Close);
         assert!(!confirm.is_open());
-        assert!(!confirm.requested(|| panic!("must not re-decide")));
-        assert!(!confirm.requested(|| panic!("must not re-decide")));
+        assert!(!confirm.requested(Subject::Window, || panic!("must not re-decide")));
+        assert!(!confirm.requested(Subject::Window, || panic!("must not re-decide")));
     }
 
     /// Cancelling leaves no half-state: the window is not closing, and the
@@ -539,12 +664,17 @@ mod tests {
     #[test]
     fn cancelling_aborts_the_close_and_the_next_one_asks_again() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.requested(|| true));
+        assert!(confirm.requested(Subject::Window, || true));
         confirm.answer(Choice::Cancel);
         assert!(!confirm.is_open());
+        assert_eq!(
+            confirm.subject(),
+            Subject::Window,
+            "the payload goes with the question"
+        );
 
         let mut asked = 0;
-        assert!(confirm.requested(|| {
+        assert!(confirm.requested(Subject::Window, || {
             asked += 1;
             true
         }));
@@ -557,7 +687,7 @@ mod tests {
     #[test]
     fn a_close_that_protects_nothing_is_never_held_back() {
         let mut confirm = ConfirmClose::default();
-        assert!(!confirm.requested(|| false));
+        assert!(!confirm.requested(Subject::Window, || false));
         assert!(!confirm.is_open());
     }
 
@@ -566,8 +696,22 @@ mod tests {
     #[test]
     fn a_second_request_while_asking_keeps_asking() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.requested(|| true));
-        assert!(confirm.requested(|| panic!("must not re-decide")));
+        assert!(confirm.requested(Subject::Window, || true));
+        assert!(confirm.requested(Subject::Window, || panic!("must not re-decide")));
         assert!(confirm.is_open());
+    }
+
+    /// Only one close is ever pending: a second tab's ✕ while the dialog is up
+    /// does not queue behind the first or rewrite what "Close" will do.
+    #[test]
+    fn a_second_tab_close_while_asking_cannot_rewrite_the_payload() {
+        let mut confirm = ConfirmClose::default();
+        assert!(confirm.tab_requested(1, false, || true));
+        assert!(confirm.tab_requested(2, false, || panic!("must not re-decide")));
+        assert_eq!(
+            confirm.subject(),
+            Subject::Tab { id: 1, last: false },
+            "the question on screen is still tab 1's"
+        );
     }
 }

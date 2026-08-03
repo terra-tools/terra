@@ -100,15 +100,22 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   abandons the close entirely (the next attempt asks again), Return / Close
   approves it and every request from then on — including the one the fade
   re-issues — passes straight through.
-- Closing the *last tab* is the same close wearing tab clothes, and gets the
-  same dialog: `TabManager::close` raises no `close_requested`, so
-  `App::close_tab` asks first via `should_confirm_tab_close` (tab count 1
-  across all groups + the same shell list, switch and procinfo path). Every
-  in-window door goes through it — the tab's ✕, a middle-click on it, ⌘W and
-  the palette's `tab.close`. Approving runs the held close (`pending_tab_close`)
-  and the emptied window quits through the ordinary path, fade included;
-  cancelling closes nothing. Closing a tab that is *not* the last never asks.
-  Neither does IPC `Kill` (`terra kill`): a remote controller means it, and a
+- Closing a *tab* asks the same question of that one tab: `TabManager::close`
+  raises no `close_requested`, so `App::close_tab` gates every in-window door —
+  the tab's ✕, a middle-click on it, ⌘W and the palette's `tab.close` — through
+  `should_confirm_tab_close` (that tab's foreground command + the same shell
+  list, switch and procinfo path; one pid, not the whole table). A tab at a
+  bare prompt closes silently; a tab with a command running raises the dialog.
+  What the held close *is* rides along as `confirm_close::Subject`, which is
+  both the payload "Close" runs and the wording: `Subject::Tab { last: false }`
+  says "Close Tab?", and the last tab in the window (across every group) keeps
+  "Close Window?", because emptying the window is what actually shuts terra —
+  it then quits through the ordinary path, fade included. Cancelling closes
+  nothing and the next attempt asks again; approving a close the window
+  *survived* resets the gate, so the next busy tab gets its own question rather
+  than inheriting this answer. Only one close is ever pending: a second request
+  while the dialog is up is held like any other and cannot rewrite the subject.
+  IPC `Kill` (`terra kill`) is exempt: a remote controller means it, and a
   modal on a blocked client would deadlock an agent.
 - Palette actions (ids): `tab.new`, `tab.new.<name>`
   (one per config profile, label "New Tab: <name>", opens in the focused
