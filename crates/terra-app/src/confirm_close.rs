@@ -76,6 +76,25 @@ pub fn should_confirm(enabled: bool, foreground: &[Option<&str>]) -> bool {
             .any(|fg| fg.is_some_and(|command| !is_shell(command)))
 }
 
+/// Should closing *this tab* ask first?
+///
+/// A tab close is a window close in disguise when it is the last tab in the
+/// window (the last tab of the last group — `tab_count` counts every group's
+/// tabs, not the focused group's): the tabs path tears the window down without
+/// ever raising `close_requested`, so the red traffic light's dialog would
+/// never get a say. Same switch, same shell list, same `None` reading as
+/// [`should_confirm`] — this only adds the "is it the last one" question.
+///
+/// Closing a tab that is *not* the last is deliberately never held back. Some
+/// terminals ask there too; terra does not, because a window that survives the
+/// close still shows every other session and the cost of a mistake is one tab,
+/// not the workspace. This is scope, not an oversight — widening it means
+/// giving the dialog per-tab wording ("Close Tab?"), not just relaxing this
+/// condition.
+pub fn should_confirm_tab_close(enabled: bool, tab_count: usize, foreground: Option<&str>) -> bool {
+    tab_count == 1 && should_confirm(enabled, &[foreground])
+}
+
 // ---------------------------------------------------------------------------
 // The state machine
 // ---------------------------------------------------------------------------
@@ -455,6 +474,50 @@ mod tests {
         assert!(!should_confirm(true, &[None, Some("zsh")]));
         // …but a known one alongside it still is.
         assert!(should_confirm(true, &[None, Some("vim")]));
+    }
+
+    /// The bug this exists for: the lone tab running `claude` is the window,
+    /// and closing it must ask.
+    #[test]
+    fn closing_the_last_busy_tab_asks() {
+        assert!(should_confirm_tab_close(true, 1, Some("claude")));
+        assert!(should_confirm_tab_close(true, 1, Some("sleep")));
+    }
+
+    /// Any other tab close is out of scope: the window survives it.
+    #[test]
+    fn closing_a_tab_that_is_not_the_last_never_asks() {
+        assert!(!should_confirm_tab_close(true, 2, Some("claude")));
+        assert!(!should_confirm_tab_close(true, 7, Some("cargo")));
+    }
+
+    /// A lone idle prompt closes instantly, exactly as it always did.
+    #[test]
+    fn closing_the_last_idle_tab_never_asks() {
+        assert!(!should_confirm_tab_close(true, 1, Some("zsh")));
+        assert!(!should_confirm_tab_close(true, 1, Some("fish")));
+        // No answer from the process table is not evidence of work.
+        assert!(!should_confirm_tab_close(true, 1, None));
+    }
+
+    /// The same switch governs both doors.
+    #[test]
+    fn the_config_switch_also_wins_over_a_last_tab_close() {
+        assert!(!should_confirm_tab_close(false, 1, Some("claude")));
+    }
+
+    /// A tab close routed through the dialog and approved runs the close
+    /// itself, and the window close that follows from the empty window is not
+    /// questioned again.
+    #[test]
+    fn approving_a_last_tab_close_lets_the_window_close_follow() {
+        let mut confirm = ConfirmClose::default();
+        assert!(confirm.requested(|| true), "the tab close is held");
+        confirm.answer(Choice::Close);
+        // The close itself, then the empty-window close, then the fade's retry.
+        assert!(!confirm.requested(|| panic!("must not re-decide")));
+        assert!(!confirm.requested(|| panic!("must not re-decide")));
+        assert!(!confirm.requested(|| panic!("must not re-decide")));
     }
 
     /// The happy path: ask, say yes, and the close that follows is not
