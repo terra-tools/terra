@@ -118,7 +118,7 @@ pub const TRANSCRIPT_KB_MAX: usize = 65_536;
 /// can still read another pane's scrollback without taking the keyboard from
 /// the one you are typing in.
 pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = true;
-/// Ask before closing a window that is running something.
+/// Ask before closing a window — or a tab — that is running something.
 ///
 /// On by default, and Ghostty's default too: the red button sits a few pixels
 /// from the tab bar's `×`, ⌘Q sits next to ⌘W, and either mistake takes down
@@ -126,10 +126,11 @@ pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = true;
 /// halfway through a task. A terminal has no unsaved-document machinery to
 /// recover from that, so the one cheap protection is a question.
 ///
-/// Deliberately *not* a question every time: a window whose tabs are all
-/// sitting at a bare shell prompt protects nothing, and a dialog there is pure
-/// nagging that trains the reflex to dismiss it. See
-/// [`crate::confirm_close::should_confirm`]. `false` never asks at all.
+/// Deliberately *not* a question every time: a window (or tab) sitting at a
+/// bare shell prompt protects nothing, and a dialog there is pure nagging that
+/// trains the reflex to dismiss it. See
+/// [`crate::confirm_close::should_confirm`]. The one switch governs every
+/// door — window closes and tab closes alike; `false` never asks at all.
 pub const DEFAULT_WINDOW_CONFIRM_CLOSE: bool = true;
 /// Autodetect the paragraph direction per row.
 ///
