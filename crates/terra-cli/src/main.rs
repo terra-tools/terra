@@ -214,7 +214,7 @@ enum Command {
         command: Vec<String>,
     },
 
-    /// Close a tab (kills its PTY)
+    /// Close a tab (kills its PTY; never asks, even for the last tab)
     Kill {
         /// Numeric tab id (from `terra ls`)
         tab: u64,

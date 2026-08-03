@@ -1262,11 +1262,9 @@ impl TabManager {
         true
     }
 
-    pub fn close_active(&mut self) {
-        if let Some(id) = self.active_id() {
-            self.close(id);
-        }
-    }
+    // (No `close_active` wrapper: the app resolves the active id itself, so
+    // it can ask the last-tab question before the close happens — see
+    // `App::close_tab`.)
 
     pub fn clear(&mut self) {
         self.tabs.clear();

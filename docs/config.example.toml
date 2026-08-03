@@ -93,6 +93,11 @@ transcript_kb = 512
 # Ghostty's rule, and it is what keeps the question meaningful instead of
 # training you to hit Return without reading it.
 #
+#
+# Closing the last tab (its ✕, ⌘W, the palette) closes the window too, so it
+# asks the same question. Any other tab closes without one, and `terra kill`
+# never asks at all.
+#
 # Set this to false to never ask.
 confirm_close = true
 

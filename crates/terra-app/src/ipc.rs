@@ -511,6 +511,13 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
                 Err(err) => Response::err(err),
             }
         }
+        // Deliberately *not* routed through the "Close Window?" dialog the
+        // in-window doors use for a last tab (`App::close_tab`). `terra kill`
+        // is a remote controller saying close, and it means it: this runs on
+        // an IPC thread with the client blocked on the reply, so raising a GUI
+        // modal would hang the caller until a human answered it — which for
+        // the agents that drive terra is a deadlock, not a safeguard. The CLI
+        // help says so.
         Request::Kill { tab } => {
             if tabs.close(tab) {
                 Response::ok()

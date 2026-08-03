@@ -82,6 +82,16 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   abandons the close entirely (the next attempt asks again), Return / Close
   approves it and every request from then on — including the one the fade
   re-issues — passes straight through.
+- Closing the *last tab* is the same close wearing tab clothes, and gets the
+  same dialog: `TabManager::close` raises no `close_requested`, so
+  `App::close_tab` asks first via `should_confirm_tab_close` (tab count 1
+  across all groups + the same shell list, switch and procinfo path). Every
+  in-window door goes through it — the tab's ✕, a middle-click on it, ⌘W and
+  the palette's `tab.close`. Approving runs the held close (`pending_tab_close`)
+  and the emptied window quits through the ordinary path, fade included;
+  cancelling closes nothing. Closing a tab that is *not* the last never asks.
+  Neither does IPC `Kill` (`terra kill`): a remote controller means it, and a
+  modal on a blocked client would deadlock an agent.
 - Palette actions (ids): `tab.new`, `tab.new.<name>`
   (one per config profile, label "New Tab: <name>", opens in the focused
   group), `tab.close`, `tab.rename` (opens prompt
