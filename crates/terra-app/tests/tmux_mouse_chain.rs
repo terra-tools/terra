@@ -163,22 +163,46 @@ fn click(pos: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
 }
 
 /// Pump frames until tmux has forwarded the inner program's mouse-mode request
-/// upstream *and* the painted page is on the grid. Returns the modes tmux
-/// negotiated toward terra.
+/// upstream *and* the painted page is on the grid *and* the grid has stopped
+/// changing. Returns the modes tmux negotiated toward terra.
+///
+/// The stillness wait matters: the marker showing up does not mean tmux is
+/// done drawing. The PTY starts at a default size and the first frame resizes
+/// it, so the tmux server repaints the pane asynchronously — on a loaded CI
+/// runner that redraw can land *after* the marker is already visible. Any
+/// repaint touching the dragged row clears the selection alacritty holds
+/// (EL/ED drop selections on the rows they clear), so a drag started before
+/// the chain settles can end with an empty selection through no fault of
+/// terra's. Waiting until the grid holds still for a stretch closes that race.
 fn ready(ctx: &egui::Context, backend: &mut TerminalBackend) -> TerminalMode {
     let deadline = Instant::now() + Duration::from_secs(30);
+    /// Frames (20 ms apart) the grid must hold still once the marker is up.
+    const STILL_FRAMES: u32 = 10;
+    let mut last_screen = String::new();
+    let mut still = 0u32;
     frame(ctx, backend, Vec::new(), Modifiers::NONE);
     loop {
         let mode = backend.sync().terminal_mode;
-        if mode.intersects(TerminalMode::MOUSE_MODE) && screen_text(backend).contains("SELECTME") {
-            return mode;
+        let screen = screen_text(backend);
+        if mode.intersects(TerminalMode::MOUSE_MODE) && screen.contains("SELECTME") {
+            if screen == last_screen {
+                still += 1;
+                if still >= STILL_FRAMES {
+                    return mode;
+                }
+            } else {
+                still = 0;
+            }
+        } else {
+            still = 0;
         }
         assert!(
             Instant::now() < deadline,
-            "the tmux chain never came up (mode {:?}); the grid holds {:?}",
+            "the tmux chain never settled (mode {:?}); the grid holds {:?}",
             mode,
-            screen_text(backend).trim_end()
+            screen.trim_end()
         );
+        last_screen = screen;
         std::thread::sleep(Duration::from_millis(20));
         frame(ctx, backend, Vec::new(), Modifiers::NONE);
     }
