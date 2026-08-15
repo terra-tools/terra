@@ -83,20 +83,6 @@ setup-signing:
 sign-server:
     uv run scripts/sign-server/sign_server.py
 
-# Is the signing tunnel up? 401 = healthy, 530/1033 = its host is asleep.
-sign-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    env=scripts/sign-server/.env
-    url=$(grep -E '^(SIGN_)?TUNNEL_URL=' "$env" | head -1 | cut -d= -f2- | tr -d "\"' ")
-    [ -n "$url" ] || { echo "no TUNNEL_URL in $env"; exit 1; }
-    code=$(curl -s -o /dev/null -w '%{http_code}' -A terra-release-sign/1.0 -X POST "${url%/}/sign")
-    case "$code" in
-      401) echo "${url%/}/sign -> 401 (healthy: up, secret required)" ;;
-      530|1033) echo "${url%/}/sign -> $code (tunnel down — is the host awake?)"; exit 1 ;;
-      *) echo "${url%/}/sign -> $code (unexpected — check the server)"; exit 1 ;;
-    esac
-
 # Bundle + sign + install to /Applications and the CLI to bin, e.g. `just install 1 ~/.local/bin`.
 # Signs with the stable terra-dev identity when present (see setup-signing),
 # else falls back to ad-hoc.

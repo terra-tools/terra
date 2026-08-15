@@ -8,9 +8,10 @@ Every release, in this order — each line has burned us once:
    release). On the Mac with the YubiKey plugged in: `just sign-server`, and
    keep the machine awake for the whole run — the v1.3.2 Windows job failed
    with Cloudflare 530/1033 because the tunnel's host was asleep. Smoke-test
-   from outside with `just sign-check`: it must print `401` (reachable, secret
-   required) — `530` means the tunnel is down. Ctrl+C the server when the run
-   is done.
+   from outside: `curl -s -o /dev/null -w '%{http_code}' -A
+   terra-release-sign/1.0 -X POST <TUNNEL_URL>/sign` must print `401`
+   (reachable, secret required) — `530` means the tunnel is down. Ctrl+C the
+   server when the run is done.
 2. **Bump the workspace version** in the root `Cargo.toml` (one place; every
    crate inherits it) and let `cargo check` refresh `Cargo.lock`.
 3. **Branch, commit, open a PR** titled in the house style:
