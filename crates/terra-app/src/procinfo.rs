@@ -1070,16 +1070,24 @@ mod tests {
     fn a_child_process_is_reported_instead_of_its_parent() {
         // This is the behaviour the feature exists for: the shell is not the
         // interesting process once it has spawned something.
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("5")
+        //
+        // The question is asked of a shell of this test's own, not of the test
+        // binary: `cargo test` runs the cases in this binary in parallel, so
+        // the deepest descendant of the *test process* is whatever some other
+        // case happened to spawn — which is how this asserted `sleep` and got
+        // `bash` on a busy CI runner. `&& true` keeps the shell from exec'ing
+        // sleep in place of itself, which would leave nothing below it.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5 && true"])
             .spawn()
-            .expect("/bin/sleep exists on every macOS install");
+            .expect("/bin/sh exists on every macOS install");
+        let shell_pid = child.id();
 
-        // `spawn` returns once fork+exec is under way; the exec that renames the
-        // process from the test binary to `sleep` can land a moment later.
+        // `spawn` returns once fork+exec is under way; the shell's own fork and
+        // the exec that renames that child to `sleep` land a moment later.
         let mut name = None;
-        for _ in 0..50 {
-            name = foreground_command(std::process::id());
+        for _ in 0..100 {
+            name = foreground_command(shell_pid);
             if name.as_deref() == Some("sleep") {
                 break;
             }
