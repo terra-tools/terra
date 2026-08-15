@@ -1524,9 +1524,27 @@ impl TreeFrame<'_> {
             if grid.width() > 1.0 && grid.height() > 1.0 {
                 let mut term_ui = col_ui.new_child(egui::UiBuilder::new().max_rect(grid));
                 term_ui.set_clip_rect(column);
+                // The overlay scrollbar shares this layer with the terminal,
+                // and egui only occludes across layers — so the terminal is
+                // told which strip is not its to take presses in. `hit_area`
+                // is the same helper the scrollbar senses with, applied to
+                // the same rect it is about to be given below.
+                //
+                // `scrollbar::show` runs after the view is added (the thumb
+                // has to win the hit test), so this can only ask what the
+                // scrollbar owned on the *previous* frame — see
+                // `ScrollbarState::interactive`. `None` while the thumb is
+                // hidden, or the rightmost ~11px of every pane would stop
+                // selecting text.
+                let exclusion = self
+                    .scrollbars
+                    .get(&group)
+                    .is_some_and(scrollbar::ScrollbarState::interactive)
+                    .then(|| scrollbar::hit_area(grid));
                 // Only the focused group's view takes the keyboard; the
                 // palette beats them all.
                 let view = TerminalView::new(&mut term_ui, &mut tab.backend)
+                    .set_pointer_exclusion(exclusion)
                     .set_focus(!self.env.modal_open && focused)
                     .set_theme(terminal_theme())
                     .set_font(self.env.font.clone())

@@ -155,7 +155,12 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   `drain_pty_events` turns into `ctx.copy_text`, both `ClipboardType`s onto the
   one macOS pasteboard. The read direction (`ESC]52;c;?`) is refused inside
   egui_term: it would hand this Mac's clipboard to whatever is on the far end of
-  an ssh connection.
+  an ssh connection. A drag held past the top or bottom edge scrolls the
+  viewport and keeps extending the selection into the scrollback — a per-frame
+  *poll* of the pointer, since a pointer outside the view's rect delivers no
+  events to it at all (PATCHES 16); the alternate screen is excluded, and the
+  overlay scrollbar's strip is excluded from presses so the two never fight
+  over the viewport.
 - Drag & drop: a pill dragged within a bar reorders that bar; dropped on
   another group's bar it *moves* there (slot under the cursor, becomes that
   group's active tab); dropped on a terminal it splits — four drop zones per

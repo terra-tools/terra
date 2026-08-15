@@ -59,6 +59,12 @@ receive every click themselves and copy nothing back, so a plain drag inside one
 selects nothing. Hold **⇧ Shift** (or **⌥ Option**) while dragging to select in
 Terra itself, then `⌘C` to copy. That works in every program, tmux included.
 
+A selection is not limited to what is on screen: keep dragging past the top or
+bottom edge and the view scrolls with you, faster the further out you go, and
+the selection keeps growing into the scrollback. Full-screen programs (vim,
+`less`, tmux's own copy mode) run on the alternate screen, which has no
+scrollback, so there the view stays put and only the selection follows.
+
 ## Splits and the mouse
 
 Split the window (`⌘\`) and the pointer picks the pane: move the mouse into a

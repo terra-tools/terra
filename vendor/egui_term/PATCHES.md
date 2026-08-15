@@ -338,6 +338,145 @@
     map now pins `TERM=xterm-256color` (what terra emulates and documents)
     and `COLORTERM=truecolor`.
 
+16. view.rs `TerminalViewState` + the new `TerminalView::drag_autoscroll`:
+    **a selection drag that runs past the edge scrolls the viewport**. Upstream
+    extended a selection only from `PointerMoved`, and item 14's `accepts`
+    routes pointer events by hover — correctly, since only one pane may own the
+    mouse — so a drag that left the rect got no more events and the selection
+    froze at the last visible row. Selecting more than one screenful was
+    therefore impossible: the user had to release, wheel, and drag again from
+    scratch — losing what they had, since a fresh press starts a fresh
+    `Selection` — or give up. iTerm2 and Ghostty both scroll while the button is
+    held and keep extending into what comes into view, which is what every text
+    editor does and what the gesture means.
+
+    The fix cannot be an event handler, because the missing events are the
+    whole problem. `drag_autoscroll` runs once per frame between `process_input`
+    and `show` and **polls** `i.pointer` — `latest_pos()` and `primary_down()`,
+    plain input state that a headless test can drive with synthetic
+    `PointerMoved` plus a held `PointerButton`. It acts only when
+    `state.is_dragged`, the latch that `process_left_button_pressed` sets on
+    terra's own selection path and never on a reported press (item 13), so
+    mouse-mode drags, the wheel and the scrollbar are untouched.
+
+    Per frame, in order: a button that is no longer down clears the latch; a
+    pointer past the top or bottom edge emits `BackendCommand::ScrollViewport`
+    towards it; and a pointer outside the rect at all emits `SelectUpdate` at the
+    nearest position *inside* it. The clamp is on both axes — `visual_cell_at`
+    converts with `as usize`, so a negative x would wrap to an enormous column,
+    and clamping x also gives the natural "drag out to the side to take the
+    whole line". Nothing tracks the selection across the scroll because nothing
+    has to: the anchors are absolute grid lines and `update_selection` re-reads
+    `display_offset` every call, so scroll-then-update extends into the newly
+    revealed rows for free. Over-scrolling is free too — `Grid::scroll_display`
+    clamps at both ends of the history.
+
+    Two details that are easy to get wrong:
+
+    * **Pacing is wall-clock, and it ramps.** `autoscroll_lines_per_tick` is
+      zero for the first half cell past the edge, then eases in (quadratically)
+      over four cells to a ceiling of 5 lines per 1/60 s tick — 300 lines/s,
+      the same cap xterm.js uses. The dead zone matters because the view is
+      inset a few pixels inside its pane, so without it a pointer resting in
+      that gutter already scrolls; the ramp matters because the commonest
+      gesture is nudging a hair past the last row to catch one more line, and a
+      flat rate flings several screens past it before the hand reacts. The
+      frame's `stable_dt` (capped at 100 ms, so a stalled frame cannot fling the
+      viewport) buys a fractional number of ticks whose remainder carries in
+      `state.autoscroll_lines`, so a 120 Hz display scrolls at the same speed as
+      a 60 Hz one. Because repaints here are reactive and a pointer held still
+      outside the rect produces no events whatsoever, the poll also asks for a
+      repaint in 16 ms while it is scrolling — without that the drag stalls
+      after one frame. At either end of the history it stops asking, so a drag
+      parked there goes idle instead of spinning the repaint loop; likewise the
+      `SelectUpdate` is skipped when neither the viewport nor the pointer moved.
+    * **The alternate screen is excluded from the scrolling half.** Under
+      `ALTERNATE_SCROLL | ALT_SCREEN` the backend's `scroll` types arrow keys
+      into the PTY instead of moving the viewport, so an autoscroll inside vim
+      would walk the user's cursor — and their file — around while they were
+      merely selecting text. The `SelectUpdate` half still runs there. The gate
+      is checked twice, deliberately: the view checks `ALT_SCREEN` alone against
+      the previous frame's snapshot (the alternate grid has no scrollback, so
+      the wider test costs nothing), and because a program can enter the
+      alternate screen *between* frames, the command it sends is the new
+      `BackendCommand::ScrollViewport`, which re-checks the live mode and moves
+      the viewport or does nothing — it can never fall through to the arrow
+      keys.
+
+    Two releases the event path never saw are cleaned up by the same poll.
+    A selection drag released *outside* the rect never reached
+    `process_left_button_released`, so `is_dragged` stayed set and a later
+    pointer move, no button held, resumed extending the abandoned selection;
+    and a *reported* drag released outside left `is_reported_press` set and,
+    worse, left the program believing the button was still down, having been
+    told about the press but never the release — so the poll sends that release
+    report itself. Only those latches are cleared here: the double/triple-click
+    re-select in `process_left_button_released` belongs to a click that ended
+    inside the view and stays there. The poll also sits out while the view is
+    unfocused (a modal is up), matching what `process_input` routes, and falls
+    back to the last known position when `PointerGone` nulls `latest_pos` with
+    the button still down.
+
+    Guarded by `crates/terra-app/tests/drag_autoscroll.rs` and the
+    `autoscroll_rate_tests` unit tests in view.rs.
+
+17. backend/mod.rs `TerminalBackend::selectable_content`: **a copy is built by
+    the terminal, not by walking the visible cells**. Upstream assembled the
+    clipboard string itself — `for indexed in grid.display_iter()`, push
+    `indexed.c` wherever the selection range contained the point — and that
+    one loop got four things wrong at once. No newline was ever emitted, so a
+    multi-row copy pasted as a single run-on line that only *looked* wrapped
+    wherever the receiving app happened to break it. Every row arrived padded
+    with the blanks the grid blanks it out to, so each line dragged a tail of
+    spaces behind it. The second cell of a double-width character
+    (`WIDE_CHAR_SPACER`) was copied as a character, putting a space after
+    every CJK glyph. And `display_iter` walks the *viewport*: anything the
+    selection reached in scrollback was dropped without a trace — which item
+    16 turned from a corner case into the common one, since a drag past the
+    edge now scrolls and a selection is routinely mostly off screen by the
+    time the button comes up.
+
+    All four are already solved upstream of us. `Term::selection_to_string`
+    indexes the grid by absolute `Point`, so history is included; it trims
+    each row's trailing blanks; it withholds the row's newline when the row
+    ends in `WRAPLINE`, so a soft-wrapped line pastes back as the one line
+    the user typed rather than as fragments a shell would run separately; it
+    skips both spacer flags and picks up the zero-width marks a cell carries;
+    it collapses the cells a tab covered; and it takes the rectangular path
+    for `SelectionType::Block` (a `line_to_string` per row over the same
+    column range, newline-joined) which we could not have written ourselves
+    anyway, `line_to_string` being private. So the function is now one line
+    that locks the term and asks it. Reading the live `Term` rather than
+    `last_content` also means a copy describes the selection as it is, not as
+    of the last `sync`; the lock is safe from every caller — view.rs's
+    `Event::Copy` arm and the app both call it outside `process_command`
+    /`sync`, which are the only places the term lock is held.
+
+    Guarded by `crates/terra-app/tests/copy_selection.rs`.
+
+18. view.rs `TerminalView::set_pointer_exclusion` + the guard in
+    `process_input`: **a widget drawn on top of the terminal keeps its own
+    clicks**. egui's hit test only occludes widgets *across* layers, so terra's
+    overlay scrollbar — painted into the terminal's own layer, flush to its
+    right edge — left `contains_pointer` true for both of them: a press on the
+    thumb also started a text selection underneath it, and once item 16's
+    drag-autoscroll existed, hauling the thumb up past the top edge set the
+    poll issuing its own scroll deltas behind the scrollbar's back, so the
+    viewport ran away from the thumb under a bogus selection. The caller now
+    passes the screen-space strip its overlay owns, and `process_input` drops
+    `egui::Event::PointerButton` inside it — `None` while the overlay is
+    hidden, or the rightmost pixels of every pane would stop being selectable
+    text. Only buttons are filtered: motion still goes through, so a selection
+    begun elsewhere keeps extending as the pointer crosses the strip, and
+    blocking the press alone is enough to leave `is_dragged` false and the
+    autoscroll asleep. terra wires it from `scrollbar::hit_area` gated on
+    `ScrollbarState::interactive`, which is necessarily the *previous* frame's
+    answer — the thumb has to be added after the view to win the hit test — and
+    that lag is harmless because a pointer merely resting over the strip
+    already reveals a hidden thumb a frame before any button goes down.
+
+    Guarded by `crates/terra-app/tests/scrollbar_selection.rs`.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to
