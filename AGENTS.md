@@ -50,6 +50,10 @@ tasks (`just pre-commit` before committing).
 - No `cargo fmt --all` — vendor/egui_term and terra-protocol carry drift;
   fmt only the crates you touched (match CI's gate).
 - Every `vendor/egui_term` change gets an entry in its `PATCHES.md`.
+- `just` recipes stay one-liners that call something. A recipe growing a
+  `#!/usr/bin/env bash` body with parsing and branching is a script — put it in
+  `scripts/` if it is worth keeping, and if it is only a curl, leave it in the
+  docs as a curl.
 
 ## Orchestration
 
