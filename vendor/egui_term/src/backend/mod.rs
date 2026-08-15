@@ -41,6 +41,13 @@ pub type ClipboardType = term::ClipboardType;
 pub enum BackendCommand {
     Write(Vec<u8>),
     Scroll(i32),
+    /// terra patch: move the viewport and nothing else — never the
+    /// alternate-scroll fallback that types arrow keys at the program. Used by
+    /// drag-autoscroll, which decides whether to scroll from the *previous*
+    /// frame's snapshot: between then and now the program may have entered the
+    /// alternate screen, and a plain `Scroll` would then walk vim's cursor
+    /// around under a user who is only selecting text. See PATCHES 16.
+    ScrollViewport(i32),
     Resize(Size, Size),
     SelectStart(SelectionType, f32, f32),
     SelectUpdate(f32, f32),
@@ -354,6 +361,11 @@ impl TerminalBackend {
             BackendCommand::Scroll(delta) => {
                 self.scroll(&mut term, delta);
             }
+            BackendCommand::ScrollViewport(delta) => {
+                if delta != 0 && !term.mode().contains(TermMode::ALT_SCREEN) {
+                    term.grid_mut().scroll_display(Scroll::Delta(delta));
+                }
+            }
             BackendCommand::Resize(layout_size, font_size) => {
                 self.resize(&mut term, layout_size, font_size);
             }
@@ -400,17 +412,26 @@ impl TerminalBackend {
         (line, col)
     }
 
+    /// The selected text, exactly as it should land on the clipboard.
+    ///
+    /// terra patch: this used to walk `display_iter()` and push every cell
+    /// the range contained, which got four things wrong at once — no
+    /// newlines between rows, the padding spaces every row is blanked out
+    /// to, the second half of every double-width char, and nothing at all
+    /// from scrollback, because `display_iter` only ever walks the visible
+    /// viewport. Now that a drag autoscrolls, a selection routinely reaches
+    /// rows that are off screen by the time the button comes up.
+    ///
+    /// alacritty already solves all of it: `Term::selection_to_string`
+    /// indexes the grid by absolute `Point`, so history is included; it
+    /// trims each row's trailing blanks; it withholds the newline on a row
+    /// ending in `WRAPLINE`, so a soft-wrapped line copies back as the one
+    /// line the user typed; it skips `WIDE_CHAR_SPACER` cells; and it takes
+    /// the rectangular path for a block selection. Reaching for the live
+    /// `Term` rather than `last_content` also means the copy describes the
+    /// selection as it is now, not as of the last `sync`.
     pub fn selectable_content(&self) -> String {
-        let content = self.last_content();
-        let mut result = String::new();
-        if let Some(range) = content.selectable_range {
-            for indexed in content.grid.display_iter() {
-                if range.contains(indexed.point) {
-                    result.push(indexed.c);
-                }
-            }
-        }
-        result
+        self.term.lock().selection_to_string().unwrap_or_default()
     }
 
     pub fn sync(&mut self) -> &RenderableContent {
@@ -503,7 +524,10 @@ impl TerminalBackend {
     /// a permanently-blurred UI, which looks like a missing background
     /// rather than a missing escape sequence.
     pub fn set_focused(&mut self, focused: bool) {
-        let enabled = self.last_content.terminal_mode.contains(TermMode::FOCUS_IN_OUT);
+        let enabled = self
+            .last_content
+            .terminal_mode
+            .contains(TermMode::FOCUS_IN_OUT);
         let Some(report) = focus_report(enabled, focused, self.reported_focus)
         else {
             if !enabled {

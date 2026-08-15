@@ -29,6 +29,20 @@ const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 const CURSOR_BEAM_WIDTH: f32 = 1.5;
 /// Cursor blink cadence: visible for one interval, hidden for the next.
 const CURSOR_BLINK_INTERVAL: f64 = 0.55;
+/// terra patch: drag-autoscroll pacing. One *tick* is the unit the line rate
+/// below is quoted in; elapsed wall-clock time is divided by it, so the scroll
+/// runs at the same speed on a 120 Hz display as on a 60 Hz one.
+const AUTOSCROLL_TICK: f32 = 1.0 / 60.0;
+/// Nothing moves until the pointer is this far past the edge, in cells: the
+/// view is inset a few pixels from the pane, so without a dead zone a pointer
+/// resting in that gutter would already be scrolling.
+const AUTOSCROLL_DEAD_ZONE_CELLS: f32 = 0.5;
+/// Distance past the dead zone, in cells, at which the rate reaches its
+/// ceiling.
+const AUTOSCROLL_RAMP_CELLS: f32 = 4.0;
+/// Ceiling: 5 lines per tick is 300 lines/s — what xterm.js caps at, and slow
+/// enough that a long scrollback cannot be flung past in a flick.
+const AUTOSCROLL_MAX_LINES: f32 = 5.0;
 
 #[derive(Debug, Clone)]
 enum InputAction {
@@ -44,6 +58,14 @@ pub struct TerminalViewState {
     /// its release must go there too. See `process_left_button`.
     is_reported_press: bool,
     scroll_pixels: f32,
+    /// terra patch: lines owed to drag-autoscroll but not yet whole, carried
+    /// across frames so the scroll runs on wall-clock time rather than at the
+    /// display's refresh rate. See `drag_autoscroll`.
+    autoscroll_lines: f32,
+    /// terra patch: the last pointer position drag-autoscroll extended the
+    /// selection to, so a pointer held still re-anchors nothing. Also the
+    /// fallback when `latest_pos` goes `None` (`PointerGone`) mid-drag.
+    autoscroll_pos: Option<Pos2>,
     current_mouse_position_on_grid: TerminalGridPoint,
 }
 
@@ -59,6 +81,9 @@ pub struct TerminalView<'a> {
     bidi: bool,
     /// terra patch: the paragraph direction rows resolve against.
     bidi_base: BidiBase,
+    /// terra patch: screen-space rect where pointer buttons belong to a
+    /// widget drawn on top of this one. See `set_pointer_exclusion`.
+    pointer_exclusion: Option<Rect>,
 }
 
 impl Widget for TerminalView<'_> {
@@ -76,6 +101,7 @@ impl Widget for TerminalView<'_> {
         self.focus(&layout)
             .resize(&layout)
             .process_input(&layout, &mut state)
+            .drag_autoscroll(&layout, &mut state)
             .show(&mut state, &layout, &painter);
 
         ui.memory_mut(|m| m.data.insert_temp(widget_id, state));
@@ -101,7 +127,24 @@ impl<'a> TerminalView<'a> {
             bindings_layout: BindingsLayout::new(),
             bidi: true,
             bidi_base: BidiBase::default(),
+            pointer_exclusion: None,
         }
+    }
+
+    /// terra patch: a rect, in screen space, where pointer buttons are not
+    /// the terminal's to take.
+    ///
+    /// egui's hit test only occludes widgets *across* layers
+    /// (`hit_test.rs`), so a scrollbar painted over the terminal in the same
+    /// layer leaves `contains_pointer` true for both: a press on the thumb
+    /// started a text selection underneath it, and once autoscroll existed,
+    /// dragging the thumb past the edge of the view had the two of them
+    /// fighting over the viewport. The caller passes the strip its overlay
+    /// owns — `None` while that overlay is hidden.
+    #[inline]
+    pub fn set_pointer_exclusion(mut self, rect: Option<Rect>) -> Self {
+        self.pointer_exclusion = rect;
+        self
     }
 
     #[inline]
@@ -197,6 +240,17 @@ impl<'a> TerminalView<'a> {
             if !accepts(&event, hovered, focused) {
                 continue;
             }
+            // terra patch: a widget painted *over* the terminal (the overlay
+            // scrollbar) still leaves the terminal "hovered" — egui's hit test
+            // only occludes across layers, not within one — so without this a
+            // press on the thumb also started a text selection underneath, and
+            // dragging the thumb past the edge set autoscroll fighting the
+            // scrollbar for the viewport. See `set_pointer_exclusion`.
+            if let egui::Event::PointerButton { pos, .. } = event {
+                if self.pointer_exclusion.is_some_and(|r| r.contains(pos)) {
+                    continue;
+                }
+            }
             let mut input_actions = vec![];
 
             match event {
@@ -276,6 +330,177 @@ impl<'a> TerminalView<'a> {
                 }
             }
         }
+
+        self
+    }
+
+    /// terra patch: keep a selection drag alive past the edges of the view.
+    ///
+    /// This is a **poll**, not an event handler, and it has to be: `accepts`
+    /// only routes `PointerMoved` / `PointerButton` to a view the pointer is
+    /// over, so the moment the drag leaves the rect the events stop — the
+    /// selection freezes, and even the release goes missing. Every frame in
+    /// which a button is still held we read the pointer's raw state instead
+    /// (plain `i.pointer`, which a headless test can drive with synthetic
+    /// events), and act on it:
+    ///
+    /// * **The button is up.** The gesture is over, whatever owned it. That
+    ///   closes two latent bugs from releases the event path never saw: a
+    ///   selection drag stayed latched, so a later pointer move — no button
+    ///   held — went on extending it; and a *reported* drag left the program
+    ///   believing the button was still down, having been told about the
+    ///   press but never the release. The double/triple-click re-select in
+    ///   `process_left_button_released` is deliberately not repeated here: it
+    ///   belongs to a click that ended *inside* the view.
+    /// * **The pointer is past the top or bottom edge.** Scroll towards it,
+    ///   the way iTerm2 and Ghostty (and every text editor) do, at a rate
+    ///   that ramps up with distance — see `autoscroll_lines_per_tick`.
+    /// * **The pointer is outside the rect at all.** Extend the selection to
+    ///   the nearest point inside it, so dragging out to the left or right
+    ///   selects to the start or end of the line rather than doing nothing.
+    ///
+    /// The selection needs no bookkeeping to survive the scroll: its anchors
+    /// are absolute grid lines and `update_selection` re-reads `display_offset`
+    /// on every call, so scroll-then-`SelectUpdate` extends into the content
+    /// that just came into view.
+    ///
+    /// **Alternate screen is excluded.** `BackendCommand::Scroll` under
+    /// `ALTERNATE_SCROLL | ALT_SCREEN` types arrow keys into the PTY instead of
+    /// moving the viewport, and an autoscroll that walks vim's cursor around
+    /// while the user is selecting text would be a data-loss bug. The gate
+    /// here is `ALT_SCREEN` alone — deliberately wider than the backend's own
+    /// condition, since the alternate grid has no scrollback to move anyway.
+    fn drag_autoscroll(
+        self,
+        layout: &Response,
+        state: &mut TerminalViewState,
+    ) -> Self {
+        if !state.is_dragged && !state.is_reported_press {
+            return self;
+        }
+
+        let (pointer, primary_down, dt, modifiers) = layout.ctx.input(|i| {
+            (
+                i.pointer.latest_pos(),
+                i.pointer.primary_down(),
+                i.stable_dt,
+                i.modifiers,
+            )
+        });
+
+        if !primary_down {
+            let orphan_release = state.is_reported_press;
+            state.is_dragged = false;
+            state.is_reported_press = false;
+            state.autoscroll_lines = 0.0;
+            state.autoscroll_pos = None;
+            if orphan_release {
+                self.backend.process_command(BackendCommand::MouseReport(
+                    MouseButton::LeftButton,
+                    modifiers,
+                    state.current_mouse_position_on_grid,
+                    false,
+                ));
+            }
+            return self;
+        }
+
+        // Past here it is only terra's own selection drag: a reported drag
+        // belongs to the program, which gets motion through `process_input`.
+        // An unfocused view (a modal is up, or another pane took focus) sits
+        // out too, matching what `process_input` routes.
+        if !state.is_dragged || !layout.has_focus() {
+            return self;
+        }
+
+        // `PointerGone` clears the position but leaves the button down; keep
+        // scrolling towards wherever the pointer was last seen.
+        let Some(pos) = pointer.or(state.autoscroll_pos) else {
+            return self;
+        };
+        let rect = layout.rect;
+        if rect.contains(pos) {
+            // Inside the view the ordinary `PointerMoved` path owns the drag.
+            state.autoscroll_lines = 0.0;
+            state.autoscroll_pos = None;
+            return self;
+        }
+
+        let (cell_height, alt_screen, offset, history) = {
+            let content = self.backend.last_content();
+            (
+                (content.terminal_size.cell_height as f32).max(1.0),
+                content.terminal_mode.contains(TermMode::ALT_SCREEN),
+                content.grid.display_offset(),
+                content.grid.history_size(),
+            )
+        };
+
+        // Positive = the viewport moves up into scrollback, matching
+        // `BackendCommand::Scroll`.
+        let (overshoot, direction) = if pos.y < rect.top() {
+            (rect.top() - pos.y, 1)
+        } else if pos.y > rect.bottom() {
+            (pos.y - rect.bottom(), -1)
+        } else {
+            (0.0, 0)
+        };
+        // At either end of the history there is nothing left to scroll, and a
+        // drag parked there must go idle rather than spin the repaint loop.
+        let room = match direction {
+            1 => offset < history,
+            -1 => offset > 0,
+            _ => false,
+        };
+
+        let mut scrolled = false;
+        if room && !alt_screen {
+            // Wall-clock pacing: a frame worth `dt` seconds is worth
+            // `dt / AUTOSCROLL_TICK` ticks, and the leftover fraction is kept
+            // for the next frame so slow and fast displays scroll alike. `dt`
+            // is capped so a stalled frame cannot fling the viewport.
+            let per_tick = autoscroll_lines_per_tick(overshoot, cell_height);
+            state.autoscroll_lines += per_tick * dt.min(0.1) / AUTOSCROLL_TICK;
+            let whole = state.autoscroll_lines.floor();
+            state.autoscroll_lines -= whole;
+            if whole >= 1.0 {
+                // `ScrollViewport`, not `Scroll`: the alt-screen gate above
+                // reads the previous frame's snapshot, and a program that
+                // entered the alternate screen in between must not have
+                // arrow keys typed at it. The backend re-checks live.
+                self.backend.process_command(BackendCommand::ScrollViewport(
+                    whole as i32 * direction,
+                ));
+                scrolled = true;
+            }
+            if per_tick > 0.0 {
+                // Repaint policy is reactive, and a pointer held still outside
+                // the rect produces no events at all — without this the drag
+                // stalls.
+                layout.ctx.request_repaint_after(
+                    std::time::Duration::from_millis(16),
+                );
+            }
+        } else {
+            state.autoscroll_lines = 0.0;
+        }
+
+        // Nothing moved and the pointer has not moved either: leave the
+        // selection where it is instead of re-anchoring it every frame.
+        if !scrolled && state.autoscroll_pos == Some(pos) {
+            return self;
+        }
+        state.autoscroll_pos = Some(pos);
+
+        // Clamped into the rect on both axes: `visual_cell_at` casts pixels
+        // with `as usize`, which would wrap a negative x into an enormous
+        // column. `track_grid_position` also keeps the cached grid point in
+        // step, which is what link hover and mouse reports read.
+        let inside = rect.clamp(pos);
+        let (cursor_x, cursor_y) =
+            track_grid_position(state, layout, self.backend, inside);
+        self.backend
+            .process_command(BackendCommand::SelectUpdate(cursor_x, cursor_y));
 
         self
     }
@@ -461,10 +686,7 @@ impl<'a> TerminalView<'a> {
                                 ),
                                 Vec2::splat(side),
                             ),
-                            Rect::from_min_max(
-                                Pos2::ZERO,
-                                Pos2::new(1.0, 1.0),
-                            ),
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             egui::Color32::WHITE,
                         ));
                         continue;
@@ -952,6 +1174,8 @@ fn process_left_button_released(
     modifiers: &Modifiers,
 ) -> InputAction {
     state.is_dragged = false;
+    state.autoscroll_lines = 0.0;
+    state.autoscroll_pos = None;
     if layout.double_clicked() || layout.triple_clicked() {
         InputAction::BackendCall(build_start_select_command(layout, position))
     } else {
@@ -998,6 +1222,22 @@ fn build_start_select_command(
 /// Split out of `process_mouse_move` because the wheel needs the same answer
 /// on a view that gets no pointer events at all — an unfocused pane the
 /// cursor is merely hovering (see `accepts`).
+/// terra patch: drag-autoscroll rate, in lines per [`AUTOSCROLL_TICK`], for a
+/// pointer `overshoot` pixels past the edge of the view.
+///
+/// Zero inside the dead zone, then eased in over [`AUTOSCROLL_RAMP_CELLS`] to
+/// the ceiling. A ramp rather than a flat rate because the common gesture is
+/// nudging a hair past the last line to catch one more row: every other
+/// terminal (and xterm.js, whose 300 lines/s ceiling this matches) starts
+/// slow there, and a flat rate would fling several screens past the target
+/// before the hand could react.
+fn autoscroll_lines_per_tick(overshoot: f32, cell_height: f32) -> f32 {
+    let cells = (overshoot / cell_height.max(1.0) - AUTOSCROLL_DEAD_ZONE_CELLS)
+        .max(0.0);
+    let ramp = (cells / AUTOSCROLL_RAMP_CELLS).min(1.0);
+    AUTOSCROLL_MAX_LINES * ramp * ramp
+}
+
 fn track_grid_position(
     state: &mut TerminalViewState,
     layout: &Response,
@@ -1062,6 +1302,36 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod autoscroll_rate_tests {
+    use super::{autoscroll_lines_per_tick, AUTOSCROLL_MAX_LINES};
+
+    const CELL: f32 = 17.0;
+
+    #[test]
+    fn a_hair_past_the_edge_does_not_scroll_at_all() {
+        assert_eq!(autoscroll_lines_per_tick(1.0, CELL), 0.0);
+        assert_eq!(autoscroll_lines_per_tick(CELL / 2.0, CELL), 0.0);
+    }
+
+    #[test]
+    fn the_rate_ramps_up_with_distance_and_stops_at_the_ceiling() {
+        let near = autoscroll_lines_per_tick(CELL, CELL);
+        let far = autoscroll_lines_per_tick(3.0 * CELL, CELL);
+        assert!(near > 0.0 && near < far, "{near} !< {far}");
+        assert!(far < AUTOSCROLL_MAX_LINES);
+        assert_eq!(
+            autoscroll_lines_per_tick(40.0 * CELL, CELL),
+            AUTOSCROLL_MAX_LINES
+        );
+    }
+
+    #[test]
+    fn a_zero_cell_height_cannot_divide_by_zero() {
+        assert!(autoscroll_lines_per_tick(100.0, 0.0).is_finite());
+    }
 }
 
 #[cfg(test)]

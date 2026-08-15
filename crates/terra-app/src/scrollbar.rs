@@ -112,6 +112,30 @@ pub fn fade(now: f64, last_activity: f64) -> f32 {
     }
 }
 
+/// The full-height column the thumb travels in, inside the terminal's `rect`.
+pub fn bar_rect(rect: Rect) -> Rect {
+    Rect::from_min_max(
+        pos2(rect.right() - EDGE_INSET - THUMB_WIDTH, rect.top()),
+        pos2(rect.right() - EDGE_INSET, rect.bottom()),
+    )
+}
+
+/// The strip the overlay owns: the bar plus a little slack on its left, out
+/// to the right edge of `rect` — a bit wider than 7 logical pixels is much
+/// easier to grab.
+///
+/// Defined once and used twice: [`show`] senses this rect, and the caller
+/// hands the same rect to `TerminalView::set_pointer_exclusion` so the
+/// terminal underneath ignores presses that belong to the thumb. If the two
+/// ever disagreed there would be a sliver that both widgets claim (a press
+/// that scrolls *and* starts a selection) or that neither does.
+pub fn hit_area(rect: Rect) -> Rect {
+    Rect::from_min_max(
+        pos2(bar_rect(rect).left() - EDGE_INSET, rect.top()),
+        rect.max,
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Drag {
     /// Pointer offset from the thumb's top edge when the drag started.
@@ -127,11 +151,30 @@ pub struct ScrollbarState {
     last_activity: f64,
     seen: bool,
     drag: Option<Drag>,
+    /// Whether the last [`show`] got as far as sensing and painting a thumb —
+    /// i.e. whether the strip was the scrollbar's to claim. Stored rather than
+    /// derived because the answer depends on the whole run of `show`
+    /// (scrollable, faded out, mid-drag), not on any one field.
+    interactive: bool,
 }
 
 impl ScrollbarState {
     fn note_activity(&mut self, now: f64) {
         self.last_activity = now;
+    }
+
+    /// Did the scrollbar own its strip on the frame just drawn?
+    ///
+    /// `show` runs *after* the `TerminalView` is added — the thumb has to be
+    /// painted and sensed last to win the hit test — so a caller wiring
+    /// `TerminalView::set_pointer_exclusion` can only ever consult the
+    /// previous frame. That one-frame lag is deliberate and harmless: the
+    /// pointer resting anywhere over the strip already counts as activity and
+    /// reveals a hidden thumb, so by the time a button goes down the state has
+    /// long since flipped; and the frame after the thumb fades out, the strip
+    /// goes back to being selectable text.
+    pub fn interactive(&self) -> bool {
+        self.interactive
     }
 }
 
@@ -150,12 +193,8 @@ pub fn show(ui: &mut Ui, rect: Rect, backend: &mut TerminalBackend, state: &mut 
         state.last_activity = now - HOLD_SECONDS - FADE_SECONDS;
     }
 
-    let bar = Rect::from_min_max(
-        pos2(rect.right() - EDGE_INSET - THUMB_WIDTH, rect.top()),
-        pos2(rect.right() - EDGE_INSET, rect.bottom()),
-    );
-    // A slightly wider strip is easier to grab than 7 logical pixels.
-    let hit_area = Rect::from_min_max(pos2(bar.left() - EDGE_INSET, bar.top()), rect.max);
+    let bar = bar_rect(rect);
+    let hit_area = hit_area(rect);
 
     // Activity: the viewport moved, the wheel turned over the terminal, or the
     // pointer came to rest over the bar (which reveals a hidden thumb).
@@ -171,6 +210,7 @@ pub fn show(ui: &mut Ui, rect: Rect, backend: &mut TerminalBackend, state: &mut 
 
     if !metrics.scrollable() {
         state.drag = None;
+        state.interactive = false;
         return;
     }
 
@@ -185,8 +225,11 @@ pub fn show(ui: &mut Ui, rect: Rect, backend: &mut TerminalBackend, state: &mut 
 
     if alpha_scale <= 0.0 {
         state.drag = None;
+        state.interactive = false;
         return;
     }
+    // Past here the thumb is both painted and sensed, so the strip is ours.
+    state.interactive = true;
 
     // Interaction (registered after the terminal, so it wins the hit test).
     let response = ui.allocate_rect(hit_area, Sense::click_and_drag());
@@ -365,6 +408,63 @@ mod tests {
         };
         assert_eq!(m.offset_at(bar(), -1000.0), 500);
         assert_eq!(m.offset_at(bar(), 1000.0), 0);
+    }
+
+    /// A pane, in screen space.
+    fn pane() -> Rect {
+        Rect::from_min_max(pos2(0.0, 200.0), pos2(800.0, 600.0))
+    }
+
+    #[test]
+    fn the_bar_hugs_the_right_edge_over_the_full_height() {
+        let b = bar_rect(pane());
+        assert_eq!(b.width(), THUMB_WIDTH);
+        assert_eq!(b.right(), pane().right() - EDGE_INSET);
+        assert_eq!(b.top(), pane().top());
+        assert_eq!(b.bottom(), pane().bottom());
+    }
+
+    #[test]
+    fn the_hit_area_covers_the_bar_out_to_the_right_edge() {
+        let hit = hit_area(pane());
+        let b = bar_rect(pane());
+        assert!(hit.contains_rect(b), "hit {hit:?} misses the bar {b:?}");
+        // Flush to the pane's right edge, so there is no sliver past the thumb
+        // that neither widget claims, and a little slack on the left.
+        assert_eq!(hit.right(), pane().right());
+        assert_eq!(hit.left(), b.left() - EDGE_INSET);
+        assert_eq!(hit.top(), pane().top());
+        assert_eq!(hit.bottom(), pane().bottom());
+        // Wide enough to aim at: the 7px thumb plus both insets.
+        assert_eq!(hit.width(), THUMB_WIDTH + 2.0 * EDGE_INSET);
+    }
+
+    #[test]
+    fn the_hit_area_holds_every_thumb_position() {
+        let bar = bar_rect(pane());
+        let hit = hit_area(pane());
+        let m = Metrics {
+            history: 500,
+            screen: 40,
+            offset: 0,
+        };
+        for step in 0..=10 {
+            let m = Metrics {
+                offset: 500 * step / 10,
+                ..m
+            };
+            let thumb = m.thumb_rect(bar).unwrap();
+            assert!(
+                hit.contains_rect(thumb),
+                "thumb {thumb:?} at offset {} escapes the hit area {hit:?}",
+                m.offset
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_state_owns_nothing() {
+        assert!(!ScrollbarState::default().interactive());
     }
 
     #[test]
