@@ -27,7 +27,7 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   `Tab { backend: TerminalBackend, shell_title: String, custom_title: Option<String> }`.
   Effective title = custom_title.or(shell_title). PtyEvent::Title updates
   shell_title; PtyEvent::Exit removes the tab (app quits when last tab closes).
-- Editor groups (VS Code's full 2D "splits"): the window is a *split tree* —
+- Editor groups (VS Code's full 2D "splits"): each window is a *split tree* —
   a node is either a leaf (`Group { id, tab_ids: Vec<u64>, active }`) or a
   split `{ axis: Horizontal | Vertical, children: Vec<Node> }`, each child
   carrying a weight (its share of the split's extent). Leaves hold tab ids
@@ -52,6 +52,32 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   with a draggable hairline between siblings on both axes (resize cursor per
   axis, no child below 0.15 of its split, weights per split via
   `split_weights`/`set_split_weights(path, …)`).
+- Windows: the split tree is *per window*, not per app — `window_ids()` in
+  creation order (the root window is id 0, ids monotonic and never reused),
+  `window_of_tab`, `focused_window`, `focus_window`, `window_layout(win)`. Tabs
+  still live in the one global `BTreeMap`, so tearing a tab into another window
+  moves an id between trees and nothing else: IPC keeps addressing it by that
+  id and the wire protocol is again unchanged. Every existing group API
+  (`group_count`, `group_tabs`, `split_*`, `move_tab`, `focus_group`, ⌘1..9 …)
+  is scoped to the *focused* window's tree, which is what lets the whole tab-bar
+  and keybinding layer stay window-agnostic — the focused window decides which
+  tree it is talking about. Exactly one tab is globally active across all
+  windows: `focus_window` makes that window's focused leaf's active tab the
+  global one, so `terra ls` still marks one row and the keyboard still has one
+  destination. `move_tab_to_new_window(tab)` tears a tab out — a new window with
+  one group holding that one tab, focused, its id returned — and is a no-op
+  (`None`) for the sole tab of the sole window, since that would leave an empty
+  window behind and take the tab nowhere. `move_tab_to_window(tab, win)` puts it
+  back into an existing window's focused leaf. A non-last window emptied by a
+  close or a move removes itself; `close_window(win)` returns the tabs it took
+  with it. The app still quits exactly when no tabs remain anywhere.
+- Each extra window is an egui **deferred viewport** rendering the same frame
+  composition against its own tree — its own tab bars, its own split walk — so
+  the renderer is one function parameterised by window id rather than two code
+  paths. OS focus on a viewport calls `focus_window`, which is what makes
+  typing land in the window you clicked; a viewport whose window is gone stops
+  being emitted and the OS window goes with it. Separate viewports do not share
+  pointer routing, so a drag cannot cross between them (see drag & drop).
 - **The pointer picks the pane** (`main.rs::hover_focus`, `[input]
   focus_follows_mouse`, default on): moving the mouse
   into a leaf's terminal focuses that leaf — focus-follows-mouse, no click —
@@ -92,7 +118,9 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
 - Closing the window (`confirm_close.rs`): both ways out — the red traffic
   light and ⌘Q/Quit, which routes through `AppAction::Quit` and one
   `ViewportCommand::Close` — raise `close_requested`, so `App::ui` intercepts
-  once, in front of the close fade. `should_confirm` (pure: per-tab foreground
+  once, in front of the close fade. A traffic light is per window and asks only
+  about that window's tabs; ⌘Q is still the whole app. `should_confirm` (pure:
+  per-tab foreground
   command names + `[window] confirm_close`) decides whether the close would
   kill anything; a window of bare shell prompts closes silently, Ghostty-style.
   When it would, `ConfirmClose` holds the request (`CancelClose`) and the
@@ -108,10 +136,15 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   bare prompt closes silently; a tab with a command running raises the dialog.
   What the held close *is* rides along as `confirm_close::Subject`, which is
   both the payload "Close" runs and the wording: `Subject::Tab { last: false }`
-  says "Close Tab?", and the last tab in the window (across every group) keeps
-  "Close Window?", because emptying the window is what actually shuts terra —
-  it then quits through the ordinary path, fade included. Cancelling closes
-  nothing and the next attempt asks again; approving a close the window
+  says "Close Tab?", and the last tab of a window (across every group *of that
+  window*) keeps "Close Window?", because emptying it is what actually takes the
+  window down. Which window is asked matters now that there can be several: the
+  dialog belongs to the tab's own window and is drawn inside that viewport, so
+  the question arrives where the click did. Only when it is also the last window
+  does approving quit terra, through the ordinary path, fade included; any other
+  window just goes away and the app carries on with the remaining ones.
+  Cancelling closes nothing
+  and the next attempt asks again; approving a close the window
   *survived* resets the gate, so the next busy tab gets its own question rather
   than inheriting this answer. Only one close is ever pending: a second request
   while the dialog is up is held like any other and cannot rewrite the subject.
@@ -123,7 +156,9 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   mode, prompt id "rename"), `tab.next`, `tab.prev`, `tab.select.<id>` (one per
   open tab across all groups, label = title, prefixed with the group ordinal —
   "2: htop" — when there is more than one group), `split.right`, `split.left`,
-  `split.down`, `split.up`, `group.next`, `group.prev`, `app.quit`,
+  `split.down`, `split.up`, `tab.move-to-new-window` ("Move Tab to New Window",
+  the tear-out gesture without the mouse), `group.next`, `group.prev`,
+  `app.quit`,
   `config.edit.<slug>` (one per installed agent/editor — `claude`, `codex`,
   `vscode`, `cursor`).
 - "Edit Settings With" (`edit_tools.rs`): probes once at launch, on a
@@ -166,9 +201,16 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   group's active tab); dropped on a terminal it splits — four drop zones per
   leaf, whichever edge is proportionally nearest wins: left/right make a new
   side-by-side leaf, top/bottom a stacked one, each shown as the same
-  translucent half-overlay. Dragging the hairline divider between two
-  siblings resizes them (rewrites the two weights in their split; the other
-  children keep their share).
+  translucent half-overlay. Dropped *outside the window entirely* it tears out:
+  the release lands on no bar and no leaf of this window, which is the gesture
+  every browser reads as "give this tab its own window", so it raises
+  `AppAction::MoveTabToNewWindow` and the tab leaves for a fresh OS window under
+  the cursor. Dropping a pill on *another* terra window's bar is not v1: the
+  windows are separate viewports and egui routes pointer input per viewport, so
+  the drag simply does not exist on the far side — moving a tab back is
+  model-level for now (the palette, or `move_tab_to_window`). Dragging the
+  hairline divider between two siblings resizes them (rewrites the two weights
+  in their split; the other children keep their share).
 - IPC server (`ipc.rs`): thread with an `interprocess::local_socket::Listener`
   on `terra_protocol::socket_address()` — a unix socket on Unix, a named pipe
   on Windows (create parent dir 0700 where there is one; reclaim a stale
@@ -178,8 +220,10 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   Connection threads execute requests directly against the shared
   `Arc<Mutex<TabManager>>` — never via the UI thread, which eframe parks
   entirely while the window is occluded. Repaint is requested after mutating
-  requests; `Select` also summons the window (thread-safe NSRunningApplication;
-  never activate from inside the frame callback — it wedges winit's waker).
+  requests; `Select` also focuses the window the tab lives in (`focus_window`,
+  so the tab is both its leaf's and the app's active one) and summons that
+  window (thread-safe NSRunningApplication; never activate from inside the frame
+  callback — it wedges winit's waker).
 - Capture: `backend.sync()` then walk `last_content().grid.display_iter()`,
   build lines for the visible screen; include up to `scrollback` lines above
   via grid indexing if feasible, else visible-only is acceptable for v1.
@@ -227,7 +271,7 @@ terra capture <tab> [--scrollback N] [--cells]  # text, or the styled grid as JS
 terra transcript <tab> [--tail N] [--raw]  # what the tab's program wrote, alt screen included
 terra rename <tab> "new title"
 terra select <tab>
-terra screenshot --out F [--pretty] [--bg hex1,hex2]  # PNG of the window
+terra screenshot --out F [--pretty] [--bg hex1,hex2]  # PNG of the root window
 terra bidi <tab> [off|on|auto]    # per-tab RTL reordering; prints the mode
 terra learn                       # self-teaching prompt for agents
 terra doctor                      # probe the terminal this CLI runs inside
@@ -273,7 +317,12 @@ because a frame was drawn. The IPC thread summons the window (the same
 `App::ui`, or 2s pass — an occluded window that will not come forward has to
 fail with a message rather than hang. The app encodes PNG; the CLI decodes it
 and, for `--pretty`, composites a rounded card, traffic lights, drop shadow and
-gradient in pure pixel arithmetic (`terra-cli/src/pretty.rs`).
+gradient in pure pixel arithmetic (`terra-cli/src/pretty.rs`). It captures the
+*root* window only: `ViewportCommand::Screenshot` is posted to the viewport the
+IPC rendezvous is waiting on, and a torn-out tab lives in a deferred viewport
+whose frames the root's `App::ui` does not answer for. Documented v1 limitation
+rather than a silent wrong picture — a `--window` selector is the way out when
+one is needed.
 
 `doctor` and `record` never open the socket: they talk to the terminal the CLI
 is running inside, so the same binary run under terra and under any other

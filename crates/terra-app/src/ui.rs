@@ -17,7 +17,15 @@
 //! side-by-side split, top/bottom for a stacked one) accepts it as a split —
 //! see
 //! [`tab_drag_overlay`], which `main.rs` runs once per frame over the whole
-//! window after the columns are laid out.
+//! window after the columns are laid out. Dragged *outside* the window
+//! altogether, the same ghost tears the tab out into an OS window of its own —
+//! Chrome's gesture, and the reason the ghost puts on a window frame once it
+//! is past the edge. The torn window appears the instant the pointer clears
+//! the edge and then follows it (see [`TabDrag::torn`]); dropping it over
+//! another terra window moves the tab in there instead, whichever window it
+//! came from. [`release_tears_out`] is the release-time fallback for the
+//! shapes of "outside" the mid-drag test cannot see (a pointer that left
+//! without a farewell position).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -176,9 +184,75 @@ const GHOST_WIDTH: f32 = 150.0;
 /// half of the terminal the drop would split into.
 const DROP_ZONE_FILL: Color32 = Color32::from_rgba_premultiplied(0x14, 0x24, 0x3c, 0x50);
 const DROP_ZONE_EDGE: Color32 = Color32::from_rgb(0x3d, 0x6e, 0xc7);
+/// How far past the window's own edge the pointer must be for a release to
+/// read as "outside" (see [`release_tears_out`]). The rect and the pointer are
+/// both in points and the pointer may legitimately sit *on* the last row of
+/// pixels inside the window, so a bare `!contains` would tear a drag that
+/// merely brushed the frame. A few points of slack costs nothing: a gesture
+/// meant to tear ends well clear of the window.
+const TEAR_MARGIN: f32 = 6.0;
+/// The gap between the ghost pill and the window outline drawn around it once
+/// the drag is beyond the window edge.
+const TEAR_FRAME_INSET: u8 = 5;
+/// The tear-out outline: the same blue that marks a split drop zone, so the
+/// two drop affordances read as one family.
+const TEAR_FRAME_EDGE: Color32 = DROP_ZONE_EDGE;
+/// How far below its steered position a docked drag parks the window it is
+/// carrying: far enough to be off any desktop, near enough to be an ordinary
+/// window move. The window stays alive and keeps the mouse capture — it is
+/// only out of sight while its tab rides another window's bar.
+const DOCK_PARK: Vec2 = Vec2::new(0.0, 6000.0);
+/// Extra slack on the strip a drag is *already* docked to, so undocking takes
+/// a deliberate move rather than a point of jitter — and undocking is not
+/// free: it moves the tab back out of the bar it is sitting in. It earns its
+/// keep in the one-tab case, where the parked window is also the window
+/// reporting the pointer: the frame its move lands, the origin and the pointer
+/// it is added to change together, and a hair of disagreement between them
+/// must not bounce the tab in and out of its new home.
+const DOCK_HYSTERESIS: f32 = 12.0;
+
+/// Title bar height to assume while the window server has not told us what a
+/// window's decoration actually costs. macOS's is 28 points.
+const DECOR_FALLBACK: f32 = 28.0;
+
+/// How far a torn-out window's outer top-left sits from the pointer that tore
+/// it out, so the pointer holds the tab *by its pill* in the new window's bar:
+/// back off by the pill's left inset plus the grab offset inside it, and
+/// vertically by the window decoration plus half a bar — the pill's middle.
+///
+/// `grab` is [`TabDrag::grab`], clamped the way the ghost clamps it so the
+/// pill lands under exactly the point of the ghost it replaces. `decor_h` is
+/// the tearing window's own decoration height ([`decor_height`]).
+///
+/// It lives here rather than in `main.rs` because the drag mints the position
+/// itself (mid-drag, in this viewport's points); `main.rs` uses the same
+/// arithmetic for the routes that have no drag to ask (the palette, IPC).
+pub fn tear_anchor(grab: f32, decor_h: f32) -> Vec2 {
+    Vec2::new(
+        f32::from(PAD_X) + grab.clamp(0.0, GHOST_WIDTH),
+        decor_h + TAB_BAR_HEIGHT / 2.0,
+    )
+}
+
+/// What this viewport's decoration costs above its content: the gap between
+/// its inner and outer rects, or [`DECOR_FALLBACK`] before the window server
+/// has answered.
+pub fn decor_height(ctx: &egui::Context) -> f32 {
+    ctx.input(|i| {
+        let viewport = i.viewport();
+        match (viewport.inner_rect, viewport.outer_rect) {
+            (Some(inner), Some(outer)) => (inner.min.y - outer.min.y).max(0.0),
+            _ => DECOR_FALLBACK,
+        }
+    })
+}
 
 /// Something the user asked for via keyboard, tab bar or palette.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: the window-dragging arms carry screen positions, which are
+/// floats. Nothing compares actions for hashing, so `PartialEq` is all the
+/// tests want.
+#[derive(Debug, Clone, PartialEq)]
 pub enum AppAction {
     NewTab,
     CloseActive,
@@ -224,6 +298,79 @@ pub enum AppAction {
         id: u64,
         group: usize,
         dir: SplitDir,
+    },
+    /// Tear a tab out of this window into an OS window of its own: the pill
+    /// was dragged *outside* the window's content area, or the palette's
+    /// `tab.move-to-new-window` asked for it on the active tab. The model
+    /// decides what that costs — a tab that is the sole tab of its window has
+    /// nowhere to go and the action is a no-op there (the drag steers the
+    /// whole window instead, so it never asks).
+    ///
+    /// `pos` is where the new window's top-left goes, in screen points. The
+    /// drag knows it (it is minting the window under the pointer); the routes
+    /// that have no pointer pass `None` and let `main.rs` cascade.
+    MoveTabToNewWindow {
+        id: u64,
+        pos: Option<egui::Pos2>,
+    },
+    /// Hand a dragged tab to another *window*: the pill was carried into window
+    /// `win`'s tab bar, at slot `index` of its group `group`. Works in every
+    /// direction — root into torn, torn into root, torn into torn — because the
+    /// hit test is done against every live window's bar in screen points rather
+    /// than against this viewport's.
+    ///
+    /// This is a *docking*, not a drop: it happens while the button is still
+    /// down, so the tab is really in `win` from that moment (Chrome's rule —
+    /// mouse-up changes nothing), and the drag stays live in `host`, the window
+    /// the tab came from. `host` is held ([`TabManager::hold_window`]) so that
+    /// emptying it does not close the window the OS is delivering the drag to;
+    /// [`Self::ReleaseDragHold`] settles that up when the gesture ends.
+    DockTab {
+        id: u64,
+        host: u64,
+        win: u64,
+        group: usize,
+        index: usize,
+    },
+    /// The docked tab slid to another slot of the bar it is docked in: the
+    /// pointer moved along the strip. Emitted only when the slot actually
+    /// changes, so a still pointer costs nothing.
+    ReorderDocked {
+        id: u64,
+        win: u64,
+        group: usize,
+        index: usize,
+    },
+    /// The pill was pulled back out of the bar it was docked in: the tab goes
+    /// home to `host`, which is still there because the drag has been holding
+    /// it, and the window resumes following the pointer.
+    UndockTab {
+        id: u64,
+        host: u64,
+    },
+    /// The drag is over: drop the hold on `host` ([`Self::DockTab`]). If the
+    /// tab ended up somewhere else, `host` is empty and collapses now; if it
+    /// came home, this changes nothing.
+    ReleaseDragHold {
+        host: u64,
+    },
+    /// [`Self::SplitTab`] across a window boundary: a torn drag was released
+    /// over a half of window `win`'s group `group`, so the tab crosses into
+    /// that window *and* becomes a pane there. Two steps rather than one
+    /// because group indices are scoped to the focused window — the tab has to
+    /// arrive before `group` names anything.
+    SplitTabInWindow {
+        id: u64,
+        win: u64,
+        group: usize,
+        dir: SplitDir,
+    },
+    /// Steer window `win`'s OS window to `pos` (its outer top-left, in screen
+    /// points). Emitted every frame of a torn drag: the real window follows
+    /// the pointer, Chrome style, instead of a ghost pretending to.
+    DragWindowTo {
+        win: u64,
+        pos: egui::Pos2,
     },
     /// Drop every session override, returning to what the file says.
     ResetSession,
@@ -446,6 +593,142 @@ struct TabDrag {
     /// Pointer offset inside the tab when the drag started, so the tab does not
     /// jump to centre itself under the cursor.
     grab: f32,
+    /// The window that owns the drag, and the only one whose render pass may
+    /// drive or end it. Every window's pass runs [`tab_drag_overlay`] over the
+    /// *same* (global) drag state, and a window that is not the owner cannot
+    /// even tell whether the tab still exists — the group APIs are scoped to
+    /// the focused window, which during a render is whichever window is being
+    /// drawn. Without this an innocent bystander's pass saw
+    /// `group_of(id) == None` and cleared the drag out from under the owner.
+    ///
+    /// [`u64::MAX`] until claimed: the bar starts the drag and does not know
+    /// its own window id, so the first overlay pass that *can* see the tab
+    /// claims it (see [`tab_drag_overlay`]).
+    win: u64,
+    /// The drag has left the window and a real OS window is now following the
+    /// pointer — either the one just torn out (`moved`) or this window itself.
+    /// No ghost is painted from here on: the window *is* the feedback.
+    torn: bool,
+    /// Which flavour of `torn`: `true` after a [`AppAction::MoveTabToNewWindow`]
+    /// minted a window for the tab, `false` when the tab was the last one in
+    /// its window and the whole window is being steered instead.
+    moved: bool,
+    /// Screen pointer minus the steered window's outer top-left, taken at the
+    /// moment following started. Subtracting it every frame keeps the window
+    /// under the same part of the cursor instead of snapping its corner there.
+    ///
+    /// For a freshly torn window that part is its *tab pill*
+    /// ([`tear_anchor`]): the pointer holds the tab it is carrying, exactly
+    /// where inside the pill it grabbed it. For a whole window being steered
+    /// it is wherever the cursor already was, so nothing jumps.
+    wgrab: Vec2,
+    /// Where the tab is docked, while the pointer is inside a foreign tab bar.
+    ///
+    /// Docking is Chrome's rule taken literally: the tab is *really* in that
+    /// window from the moment the pill enters its bar — pill in the bar,
+    /// terminal on screen, at the slot under the pointer — so letting go
+    /// changes nothing. The window the tab came from parks far offscreen
+    /// ([`DOCK_PARK`]) and is held alive ([`TabDrag::host`]) so the drag it is
+    /// pumping survives being emptied. Pulling the pill back out undoes all of
+    /// it. Recomputed every frame from what is under the pointer, so leaving
+    /// the bar — or the target window dying under it — undocks by itself.
+    docked: Option<DockSlot>,
+    /// The window the carried tab belongs to while it is not docked: the one
+    /// torn out for it, or the whole window being steered. Remembered from the
+    /// first dock onwards because that window is held from then on, and the
+    /// hold has to be dropped when the gesture ends whatever ended it.
+    host: Option<u64>,
+}
+
+/// Where a docked tab currently sits: window, group, and slot in that group's
+/// bar. Compared frame to frame, so the tab only actually moves when the
+/// pointer has moved it somewhere new.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DockSlot {
+    win: u64,
+    group: usize,
+    index: usize,
+}
+
+/// Where the windows are, for the frame [`tab_drag_overlay`] is running in.
+///
+/// A drag that crosses windows needs two coordinate systems: this viewport's
+/// (what the pointer is reported in) and the desktop's (what a window position
+/// and a cross-window hit test are in). `origin` is the bridge between them.
+pub struct DragWindows {
+    /// The window this render pass belongs to.
+    pub win: u64,
+    /// This viewport's content rect, in its own points — what the drag is
+    /// "inside" of. `ctx.viewport_rect()` is the root's own and means nothing
+    /// inside a deferred viewport, so the renderer passes the real one.
+    pub local: Rect,
+    /// This viewport's inner-rect origin in screen points, `None` while the OS
+    /// has not told us yet. Local pointer + `origin` = screen pointer.
+    pub origin: Option<egui::Pos2>,
+    /// Every live window's tab-bar strips in screen points, one entry per
+    /// group. A torn drag docks the moment the pointer enters one of them, so
+    /// this is what that hit test runs against.
+    pub bars: Vec<BarStrip>,
+    /// Every live window's terminal areas in screen points, as
+    /// `(window, group, rect)` — the group being its index in that window's
+    /// DFS order, which is what [`AppAction::SplitTabInWindow`] names. A torn
+    /// drag released over one of these splits that group.
+    pub terms: Vec<(u64, usize, Rect)>,
+    /// The torn tab in flight, as the window driving it published it last
+    /// frame. A window that is not driving the drag has no other way to know
+    /// the pointer is over it: the pointer is reported to the dragging
+    /// viewport, not to this one.
+    pub carry: Option<CarryState>,
+}
+
+/// One group's tab-bar strip on the desktop, as the drag sees it.
+///
+/// The tab count travels with the rect because the slot a dropped pill lands
+/// in is worked out from the two together — the same `tab_width` /
+/// [`insertion_index`] arithmetic the bar itself lays tabs out with, run from
+/// another window entirely.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarStrip {
+    pub win: u64,
+    /// The group's index in its window's DFS order.
+    pub group: usize,
+    /// The strip in screen points ([`attach_strip`]).
+    pub rect: Rect,
+    /// How many tabs that group holds right now.
+    pub tabs: usize,
+}
+
+/// A torn tab in flight, published once a frame by the window that owns the
+/// drag so a window it is carried over can wash the half a drop would split
+/// into. Not published while the drag is docked: a docked tab is really in its
+/// new bar, and that bar draws it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CarryState {
+    pub id: u64,
+    /// Where the pointer is, in screen points — the only frame of reference
+    /// two viewports share.
+    pub screen: egui::Pos2,
+    /// The window riding under the pointer, which is never a drop target: it
+    /// is the thing being carried.
+    pub steer: Option<u64>,
+}
+
+/// What one window's render pass has to say about the carried tab.
+///
+/// Only the window that owns the drag knows anything, so a bystander's pass
+/// says [`CarryReport::NotMine`] and leaves the published state alone —
+/// without that, the first other window to render would clear the drag's
+/// state out from under it every frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CarryReport {
+    /// Someone else's drag (or nobody's): this pass knows nothing.
+    NotMine,
+    /// This pass owns a torn drag, and here is where it has got to.
+    Carrying(CarryState),
+    /// Nothing is in flight, and this pass can say so: it owns the drag and
+    /// the drag is not torn (or has just ended), or there is no drag at all —
+    /// the drag state is global, so that much any window can see.
+    Idle,
 }
 
 fn drag_state_id() -> Id {
@@ -865,7 +1148,7 @@ pub fn bar_visible(tab_count: usize, group_count: usize, with_one_tab: bool) -> 
 
 /// One row of a dropdown: what it says, what it wears, and what choosing it
 /// does.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MenuEntry {
     pub label: String,
     /// The logo drawn to the left of the label, from the same set the pills
@@ -1405,6 +1688,15 @@ pub fn tab_bar(
                         started_drag = Some(TabDrag {
                             id: slot.id,
                             grab: pos.x - rect.left(),
+                            // The bar draws a column, not a window, and has no
+                            // window id to hand over; the overlay claims the
+                            // drag for whichever window can see the tab.
+                            win: u64::MAX,
+                            torn: false,
+                            moved: false,
+                            wgrab: Vec2::ZERO,
+                            docked: None,
+                            host: None,
                         });
                     }
                 }
@@ -1512,6 +1804,14 @@ fn drive_drag(
         // Some other group's bar owns this drag.
         return None;
     }
+    if drag.torn {
+        // A torn drag docked into this bar: the tab really is here, but the
+        // pointer is not — the gesture belongs to another window's viewport,
+        // which is the only one the OS is telling about it. The pill animates
+        // to the slot the dock put it in, like any other tab that just
+        // arrived, and [`torn_drag`] does the driving.
+        return None;
+    }
     let down = ui.input(|i| i.pointer.primary_down());
     let pointer = ui.input(|i| i.pointer.interact_pos());
     let (true, Some(pointer)) = (down, pointer) else {
@@ -1552,6 +1852,22 @@ pub struct GroupGeometry {
     /// The terminal area below the bar, whose four halves (nearest edge
     /// wins) are the split drop zones.
     pub terminal: Rect,
+}
+
+/// The strip of a column that catches a torn drag ([`attach_into_bar`]): its
+/// tab bar, or — when the bar is hidden, which is a lone tab under `[tabs]
+/// bar_with_one_tab = false` — the band where the bar *would* be. A bare
+/// window has to be able to receive a tab too, and that band is where the
+/// pointer holding a pill expects the bar to be.
+pub fn attach_strip(geom: &GroupGeometry) -> Rect {
+    if geom.bar.is_positive() {
+        geom.bar
+    } else {
+        Rect::from_min_size(
+            geom.terminal.min,
+            Vec2::new(geom.terminal.width(), TAB_BAR_HEIGHT),
+        )
+    }
 }
 
 /// What the pointer is over mid-drag.
@@ -1637,14 +1953,314 @@ fn drop_target(
     None
 }
 
+/// What crossing the window edge mid-drag means for the window this drag
+/// belongs to. See [`mid_drag_tear`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MidDragTear {
+    /// Mint a window for the tab and let it follow the pointer.
+    NewWindow,
+    /// The tab is the last one here, so there is nothing to tear it *out* of:
+    /// steer this whole window instead, the way Chrome drags a one-tab window
+    /// bodily. It also spares the sole-tab-of-the-sole-window case a refusal —
+    /// the gesture always does something.
+    SteerWindow,
+    /// Still inside (or nothing to act on): carry on dragging the ghost.
+    None,
+}
+
+/// Should this frame turn the drag into a window? Pure, so the three cases can
+/// be tested without a window server.
+///
+/// `local` is the dragging window's own content rect and `pointer` is in the
+/// same points; `tabs_in_window` counts the tabs of the window the drag
+/// started in.
+fn mid_drag_tear(
+    down: bool,
+    pointer: Option<egui::Pos2>,
+    local: Rect,
+    tabs_in_window: usize,
+) -> MidDragTear {
+    // A pointer with no position cannot steer a window to anywhere, so that
+    // shape of "outside" stays with the release-time path
+    // ([`release_tears_out`]).
+    let (true, Some(pointer)) = (down, pointer) else {
+        return MidDragTear::None;
+    };
+    if local.expand(TEAR_MARGIN).contains(pointer) {
+        return MidDragTear::None;
+    }
+    match tabs_in_window {
+        0 => MidDragTear::None,
+        1 => MidDragTear::SteerWindow,
+        _ => MidDragTear::NewWindow,
+    }
+}
+
+/// Which window's tab bar the torn drag is over, if any — the bar it docks to
+/// while the button is down, and hands the tab to when it comes up.
+///
+/// The first live window whose bar strip is under `screen` wins, minus the
+/// window being steered: the carried window's own bar rides under the pointer
+/// the whole time (that is what [`tear_anchor`] arranges), so excluding it is
+/// what keeps the drag from docking to itself.
+///
+/// The strip is given the same [`BAR_DRAG_SLACK`] band an in-bar drag gets, so
+/// grazing the bar's top edge on the way in counts; the strip already docked
+/// to gets [`DOCK_HYSTERESIS`] more.
+fn attach_into_bar(
+    screen: egui::Pos2,
+    steered: u64,
+    docked: Option<DockSlot>,
+    bars: &[BarStrip],
+) -> Option<(u64, usize, usize)> {
+    let strip = bars.iter().find(|strip| {
+        let slack = if docked.map(|d| d.win) == Some(strip.win) {
+            BAR_DRAG_SLACK + DOCK_HYSTERESIS
+        } else {
+            BAR_DRAG_SLACK
+        };
+        strip.win != steered && strip.rect.expand2(Vec2::new(0.0, slack)).contains(screen)
+    })?;
+    let here = docked.is_some_and(|d| d.win == strip.win && d.group == strip.group);
+    Some((strip.win, strip.group, bar_slot(strip, screen.x, here)))
+}
+
+/// Which slot of `strip` the point `x` names, run from outside the window the
+/// bar belongs to: the bar's own layout ([`tab_width`], [`insertion_index`])
+/// replayed from the strip rect and the tab count that travelled with it.
+///
+/// `already_here` says the dragged tab is one of those `tabs` — it has already
+/// docked into this group — so the answer is a slot to *reorder* into
+/// (`0..tabs`) rather than one to insert at (`0..=tabs`).
+fn bar_slot(strip: &BarStrip, x: f32, already_here: bool) -> usize {
+    let inner = strip
+        .rect
+        .shrink2(Vec2::new(f32::from(PAD_X), f32::from(PAD_Y)));
+    let width = tab_width(inner.width(), strip.tabs.max(1));
+    let index = insertion_index(x, inner.left(), width + TAB_GAP, strip.tabs);
+    if already_here {
+        index.min(strip.tabs.saturating_sub(1))
+    } else {
+        index
+    }
+}
+
+/// What a torn drag is over on the desktop. Neither target is a promise: a bar
+/// docks the drag (the tab really moves there, but the gesture is still on and
+/// can take it back), a terminal half only shows its wash until the release.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TornTarget {
+    /// Slot `index` of group `group` of window `win`'s tab bar.
+    Bar {
+        win: u64,
+        group: usize,
+        index: usize,
+    },
+    /// A half of window `win`'s group `group`. `zone` is the half itself, for
+    /// the preview wash.
+    Split {
+        win: u64,
+        group: usize,
+        dir: SplitDir,
+        zone: Rect,
+    },
+}
+
+/// Where a torn drag at `screen` is pointing, skipping the window it is
+/// steering (that one is the thing being carried, in every direction).
+///
+/// The bar wins where the two overlap: a bar strip reaches [`BAR_DRAG_SLACK`]
+/// down into the terminal below it, and there the gesture aimed at the row of
+/// pills has to be the one that happens. The strip a drag is already docked to
+/// reaches [`DOCK_HYSTERESIS`] further still, so a docked tab does not flicker
+/// in and out of the bar it is sitting in.
+fn torn_target(
+    screen: egui::Pos2,
+    steered: u64,
+    docked: Option<DockSlot>,
+    bars: &[BarStrip],
+    terms: &[(u64, usize, Rect)],
+) -> Option<TornTarget> {
+    if let Some((win, group, index)) = attach_into_bar(screen, steered, docked, bars) {
+        return Some(TornTarget::Bar { win, group, index });
+    }
+    let (win, group, terminal) = terms
+        .iter()
+        .find(|(win, _, rect)| *win != steered && rect.contains(screen))?;
+    let (dir, zone) = split_zone(*terminal, screen);
+    Some(TornTarget::Split {
+        win: *win,
+        group: *group,
+        dir,
+        zone,
+    })
+}
+
+/// What one frame of a torn drag does with the tab and the window carrying it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TornStep {
+    /// Keep the window under the pointer, as it has been since the tear.
+    Steer,
+    /// Put the tab into window `win`'s bar at `index` — for real, now — and
+    /// park the window it came from.
+    Dock {
+        win: u64,
+        group: usize,
+        index: usize,
+    },
+    /// Already docked there, and the pointer has slid to a different slot.
+    Slide {
+        win: u64,
+        group: usize,
+        index: usize,
+    },
+    /// Docked, and nothing has changed: the tab is where it should be.
+    Settled,
+    /// Pulled back out of the bar with the button still down: the tab goes
+    /// home and its window comes back under the pointer.
+    Undock,
+    /// Let go while docked. The tab is already where it belongs, so this only
+    /// ends the gesture.
+    Attach,
+    /// Let go over a half of window `win`'s group `group`: the tab crosses and
+    /// becomes a pane there.
+    Split {
+        win: u64,
+        group: usize,
+        dir: SplitDir,
+    },
+    /// Let go anywhere else: the window simply stays where it was carried to.
+    Drop,
+}
+
+/// The whole gesture in one place: what the pointer is over ([`torn_target`],
+/// which already knows what the drag is docked to) plus whether the button is
+/// still down decides what this frame does.
+///
+/// Docking is a hover state, so it is remade from the target every frame and
+/// never has to be torn down explicitly: leaving the bar undocks, and a target
+/// window that disappears takes its strip out of the hit test with it. The
+/// release commits nothing that docking has not already done — which is the
+/// point of docking for real rather than painting a promise.
+fn torn_step(down: bool, target: Option<TornTarget>, docked: Option<DockSlot>) -> TornStep {
+    match (down, target) {
+        (_, Some(TornTarget::Bar { win, group, index })) => {
+            let slot = DockSlot { win, group, index };
+            match docked {
+                Some(now) if now == slot => {
+                    if down {
+                        TornStep::Settled
+                    } else {
+                        TornStep::Attach
+                    }
+                }
+                Some(now) if now.win == win => TornStep::Slide { win, group, index },
+                // Not docked at all, or docked in another window: either way
+                // the tab has to travel, and one action does both.
+                _ => TornStep::Dock { win, group, index },
+            }
+        }
+        (true, _) => {
+            if docked.is_some() {
+                TornStep::Undock
+            } else {
+                TornStep::Steer
+            }
+        }
+        (
+            false,
+            Some(TornTarget::Split {
+                win, group, dir, ..
+            }),
+        ) => TornStep::Split { win, group, dir },
+        (false, None) => TornStep::Drop,
+    }
+}
+
+/// VS Code's drop shade: a translucent blue wash over the half of a terminal
+/// the drop would split into. One drawing for both the in-window drag and the
+/// torn one, so a tab dropped across windows promises what it promises at
+/// home.
+fn paint_drop_zone(painter: &egui::Painter, zone: Rect) {
+    painter.rect_filled(zone, 0.0, DROP_ZONE_FILL);
+    painter.rect_stroke(
+        zone,
+        0.0,
+        Stroke::new(1.0, DROP_ZONE_EDGE),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// The wash a window paints for a tab being carried over it: the pointer
+/// belongs to whichever viewport is driving the drag, so it arrives in screen
+/// points and is converted here against this window's own origin.
+///
+/// Whichever of this window's terminals holds it gets the same quadrant
+/// treatment an in-window drag would draw. Repaints while it is hovered, so
+/// the wash follows the pointer even though nothing else is happening here.
+///
+/// A bar needs no such preview: a tab carried into one is really in it, and
+/// the bar draws its own pill.
+fn paint_carried_zone(ui: &Ui, geoms: &[GroupGeometry], screen: egui::Pos2, origin: egui::Pos2) {
+    let local = screen - origin.to_vec2();
+    let Some(geom) = geoms.iter().find(|geom| geom.terminal.contains(local)) else {
+        return;
+    };
+    let (_, zone) = split_zone(geom.terminal, local);
+    paint_drop_zone(ui.painter(), zone);
+    ui.ctx().request_repaint();
+}
+
+/// Does releasing the drag here tear the tab out into a window of its own?
+///
+/// The fallback half of the gesture. Crossing the edge with a live pointer
+/// already tears mid-drag ([`mid_drag_tear`]), so what reaches here is the
+/// release whose position the window never saw, plus the ordinary in-window
+/// releases this has to answer "no" to.
+///
+/// Two shapes of "outside", because winit reports both on macOS while a button
+/// is held:
+///
+/// * a **position beyond the viewport**. The OS keeps delivering moves to the
+///   window that owns the drag even once the pointer has left it, so the usual
+///   report is a perfectly good `Pos2` that simply is not inside the window's
+///   own content rect ([`DragWindows::local`]) — negative coordinates above or
+///   left of the window,
+///   or coordinates past its width/height. It must clear the edge by
+///   [`TEAR_MARGIN`] to count, so a pill let go on the window's own frame
+///   stays where it is.
+/// * **no position at all**. The pointer can also leave without a farewell
+///   position — the window loses the cursor (`PointerGone`, a release whose
+///   coordinates the window never sees), and egui then has no `interact_pos`
+///   to hand out. A drag that ends with the pointer nowhere ended off the
+///   window, so that tears too.
+///
+/// Pure on purpose: the caller passes the two facts and the tests fabricate
+/// them (`main.rs::hover_focus` is the same shape). It also answers the
+/// *present tense* mid-drag — "would a release here tear?" — which is what
+/// dresses the ghost in a window frame before the button comes up.
+fn release_tears_out(pointer: Option<egui::Pos2>, viewport: Rect) -> bool {
+    match pointer {
+        Some(pos) => !viewport.expand(TEAR_MARGIN).contains(pos),
+        None => true,
+    }
+}
+
 /// The floating pill that follows the pointer once a drag has left its bar.
 /// Painted on the tooltip layer, so it rides above every column.
+///
+/// `tearing` says the pointer is already past the window edge, where a release
+/// would tear the tab out ([`release_tears_out`]): the pill then gains a thin
+/// outline standing off it — the outline of the window it is about to become —
+/// so the outcome is legible before the button comes up. Deliberately quiet:
+/// the pill is still the pill, wearing a frame, not a second widget.
 fn paint_ghost(
     ctx: &egui::Context,
     tabs: &TabManager,
     icons: &IconCache,
     drag: TabDrag,
     pointer: egui::Pos2,
+    tearing: bool,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Tooltip,
@@ -1659,6 +2275,18 @@ fn paint_ghost(
         Vec2::new(GHOST_WIDTH, height),
     );
     let radius = CornerRadius::same(CORNER);
+    if tearing {
+        // The window-to-be: one hairline rectangle standing off the pill on
+        // every side, so the pill reads as content inside a frame rather than
+        // as a pill that changed colour.
+        let frame = rect.expand(f32::from(TEAR_FRAME_INSET));
+        painter.rect_stroke(
+            frame,
+            CornerRadius::same(CORNER + TEAR_FRAME_INSET),
+            Stroke::new(1.0, TEAR_FRAME_EDGE),
+            egui::StrokeKind::Inside,
+        );
+    }
     painter.rect_filled(rect, radius, TAB_ACTIVE_BG.gamma_multiply(0.9));
     painter.rect_stroke(
         rect,
@@ -1698,6 +2326,218 @@ fn paint_ghost(
     painter.galley(pos, galley, TITLE_ACTIVE);
 }
 
+/// The follow half of a torn drag, run from [`tab_drag_overlay`] in the
+/// *owning* window's pass only.
+///
+/// The window being carried is not always the owner: after a
+/// [`AppAction::MoveTabToNewWindow`] the tab lives in a window of its own and
+/// that is the one to move, so it is looked up from the tab each frame rather
+/// than remembered. The action is applied by the root frame, so for a frame or
+/// two the tab is still here and there is nothing to carry yet — that frame is
+/// simply skipped.
+///
+/// While the drag is docked the tab is somewhere else entirely, so the carried
+/// window is [`TabDrag::host`] instead: the one parked offscreen, held alive,
+/// and waiting to be handed the tab back if the pill leaves the bar again.
+///
+/// Returns what to publish about the tab in flight, so a window it is being
+/// carried over can wash the half a drop would split into ([`CarryReport`]).
+fn torn_drag(
+    ui: &Ui,
+    tabs: &TabManager,
+    mut drag: TabDrag,
+    geoms: &[GroupGeometry],
+    windows: &DragWindows,
+    actions: &mut Vec<AppAction>,
+) -> CarryReport {
+    let ctx = ui.ctx();
+    let pointer = ctx.input(|i| i.pointer.interact_pos());
+    let down = ctx.input(|i| i.pointer.primary_down());
+    let Some(home) = tabs.window_of_tab(drag.id) else {
+        // The tab died mid-flight (shell exit, `terra kill`) — with the hold
+        // and the parked window still outstanding, both of which this settles.
+        end_torn_drag(ctx, drag, None, None, actions);
+        return CarryReport::Idle;
+    };
+    // Docked, the tab is in the target window and says nothing about what is
+    // being carried: that is the host, parked below the desktop.
+    let carried = match (drag.docked, drag.host) {
+        (Some(_), Some(host)) => Some(host),
+        _ if drag.moved => (home != drag.win).then_some(home),
+        _ => Some(drag.win),
+    };
+    let screen = match (pointer, windows.origin) {
+        (Some(pointer), Some(origin)) => Some(origin + pointer.to_vec2()),
+        _ => None,
+    };
+    // What is under the pointer. Only consulted once there is a window to
+    // carry: until then the tab is still at home and the owner's own bar is
+    // right under the pointer.
+    let target = match (screen, carried) {
+        (Some(screen), Some(carried)) => {
+            torn_target(screen, carried, drag.docked, &windows.bars, &windows.terms)
+        }
+        _ => None,
+    };
+    // Where the carried window goes if it is following the pointer this frame.
+    let follow = |screen: egui::Pos2| screen - drag.wgrab;
+
+    match torn_step(down, target, drag.docked) {
+        TornStep::Dock { win, group, index } => {
+            let (Some(screen), Some(carried)) = (screen, carried) else {
+                return CarryReport::Idle;
+            };
+            // The tab really moves, now, into the bar under the pointer. The
+            // window it came from is held first (emptying it would otherwise
+            // close the very window the OS is delivering this drag to) and
+            // parked far below the desktop, so what the user sees is the tab
+            // sitting in its new bar — which is exactly what has happened.
+            actions.push(AppAction::DockTab {
+                id: drag.id,
+                host: carried,
+                win,
+                group,
+                index,
+            });
+            if drag.docked.is_none() {
+                actions.push(AppAction::DragWindowTo {
+                    win: carried,
+                    pos: follow(screen) + DOCK_PARK,
+                });
+            }
+            drag.docked = Some(DockSlot { win, group, index });
+            drag.host = Some(carried);
+            set_drag(ctx, Some(drag));
+            if !down {
+                // Docked and released on the same frame: the tab has arrived,
+                // there is nothing left to do but tidy up.
+                end_torn_drag(ctx, drag, Some(carried), Some(screen), actions);
+                return CarryReport::Idle;
+            }
+        }
+        TornStep::Slide { win, group, index } => {
+            // Sliding along the bar it is docked in, Chrome style: one move
+            // per slot crossed, nothing at all while the pointer sits still.
+            actions.push(AppAction::ReorderDocked {
+                id: drag.id,
+                win,
+                group,
+                index,
+            });
+            drag.docked = Some(DockSlot { win, group, index });
+            set_drag(ctx, Some(drag));
+        }
+        TornStep::Settled => {}
+        TornStep::Undock => {
+            // Pulled back out of the bar: the tab goes home to the window that
+            // has been waiting for it, which comes back under the pointer on
+            // this very frame, from the same `wgrab` it was parked with.
+            if let Some(host) = drag.host {
+                actions.push(AppAction::UndockTab { id: drag.id, host });
+                if let Some(screen) = screen {
+                    actions.push(AppAction::DragWindowTo {
+                        win: host,
+                        pos: follow(screen),
+                    });
+                }
+            }
+            drag.docked = None;
+            set_drag(ctx, Some(drag));
+        }
+        TornStep::Steer => {
+            if let Some(TornTarget::Split { win, .. }) = target {
+                // Over a terminal half: nothing happens until the button comes
+                // up, but the half is washed so the split is legible first. A
+                // foreign window paints its own ([`paint_carried_zone`], off
+                // `carry`); this window paints it here, where the pointer
+                // needs no round trip.
+                if win == windows.win {
+                    if let (Some(screen), Some(origin)) = (screen, windows.origin) {
+                        paint_carried_zone(ui, geoms, screen, origin);
+                    }
+                }
+            }
+            if let (Some(screen), Some(carried)) = (screen, carried) {
+                actions.push(AppAction::DragWindowTo {
+                    win: carried,
+                    pos: follow(screen),
+                });
+            }
+        }
+        TornStep::Attach => {
+            // Let go while docked. The tab has been in that window since the
+            // pill entered its bar, so the release moves nothing — it only
+            // ends the gesture and lets the emptied host go.
+            end_torn_drag(ctx, drag, carried, screen, actions);
+            return CarryReport::Idle;
+        }
+        TornStep::Split { win, group, dir } => {
+            // Let go over a foreign terminal half: the one the wash has been
+            // promising.
+            actions.push(AppAction::SplitTabInWindow {
+                id: drag.id,
+                win,
+                group,
+                dir,
+            });
+            end_torn_drag(ctx, drag, carried, screen, actions);
+            return CarryReport::Idle;
+        }
+        TornStep::Drop => {
+            // Let go in the open: the window stays where it was carried to,
+            // which is the whole point of having carried it there.
+            end_torn_drag(ctx, drag, carried, screen, actions);
+            return CarryReport::Idle;
+        }
+    }
+
+    // No ghost: the window under the pointer — or, docked, the pill the target
+    // window is now drawing itself — is the drag feedback.
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    ctx.request_repaint();
+    match screen {
+        // Docked, there is nothing for another window to preview: the tab is
+        // in a bar, not hovering over a terminal, and the bar it is in draws
+        // it. Publishing nothing also keeps a bar's slack band, which hangs a
+        // little into the terminal below it, from washing that terminal blue
+        // under the docked pill.
+        Some(screen) if drag.docked.is_none() => CarryReport::Carrying(CarryState {
+            id: drag.id,
+            screen,
+            steer: carried,
+        }),
+        _ => CarryReport::Idle,
+    }
+}
+
+/// End a torn drag, whatever ended it: clear the drag state, drop the hold on
+/// the window the tab came from, and — the part that is easy to forget — bring
+/// that window back from the parking spot below the desktop if it was still
+/// docked. A window left there is gone as far as the user is concerned, and a
+/// hold left standing is an empty window that never closes, so every exit goes
+/// through here.
+fn end_torn_drag(
+    ctx: &egui::Context,
+    drag: TabDrag,
+    carried: Option<u64>,
+    screen: Option<egui::Pos2>,
+    actions: &mut Vec<AppAction>,
+) {
+    if let (Some(_), Some(host), Some(screen)) = (drag.docked, drag.host, screen) {
+        // Docked at the end: the host is empty and about to collapse, but a
+        // move that did not take must not cost the user a window.
+        actions.push(AppAction::DragWindowTo {
+            win: host,
+            pos: screen - drag.wgrab,
+        });
+    }
+    if let Some(host) = drag.host.or(carried) {
+        actions.push(AppAction::ReleaseDragHold { host });
+    }
+    set_drag(ctx, None);
+    ctx.request_repaint();
+}
+
 /// The cross-group half of a tab drag, run once per frame after every column
 /// (bar + terminal) has been laid out — it needs the whole window's geometry,
 /// which no single group's bar has.
@@ -1708,24 +2548,84 @@ fn paint_ghost(
 /// [`AppAction::MoveTab`] for a foreign bar, [`AppAction::SplitTab`] for a
 /// terminal half — and ends the drag. Anywhere else the release is a no-op and
 /// the pill simply animates back to its slot.
+///
+/// Once the pointer leaves the window the drag goes *torn*: a real OS window
+/// (freshly minted, or this whole window when the tab is its last) follows the
+/// pointer, held by its own tab pill, until the button comes up. From there
+/// the desktop offers the same two targets a window does. Carrying the tab
+/// into another terra window's *tab bar* docks it there — and docking is not a
+/// promise: the tab really moves, into that bar, at the slot under the pointer,
+/// with its terminal on screen, while the window it came from parks out of
+/// sight and is held alive so the drag it is pumping survives. Pull the pill
+/// back out and the tab goes home again; let go and nothing further happens,
+/// because everything already has. Over a half of another window's *terminal*
+/// the half is washed blue as it is at home, and that one does wait for the
+/// release; anywhere else the release just leaves the window where it was.
+///
+/// Every window's render pass calls this with the same global drag state, so
+/// the first job is deciding whose drag it is — only the owner may touch it.
+/// A bystander's pass is not idle though: the pointer belongs to the owner's
+/// viewport, so a window being carried over paints its own preview from what
+/// the owner published ([`DragWindows::carry`]).
 pub fn tab_drag_overlay(
     ui: &Ui,
     tabs: &TabManager,
     icons: &IconCache,
     geoms: &[GroupGeometry],
+    windows: &DragWindows,
     actions: &mut Vec<AppAction>,
-) {
+) -> CarryReport {
     let ctx = ui.ctx().clone();
-    let Some(drag) = current_drag(&ctx) else {
-        return;
-    };
-    let Some(src_group) = tabs.group_of(drag.id) else {
-        // Closed under the pointer (⌘W, `terra kill`, shell exit).
-        set_drag(&ctx, None);
-        return;
+    let Some(mut drag) = current_drag(&ctx) else {
+        // No drag anywhere — the state is global, so any pass may say so, and
+        // one of them has to or a finished carry would never be cleared.
+        return CarryReport::Idle;
     };
     let pointer = ctx.input(|i| i.pointer.interact_pos());
     let down = ctx.input(|i| i.pointer.primary_down());
+
+    // Ownership, claimed by the focus loan: during a render the model is
+    // focused on the window being drawn, so `group_of` answers `Some` in
+    // exactly one window's pass — the one the dragged tab lives in. That makes
+    // the first pass that can see the tab the owner.
+    if drag.win == u64::MAX {
+        if tabs.group_of(drag.id).is_some() {
+            drag.win = windows.win;
+            set_drag(&ctx, Some(drag));
+        } else if down {
+            // Someone else's window, or nobody's yet. Crucially it does *not*
+            // clear: a bystander deciding a drag is dead is how a second
+            // torn-out window used to kill the drag on its first frame.
+            return CarryReport::NotMine;
+        } else {
+            // Released and still unclaimed — no window ever saw the tab, so
+            // there is nothing to drop and no owner to clean up after it.
+            set_drag(&ctx, None);
+            return CarryReport::Idle;
+        }
+    }
+    if drag.win != windows.win {
+        // Not this window's drag to drive — but the tab may be over one of its
+        // terminals, and the wash showing which half a drop would take is this
+        // window's to paint. (A tab over a *bar* needs no preview: it is really
+        // in that bar, drawn by the bar itself.)
+        if let (Some(carry), Some(origin)) = (windows.carry, windows.origin) {
+            if carry.steer != Some(windows.win) {
+                paint_carried_zone(ui, geoms, carry.screen, origin);
+            }
+        }
+        return CarryReport::NotMine;
+    }
+
+    if drag.torn {
+        return torn_drag(ui, tabs, drag, geoms, windows, actions);
+    }
+
+    let Some(src_group) = tabs.group_of(drag.id) else {
+        // Closed under the pointer (⌘W, `terra kill`, shell exit).
+        set_drag(&ctx, None);
+        return CarryReport::Idle;
+    };
     // While the pointer stays in its own bar's band the drag is an in-bar
     // reorder ([`drive_drag`]) and nothing here may compete with it — the
     // band's overhang into the terminal must not read as a split target.
@@ -1739,6 +2639,18 @@ pub fn tab_drag_overlay(
         .and_then(|p| drop_target(p, tabs, drag, geoms));
 
     if !down {
+        // Outside the window first, before any drop target is consulted: a
+        // release out there belongs to no group, and the tear-out is what the
+        // gesture meant. The model may still decide it is a no-op (the sole
+        // tab of the sole window has nowhere to go).
+        if release_tears_out(pointer, windows.local) {
+            actions.push(AppAction::MoveTabToNewWindow {
+                id: drag.id,
+                pos: None,
+            });
+            set_drag(&ctx, None);
+            return CarryReport::Idle;
+        }
         match target {
             Some(DropTarget::Bar { group, index }) if group != src_group => {
                 actions.push(AppAction::MoveTab {
@@ -1759,26 +2671,74 @@ pub fn tab_drag_overlay(
             _ => {}
         }
         set_drag(&ctx, None);
-        return;
+        return CarryReport::Idle;
     }
 
-    let Some(pointer) = pointer else { return };
+    let Some(pointer) = pointer else {
+        return CarryReport::Idle;
+    };
+
+    // Past the edge, with the button still down: the window is born now and
+    // follows the pointer from here (Chrome's gesture), instead of appearing
+    // out of nowhere when the button comes up.
+    let here = tabs
+        .ids()
+        .into_iter()
+        .filter(|id| tabs.window_of_tab(*id) == Some(drag.win))
+        .count();
+    match mid_drag_tear(down, Some(pointer), windows.local, here) {
+        MidDragTear::NewWindow => {
+            // The window opens with its first pill under the pointer, at the
+            // same spot inside the pill the drag was started at, so the ghost
+            // becoming a window is not a jump. `wgrab` is that same offset,
+            // which is what the follow keeps holding every frame after.
+            let anchor = tear_anchor(drag.grab, decor_height(&ctx));
+            actions.push(AppAction::MoveTabToNewWindow {
+                id: drag.id,
+                pos: windows
+                    .origin
+                    .map(|origin| origin + pointer.to_vec2() - anchor),
+            });
+            drag.torn = true;
+            drag.moved = true;
+            drag.wgrab = anchor;
+            set_drag(&ctx, Some(drag));
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            ctx.request_repaint();
+            return CarryReport::Idle;
+        }
+        MidDragTear::SteerWindow => {
+            // Nothing to tear out of a one-tab window: carry the window
+            // itself, held wherever the cursor currently is on it.
+            let outer = ctx.input(|i| i.viewport().outer_rect);
+            if let (Some(origin), Some(outer)) = (windows.origin, outer) {
+                drag.torn = true;
+                drag.moved = false;
+                drag.wgrab = (origin + pointer.to_vec2()) - outer.min;
+                set_drag(&ctx, Some(drag));
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                ctx.request_repaint();
+                return CarryReport::Idle;
+            }
+            // No screen geometry yet: fall through and keep dragging the
+            // ghost, which still tears on release.
+        }
+        MidDragTear::None => {}
+    }
+
     if let Some(DropTarget::Split { zone, .. }) = target {
-        // VS Code's drop shade: a blue wash over the half the split would take.
-        ui.painter().rect_filled(zone, 0.0, DROP_ZONE_FILL);
-        ui.painter().rect_stroke(
-            zone,
-            0.0,
-            Stroke::new(1.0, DROP_ZONE_EDGE),
-            egui::StrokeKind::Inside,
-        );
+        paint_drop_zone(ui.painter(), zone);
     }
     if !in_own_bar(pointer) {
-        // Inside its own bar the live pill *is* the drag feedback.
-        paint_ghost(&ctx, tabs, icons, drag, pointer);
+        // Inside its own bar the live pill *is* the drag feedback. Past the
+        // window edge the ghost puts on a window frame, so the tear-out reads
+        // before the button comes up rather than surprising the user after.
+        let tearing = release_tears_out(Some(pointer), windows.local);
+        paint_ghost(&ctx, tabs, icons, drag, pointer, tearing);
     }
     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
     ctx.request_repaint();
+    CarryReport::Idle
 }
 
 #[cfg(test)]
@@ -2143,5 +3103,484 @@ mod tests {
         let mid = state.animate(key, 100.0, GROW_TIME, (GROW_TIME / 4.0) as f64);
         let retargeted = state.animate(key, 0.0, GROW_TIME, (GROW_TIME / 4.0) as f64);
         assert!((retargeted - mid).abs() < 0.01);
+    }
+
+    /// A 900×600 window, the shape [`release_tears_out`] is asked about.
+    fn viewport() -> Rect {
+        Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 600.0))
+    }
+
+    /// A release anywhere the window can see keeps the drag ordinary: the drop
+    /// targets (own bar, foreign bar, terminal half) decide it, not this.
+    #[test]
+    fn a_release_inside_the_window_never_tears() {
+        let v = viewport();
+        for pos in [
+            v.center(),
+            v.min,
+            v.max,
+            egui::pos2(0.0, 300.0),
+            egui::pos2(899.0, 1.0),
+        ] {
+            assert!(!release_tears_out(Some(pos), v), "{pos:?}");
+        }
+    }
+
+    /// Past every edge, on all four sides — the window's own frame is not
+    /// enough, but a hand that carried the pill off the window is.
+    #[test]
+    fn a_release_beyond_any_edge_tears() {
+        let v = viewport();
+        for pos in [
+            egui::pos2(-40.0, 300.0),
+            egui::pos2(940.0, 300.0),
+            egui::pos2(450.0, -30.0),
+            egui::pos2(450.0, 660.0),
+            // Diagonally off a corner counts too.
+            egui::pos2(-20.0, -20.0),
+        ] {
+            assert!(release_tears_out(Some(pos), v), "{pos:?}");
+        }
+    }
+
+    /// [`TEAR_MARGIN`] is the whole point of the slack: a pointer sitting on —
+    /// or a hair past — the window edge is inside a window whose last row of
+    /// pixels it is touching, not a tear-out.
+    #[test]
+    fn grazing_the_edge_is_not_a_tear() {
+        let v = viewport();
+        assert!(!release_tears_out(
+            Some(egui::pos2(900.0 + TEAR_MARGIN - 1.0, 300.0)),
+            v
+        ));
+        assert!(!release_tears_out(Some(egui::pos2(-TEAR_MARGIN, 300.0)), v));
+        assert!(release_tears_out(
+            Some(egui::pos2(900.0 + TEAR_MARGIN + 1.0, 300.0)),
+            v
+        ));
+    }
+
+    /// The other shape of "outside": the pointer left without a farewell
+    /// position, so there is no `interact_pos` at all. That release happened
+    /// off the window.
+    #[test]
+    fn a_release_with_no_pointer_position_tears() {
+        assert!(release_tears_out(None, viewport()));
+    }
+
+    /// The mid-drag half: inside the window (edge slack included) the gesture
+    /// is still an ordinary drag, whatever the tab count.
+    #[test]
+    fn a_pointer_inside_the_window_tears_nothing() {
+        let v = viewport();
+        for pos in [v.center(), v.min, v.max, egui::pos2(900.0, 300.0)] {
+            assert_eq!(
+                mid_drag_tear(true, Some(pos), v, 3),
+                MidDragTear::None,
+                "{pos:?}"
+            );
+        }
+    }
+
+    /// Past the edge with company left behind: the tab becomes a window of its
+    /// own, mid-drag, without waiting for the button.
+    #[test]
+    fn crossing_the_edge_with_siblings_mints_a_window() {
+        let v = viewport();
+        assert_eq!(
+            mid_drag_tear(true, Some(egui::pos2(-40.0, 300.0)), v, 2),
+            MidDragTear::NewWindow
+        );
+        assert_eq!(
+            mid_drag_tear(true, Some(egui::pos2(450.0, 700.0)), v, 9),
+            MidDragTear::NewWindow
+        );
+    }
+
+    /// The last tab of a window has nothing to be torn out of, so the window
+    /// itself goes along for the ride — Chrome's behaviour, and the reason the
+    /// gesture never has to refuse.
+    #[test]
+    fn crossing_the_edge_with_the_last_tab_steers_the_window() {
+        let v = viewport();
+        assert_eq!(
+            mid_drag_tear(true, Some(egui::pos2(-40.0, 300.0)), v, 1),
+            MidDragTear::SteerWindow
+        );
+    }
+
+    /// Nothing to decide without a pointer down and a position: a release is
+    /// the old path's business ([`release_tears_out`]), and a pointer that
+    /// vanished cannot steer a window anywhere.
+    #[test]
+    fn no_button_or_no_position_decides_nothing() {
+        let v = viewport();
+        assert_eq!(
+            mid_drag_tear(false, Some(egui::pos2(-40.0, 300.0)), v, 3),
+            MidDragTear::None
+        );
+        assert_eq!(mid_drag_tear(true, None, v, 3), MidDragTear::None);
+        assert_eq!(
+            mid_drag_tear(true, Some(egui::pos2(-40.0, 300.0)), v, 0),
+            MidDragTear::None
+        );
+    }
+
+    /// Two windows' bars, side by side: the root's across the top of a
+    /// 900-wide window at the origin holding three tabs, and torn-out window
+    /// 7's at (1000, 200) holding one.
+    fn bars() -> [BarStrip; 2] {
+        [
+            BarStrip {
+                win: 0,
+                group: 0,
+                rect: Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(900.0, TAB_BAR_HEIGHT)),
+                tabs: 3,
+            },
+            BarStrip {
+                win: 7,
+                group: 0,
+                rect: Rect::from_min_size(
+                    egui::pos2(1000.0, 200.0),
+                    Vec2::new(400.0, TAB_BAR_HEIGHT),
+                ),
+                tabs: 1,
+            },
+        ]
+    }
+
+    /// Docked in the root window's only group, at slot `index`.
+    fn docked(index: usize) -> Option<DockSlot> {
+        Some(DockSlot {
+            win: 0,
+            group: 0,
+            index,
+        })
+    }
+
+    /// The dock hit test works in screen points and skips the window being
+    /// carried — a torn window's own bar is under its own pointer the whole
+    /// time, which is exactly where the pointer holds it.
+    #[test]
+    fn a_torn_drag_finds_the_bar_it_is_over() {
+        let bars = bars();
+        // Into the root's bar, carrying window 7: a move back home, at the
+        // slot the pointer is over rather than always at the end.
+        assert_eq!(
+            attach_into_bar(egui::pos2(60.0, 16.0), 7, None, &bars),
+            Some((0, 0, 0))
+        );
+        assert_eq!(
+            attach_into_bar(egui::pos2(880.0, 16.0), 7, None, &bars),
+            Some((0, 0, 3))
+        );
+        // Into window 7's bar, carrying the root: the other direction too.
+        assert_eq!(
+            attach_into_bar(egui::pos2(1010.0, 216.0), 0, None, &bars),
+            Some((7, 0, 0))
+        );
+        // Over the carried window's own bar: nothing, or the drag would dock
+        // into the window it is carrying.
+        assert_eq!(
+            attach_into_bar(egui::pos2(1100.0, 216.0), 7, None, &bars),
+            None
+        );
+    }
+
+    /// Only the bar docks: the body of a window below it is somewhere to
+    /// leave a window, not somewhere to hand a tab over.
+    #[test]
+    fn a_torn_drag_over_a_window_body_or_the_desktop_docks_to_nothing() {
+        let bars = bars();
+        assert_eq!(
+            attach_into_bar(egui::pos2(450.0, 300.0), 7, None, &bars),
+            None
+        );
+        assert_eq!(
+            attach_into_bar(egui::pos2(1500.0, 900.0), 7, None, &bars),
+            None
+        );
+    }
+
+    /// The slot is the bar's own arithmetic replayed from outside: the same
+    /// tab widths, and one more slot to insert at than there are tabs — except
+    /// for a tab already docked in that bar, which can only trade places with
+    /// the ones beside it.
+    #[test]
+    fn the_slot_follows_the_pointer_along_the_strip() {
+        let strip = bars()[0];
+        assert_eq!(bar_slot(&strip, 0.0, false), 0);
+        assert_eq!(bar_slot(&strip, 10_000.0, false), 3);
+        assert_eq!(bar_slot(&strip, 10_000.0, true), 2);
+        // Monotonic across the row: the slot never goes backwards as the
+        // pointer moves right.
+        let mut last = 0;
+        for step in 0..90 {
+            let slot = bar_slot(&strip, step as f32 * 10.0, false);
+            assert!(slot >= last, "slot {slot} after {last}");
+            last = slot;
+        }
+    }
+
+    /// Entering a foreign bar docks the tab — really, into that window — and
+    /// releasing there has nothing left to do.
+    #[test]
+    fn entering_a_bar_docks_and_releasing_there_only_ends_the_gesture() {
+        let bar = TornTarget::Bar {
+            win: 0,
+            group: 0,
+            index: 2,
+        };
+        assert_eq!(
+            torn_step(true, Some(bar), None),
+            TornStep::Dock {
+                win: 0,
+                group: 0,
+                index: 2
+            }
+        );
+        assert_eq!(torn_step(true, Some(bar), docked(2)), TornStep::Settled);
+        assert_eq!(torn_step(false, Some(bar), docked(2)), TornStep::Attach);
+        // Released the same frame it arrives: it still has to get there.
+        assert_eq!(
+            torn_step(false, Some(bar), None),
+            TornStep::Dock {
+                win: 0,
+                group: 0,
+                index: 2
+            }
+        );
+    }
+
+    /// Moving along the bar it is docked in slides the tab; moving to another
+    /// window's bar is a fresh dock, which travels in one step.
+    #[test]
+    fn sliding_along_a_bar_reorders_and_a_foreign_bar_redocks() {
+        let here = TornTarget::Bar {
+            win: 0,
+            group: 0,
+            index: 1,
+        };
+        assert_eq!(
+            torn_step(true, Some(here), docked(2)),
+            TornStep::Slide {
+                win: 0,
+                group: 0,
+                index: 1
+            }
+        );
+        let elsewhere = TornTarget::Bar {
+            win: 7,
+            group: 0,
+            index: 0,
+        };
+        assert_eq!(
+            torn_step(true, Some(elsewhere), docked(2)),
+            TornStep::Dock {
+                win: 7,
+                group: 0,
+                index: 0
+            }
+        );
+    }
+
+    /// Leaving the bar with the button still down takes the tab back out:
+    /// undocked, the window it came from follows the pointer again.
+    #[test]
+    fn leaving_the_bar_undocks_and_steers_again() {
+        assert_eq!(torn_step(true, None, docked(0)), TornStep::Undock);
+        assert_eq!(torn_step(true, None, None), TornStep::Steer);
+        let split = TornTarget::Split {
+            win: 0,
+            group: 1,
+            dir: SplitDir::Right,
+            zone: Rect::NOTHING,
+        };
+        assert_eq!(torn_step(true, Some(split), docked(0)), TornStep::Undock);
+        assert_eq!(torn_step(true, Some(split), None), TornStep::Steer);
+    }
+
+    /// A release away from every bar never docks: over a foreign terminal it
+    /// splits that group, over bare desktop it leaves the window where it was.
+    #[test]
+    fn a_release_outside_a_bar_never_docks() {
+        assert_eq!(
+            torn_step(
+                false,
+                Some(TornTarget::Split {
+                    win: 4,
+                    group: 2,
+                    dir: SplitDir::Down,
+                    zone: Rect::NOTHING,
+                }),
+                None
+            ),
+            TornStep::Split {
+                win: 4,
+                group: 2,
+                dir: SplitDir::Down,
+            }
+        );
+        assert_eq!(torn_step(false, None, None), TornStep::Drop);
+    }
+
+    /// The strip a drag is already docked to is the more forgiving one: a
+    /// point that would not have docked keeps a docked drag docked, so the
+    /// tab does not hop in and out of the bar it is sitting in.
+    #[test]
+    fn a_docked_strip_holds_on_a_little_longer() {
+        let bars = bars();
+        let outside = egui::pos2(450.0, TAB_BAR_HEIGHT + BAR_DRAG_SLACK + 1.0);
+        assert_eq!(attach_into_bar(outside, 7, None, &bars), None);
+        assert!(attach_into_bar(outside, 7, docked(1), &bars).is_some());
+        // Only for the strip it is docked to, and only so far.
+        let elsewhere = Some(DockSlot {
+            win: 9,
+            group: 0,
+            index: 0,
+        });
+        assert_eq!(attach_into_bar(outside, 7, elsewhere, &bars), None);
+        assert_eq!(
+            attach_into_bar(
+                egui::pos2(
+                    450.0,
+                    TAB_BAR_HEIGHT + BAR_DRAG_SLACK + DOCK_HYSTERESIS + 1.0
+                ),
+                7,
+                docked(1),
+                &bars
+            ),
+            None
+        );
+    }
+
+    /// The root window's two terminals under its bar, and window 7's one.
+    fn terms() -> [(u64, usize, Rect); 3] {
+        [
+            (
+                0u64,
+                0usize,
+                Rect::from_min_size(egui::pos2(0.0, TAB_BAR_HEIGHT), Vec2::new(450.0, 568.0)),
+            ),
+            (
+                0u64,
+                1usize,
+                Rect::from_min_size(egui::pos2(450.0, TAB_BAR_HEIGHT), Vec2::new(450.0, 568.0)),
+            ),
+            (
+                7u64,
+                0usize,
+                Rect::from_min_size(
+                    egui::pos2(1000.0, 200.0 + TAB_BAR_HEIGHT),
+                    Vec2::new(400.0, 268.0),
+                ),
+            ),
+        ]
+    }
+
+    /// A torn drag over a foreign terminal picks that window's group and the
+    /// quadrant under the pointer — the same rule an in-window drag follows,
+    /// only across a window boundary.
+    #[test]
+    fn a_torn_drag_over_a_foreign_terminal_picks_a_half_of_it() {
+        let (bars, terms) = (bars(), terms());
+        // Well right of centre in the root's second group, carrying window 7.
+        assert_eq!(
+            torn_target(egui::pos2(880.0, 300.0), 7, None, &bars, &terms),
+            Some(TornTarget::Split {
+                win: 0,
+                group: 1,
+                dir: SplitDir::Right,
+                zone: Rect::from_min_size(
+                    egui::pos2(675.0, TAB_BAR_HEIGHT),
+                    Vec2::new(225.0, 568.0)
+                ),
+            })
+        );
+        // Near the top of the first group: the upper half.
+        assert!(matches!(
+            torn_target(egui::pos2(200.0, 80.0), 7, None, &bars, &terms),
+            Some(TornTarget::Split {
+                win: 0,
+                group: 0,
+                dir: SplitDir::Up,
+                ..
+            })
+        ));
+    }
+
+    /// The window under the pointer is the window being carried, and a tab
+    /// cannot be dropped into the thing carrying it.
+    #[test]
+    fn the_steered_window_is_no_split_target_either() {
+        let (bars, terms) = (bars(), terms());
+        assert_eq!(
+            torn_target(egui::pos2(1100.0, 300.0), 7, None, &bars, &terms),
+            None
+        );
+        // Someone else carrying the root: window 7's terminal is fair game.
+        assert!(matches!(
+            torn_target(egui::pos2(1100.0, 300.0), 0, None, &bars, &terms),
+            Some(TornTarget::Split { win: 7, .. })
+        ));
+    }
+
+    /// The bar's slack band hangs a few points into the terminal below it.
+    /// There the gesture aimed at the row of pills wins: docking, not
+    /// splitting.
+    #[test]
+    fn the_bar_wins_where_its_slack_overlaps_a_terminal() {
+        let (bars, terms) = (bars(), terms());
+        let overlap = egui::pos2(200.0, TAB_BAR_HEIGHT + BAR_DRAG_SLACK / 2.0);
+        assert!(terms[0].2.contains(overlap));
+        assert!(matches!(
+            torn_target(overlap, 7, None, &bars, &terms),
+            Some(TornTarget::Bar {
+                win: 0,
+                group: 0,
+                ..
+            })
+        ));
+        // A hair further down and the terminal has it.
+        assert!(matches!(
+            torn_target(
+                egui::pos2(200.0, TAB_BAR_HEIGHT + BAR_DRAG_SLACK + 1.0),
+                7,
+                None,
+                &bars,
+                &terms
+            ),
+            Some(TornTarget::Split {
+                win: 0,
+                group: 0,
+                ..
+            })
+        ));
+    }
+
+    /// Bare desktop is neither.
+    #[test]
+    fn a_torn_drag_over_nothing_targets_nothing() {
+        assert_eq!(
+            torn_target(egui::pos2(1500.0, 900.0), 7, None, &bars(), &terms()),
+            None
+        );
+    }
+
+    /// The torn window is held by its pill: back the outer corner off by the
+    /// bar's left padding plus where inside the pill the drag began, and by
+    /// the decoration plus half a bar, and the pointer lands on that spot of
+    /// the pill. A grab past the ghost's own width clamps, so a pointer can
+    /// never end up beyond the pill it is carrying.
+    #[test]
+    fn the_tear_anchor_puts_the_pointer_on_the_pill() {
+        let anchor = tear_anchor(40.0, 28.0);
+        assert!((anchor.x - (f32::from(PAD_X) + 40.0)).abs() < 0.01);
+        assert!((anchor.y - (28.0 + TAB_BAR_HEIGHT / 2.0)).abs() < 0.01);
+        // Grabbed at the very left of the pill: only the bar padding is left.
+        assert!((tear_anchor(0.0, 0.0).x - f32::from(PAD_X)).abs() < 0.01);
+        // Absurd grabs clamp to the ghost the anchor is taking over from.
+        assert_eq!(tear_anchor(9000.0, 28.0), tear_anchor(GHOST_WIDTH, 28.0));
+        assert_eq!(tear_anchor(-50.0, 28.0), tear_anchor(0.0, 28.0));
     }
 }

@@ -25,6 +25,24 @@
 //! While a ticket is outstanding `App::ui` also keeps requesting repaints —
 //! the readback completes on a later frame, and an idle terra would otherwise
 //! park before that frame ever happened.
+//!
+//! # One window: the root one
+//!
+//! terra can have several OS windows (a tab torn out becomes a deferred
+//! viewport with its own window and its own framebuffer), but `terra
+//! screenshot` photographs the **root** window only — the one terra started
+//! with. The request carries no window on the wire, so there is nothing to name
+//! another one with, and adding that is a protocol change rather than a
+//! refinement here.
+//!
+//! That limitation is enforced at both ends rather than assumed. The command
+//! goes to [`egui::ViewportId::ROOT`] explicitly instead of to "the current
+//! viewport", and [`Screenshots::deliver`] ignores any `Event::Screenshot`
+//! that came from some other viewport. Neither is theoretical: `deliver` runs
+//! once per frame from `App::ui`, an extra window that captures itself for its
+//! own reasons would otherwise have its image handed to whichever IPC thread
+//! happened to be waiting, and a ticket answered with the wrong window's pixels
+//! is a screenshot that is quietly, plausibly wrong — the worst kind.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -88,9 +106,15 @@ impl Screenshots {
             ticket
         };
 
-        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
-            Ticket(ticket),
-        )));
+        // Addressed to the root viewport by name. `send_viewport_cmd` targets
+        // the *current* one, which off the UI thread resolves to the root by
+        // default — true today, but "by default" is not the same as "on
+        // purpose", and this is the line that decides which window the user
+        // gets a picture of. See the module docs.
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Screenshot(egui::UserData::new(Ticket(ticket))),
+        );
         ctx.request_repaint();
 
         let deadline = Instant::now() + timeout;
@@ -120,6 +144,10 @@ impl Screenshots {
 
     /// Hand any screenshots in this frame's input to whoever asked for them.
     /// Called from the UI thread, once per frame.
+    ///
+    /// Only the root viewport's images are collected: every ticket this type
+    /// hands out was posted to the root window, so an image from anywhere else
+    /// answers no question of ours (see the module docs).
     pub fn deliver(&self, ctx: &egui::Context) {
         // Collected under `ctx.input` and matched outside it: the closure runs
         // with egui's input lock held, and the state lock must never be taken
@@ -130,8 +158,10 @@ impl Screenshots {
                 .iter()
                 .filter_map(|event| match event {
                     egui::Event::Screenshot {
-                        user_data, image, ..
-                    } => {
+                        viewport_id,
+                        user_data,
+                        image,
+                    } if *viewport_id == egui::ViewportId::ROOT => {
                         let ticket = user_data.data.as_ref()?.downcast_ref::<Ticket>()?.0;
                         Some((ticket, Arc::clone(image)))
                     }
@@ -223,6 +253,52 @@ mod tests {
         reader.next_frame(&mut buf).unwrap();
         assert_eq!(buf[3], 0x80, "alpha must survive");
         assert!(buf[0] >= 0xfe, "got {:#x}, expected ~0xff", buf[0]);
+    }
+
+    /// Play the UI thread's half: run one frame whose input carries a
+    /// screenshot event from `viewport`, and let `deliver` sort it out.
+    fn feed(ctx: &egui::Context, shots: &Screenshots, viewport: egui::ViewportId, ticket: u64) {
+        let input = egui::RawInput {
+            events: vec![egui::Event::Screenshot {
+                viewport_id: viewport,
+                user_data: egui::UserData::new(Ticket(ticket)),
+                image: Arc::new(image(1, 1, egui::Color32::RED)),
+            }],
+            ..Default::default()
+        };
+        // Delivered from *inside* the frame, which is where `App::ui` calls it
+        // and the only place `ctx.input` reads this frame's events.
+        let inner = ctx.clone();
+        let _ = ctx.run_ui(input, |_ui| shots.deliver(&inner));
+    }
+
+    /// `terra screenshot` is the root window's. A torn-out window that
+    /// captures itself must not have its pixels handed to the IPC thread
+    /// waiting on the root's ticket — a screenshot of the wrong window is
+    /// wrong in a way nobody would catch by looking at it.
+    #[test]
+    fn an_image_from_another_window_answers_nobody() {
+        let shots = Screenshots::default();
+        let ctx = egui::Context::default();
+        {
+            let mut state = lock(&shots.state);
+            state.next = 7;
+            state.waiting.push(7);
+        }
+
+        let torn_out = egui::ViewportId::from_hash_of("a torn-out terra window");
+        assert_ne!(torn_out, egui::ViewportId::ROOT);
+        feed(&ctx, &shots, torn_out, 7);
+        assert!(shots.pending(), "the ticket is still outstanding");
+        assert!(
+            lock(&shots.state).ready.is_empty(),
+            "another window's framebuffer was collected"
+        );
+
+        // The root's own image, same ticket, does answer it.
+        feed(&ctx, &shots, egui::ViewportId::ROOT, 7);
+        assert!(!shots.pending());
+        assert!(lock(&shots.state).ready.contains_key(&7));
     }
 
     /// The wait must end even when no UI thread ever answers — this is the

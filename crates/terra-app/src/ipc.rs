@@ -52,6 +52,41 @@ use crate::config::BidiMode;
 use crate::screenshot::Screenshots;
 use crate::tabs::TabManager;
 
+// ---------------------------------------------------------------------------
+// TEMP STUB for integration — remove
+// ---------------------------------------------------------------------------
+//
+// The multi-window `TabManager` API is being written in parallel (see the
+// window/viewport work). These are the three methods `Select` needs, as an
+// extension trait so this file compiles against a `TabManager` that does not
+// have them yet. Rust resolves inherent methods before trait ones, so the
+// moment the real `window_of_tab`/`focus_window`/`focused_window` land on
+// `TabManager` they win silently and this whole block can be deleted without
+// touching a call site.
+#[allow(dead_code)]
+trait TabManagerWindowsStub {
+    fn window_of_tab(&self, tab: u64) -> Option<u64>;
+    fn focus_window(&mut self, win: u64) -> bool;
+    fn focused_window(&self) -> u64;
+}
+
+impl TabManagerWindowsStub for TabManager {
+    /// Single-window stub: every open tab lives in the root window.
+    fn window_of_tab(&self, tab: u64) -> Option<u64> {
+        self.ids().contains(&tab).then_some(ROOT_WINDOW)
+    }
+    fn focus_window(&mut self, win: u64) -> bool {
+        win == ROOT_WINDOW
+    }
+    fn focused_window(&self) -> u64 {
+        ROOT_WINDOW
+    }
+}
+
+/// The window terra starts with, and the one every torn-out window is torn out
+/// *of*. Its viewport is [`egui::ViewportId::ROOT`].
+const ROOT_WINDOW: u64 = 0;
+
 /// Owns the listening address; unlinks the socket file on drop (best effort,
 /// and a no-op for a named pipe, which the kernel reaps with the process).
 pub struct IpcServer {
@@ -376,9 +411,14 @@ fn dispatch(
         Request::List | Request::Capture { .. } | Request::Transcript { .. }
     );
 
-    let response = {
+    let (response, window) = {
         let mut tabs = lock(tabs);
-        execute(&mut tabs, request)
+        let response = execute(&mut tabs, request);
+        // Read *after* executing: `Select` has just focused the tab's window,
+        // so this is the window the summon should bring forward. Taken under
+        // the same lock, so nothing can move a tab in between.
+        let window = summon.then(|| tabs.focused_window());
+        (response, window)
     };
 
     if mutating {
@@ -387,16 +427,41 @@ fn dispatch(
         ctx.request_repaint();
     }
 
-    // `terra select` also summons the window. Done here on the IPC thread via
-    // the thread-safe NSRunningApplication — activating from inside the frame
-    // callback wedges winit's waker.
-    if summon && matches!(response, Response::Ok { .. }) {
-        crate::macos::activate_app();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        ctx.request_repaint();
+    // `terra select` also summons the window the tab is in.
+    if let (Some(window), Response::Ok { .. }) = (window, &response) {
+        summon_window(ctx, window);
     }
 
     response
+}
+
+/// Bring one of terra's windows forward.
+///
+/// Two halves, and only the first is complete. `activate_app` is per *process*
+/// — it raises terra as a whole — and is done here on the IPC thread via the
+/// thread-safe `NSRunningApplication`, never from inside the frame callback,
+/// which wedges winit's waker. The second half is telling the window server
+/// *which* of terra's windows should end up in front, and that is a
+/// per-viewport `Focus`.
+///
+/// The root window has a `ViewportId` known statically, so it gets the real
+/// thing. A torn-out window is a deferred viewport whose id only the code that
+/// created it knows; until that mapping is exposed, such a window gets the
+/// app-level activation alone — terra comes forward, but possibly showing the
+/// wrong window of its own.
+//
+// TODO(summon per viewport): once `TabManager` (or `main.rs`) can hand back the
+// `egui::ViewportId` of a window, replace the fallback with
+// `ctx.send_viewport_cmd_to(id, ViewportCommand::Focus)`.
+fn summon_window(ctx: &egui::Context, window: u64) {
+    crate::macos::activate_app();
+    if window == ROOT_WINDOW {
+        // Addressed explicitly rather than via `send_viewport_cmd`: that one
+        // targets the *current* viewport, which off-frame happens to be the
+        // root but is not guaranteed to stay that way.
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+    }
+    ctx.request_repaint();
 }
 
 /// Replay a key string (`"y{Enter}{Delay 300}n{Enter}"`) against one tab.
@@ -445,6 +510,13 @@ fn send_keys(
 
 /// Capture the window and hand back a PNG.
 ///
+/// **Root window only.** `terra screenshot` takes no window argument on the
+/// wire and gains none here: v1 of the multi-window work photographs the window
+/// terra started with. A torn-out window is a separate deferred viewport with
+/// its own framebuffer, so capturing it means a per-viewport
+/// `ViewportCommand::Screenshot` *and* a wire field to name the window — a
+/// protocol change, which this is deliberately not.
+///
 /// The window is summoned first, for the same reason `terra select` does it and
 /// in the same way (the thread-safe `NSRunningApplication`, never from inside
 /// the frame callback — that wedges winit's waker): the pixels asked for are
@@ -463,9 +535,7 @@ fn screenshot(shots: &Screenshots, ctx: &egui::Context) -> Response {
     if let Ok(png) = shots.capture_within(ctx, std::time::Duration::from_millis(600)) {
         return Response::ok_png(&png);
     }
-    crate::macos::activate_app();
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    ctx.request_repaint();
+    summon_window(ctx, ROOT_WINDOW);
     match shots.capture(ctx) {
         Ok(png) => Response::ok_png(&png),
         Err(err) => Response::err(err),
@@ -483,6 +553,11 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
         // "p, but called x" rather than an error or a silent ignore. The CLI
         // refuses `--profile` together with a `-- cmd`, but the wire allows
         // both and has to mean something, so an explicit command wins too.
+        //
+        // Where it lands needs no code here: `open` puts the tab in the
+        // focused leaf, and the focused leaf is by construction in the focused
+        // window — so `terra new` opens in whichever window the user was last
+        // in, which is the model's own rule rather than an IPC special case.
         Request::New {
             title,
             command,
@@ -608,7 +683,17 @@ fn execute(tabs: &mut TabManager, request: Request) -> Response {
         // Answered in `dispatch`, which has the UI context and does not hold
         // this lock: a screenshot is a frame, not a tab operation.
         Request::Screenshot => Response::err("internal error: screenshot reached the tab executor"),
+        // Two focus moves, in this order, because the second is scoped by the
+        // first: the group/tab APIs act on the *focused window*, so a tab that
+        // was torn out into its own window is unreachable until that window is
+        // focused. Then `select` activates it in its leaf and focuses that
+        // leaf, exactly as it always did. The wire is unchanged throughout —
+        // tab ids are global, so a client never learns windows exist.
         Request::Select { tab } => {
+            let Some(window) = tabs.window_of_tab(tab) else {
+                return no_tab(tab);
+            };
+            tabs.focus_window(window);
             if tabs.select(tab) {
                 Response::ok()
             } else {

@@ -650,26 +650,111 @@ fn shape_of(node: &Node) -> String {
     }
 }
 
+/// One OS window: its own split tree, and which of its leaves the keyboard
+/// belongs to while the window is the focused one.
+///
+/// Tabs are *not* in here — they stay in the one global [`TabManager::tabs`]
+/// map, so a tab torn out into a second window keeps the id the wire protocol
+/// already knows it by. A window owns leaves; leaves own tab ids.
+struct Window {
+    /// Stable identity, minted from [`TabManager::next_window`] and never
+    /// reused. The window terra starts in is 0.
+    id: u64,
+    /// This window's split tree — the same [`Node`] model, with the same
+    /// invariants, one per window. `None` while the window holds no tab,
+    /// which only the last surviving window is ever allowed to be (an
+    /// emptied second window is removed instead; see
+    /// [`TabManager::normalize`]).
+    tree: Option<Node>,
+    /// Leaf *id* (see [`Group::id`]) of this window's focused group.
+    ///
+    /// Remembered per window rather than globally so that returning to a
+    /// window returns to the pane you left it in — switching windows must not
+    /// reshuffle where the keyboard lands inside them.
+    focused_leaf: u64,
+}
+
+/// Does the tree under `node` hold a leaf with id `leaf`?
+fn contains_leaf(node: &Node, leaf: u64) -> bool {
+    match &node.kind {
+        NodeKind::Leaf(group) => group.id == leaf,
+        NodeKind::Split { children, .. } => children.iter().any(|c| contains_leaf(c, leaf)),
+    }
+}
+
+/// The leaves of one window, cloned so no borrow of the window list escapes.
+fn leaves_of(window: &Window) -> Vec<Group> {
+    let mut refs = Vec::new();
+    if let Some(root) = window.tree.as_ref() {
+        collect_leaves(root, &mut refs);
+    }
+    refs.into_iter().cloned().collect()
+}
+
+/// Take `tab` out of whichever window's leaf holds it, leaving that leaf the
+/// way [`TabManager::close`] leaves it: the nearest tab to the left becomes
+/// active. `false` when no window held it.
+///
+/// The leaf it empties (and the window that leaf may empty) is left standing —
+/// [`TabManager::normalize`] is what collapses both, once the caller has also
+/// put the tab down somewhere.
+fn detach_tab(windows: &mut [Window], tab: u64) -> bool {
+    for window in windows.iter_mut() {
+        let Some(root) = window.tree.as_mut() else {
+            continue;
+        };
+        let src_leaf = {
+            let mut refs = Vec::new();
+            collect_leaves(root, &mut refs);
+            refs.iter().find(|g| g.tab_ids.contains(&tab)).map(|g| g.id)
+        };
+        if let Some(src_leaf) = src_leaf {
+            let group = leaf_mut(root, src_leaf).expect("leaf just seen");
+            let idx = group
+                .tab_ids
+                .iter()
+                .position(|i| *i == tab)
+                .expect("tab just seen in this leaf");
+            group.tab_ids.remove(idx);
+            if group.active == Some(tab) {
+                reactivate(group, idx);
+            }
+            return true;
+        }
+    }
+    false
+}
+
 pub struct TabManager {
     tabs: BTreeMap<u64, Tab>,
-    /// The split tree; the single source of truth for the bars, `⌘1..9` and
-    /// next/prev. `None` while no tab is open. Invariants, restored by every
-    /// mutation: every open tab appears in exactly one leaf, a leaf's
-    /// `active` names one of its own tabs, and the [`Node`] shape invariants
-    /// (no empty leaf, no single-child split, no same-axis nesting).
+    /// Every open window, in creation order, each with its own split tree —
+    /// the single source of truth for the bars, `⌘1..9` and next/prev.
+    /// Never empty: window 0 exists from `new` on, and the last window is
+    /// kept even once its last tab closes (that empty state is the app's quit
+    /// condition, not a window to remove).
     ///
     /// Behind a `RefCell` because the tab bar reorders tabs while holding only
     /// a `&TabManager` (the bar is drawn from an immutable borrow, mid-frame,
     /// while a tab is dragged). Nothing else in the manager is shared, so the
     /// borrows are short and strictly local to the group methods.
-    tree: RefCell<Option<Node>>,
-    /// Leaf *id* (see [`Group::id`]) of the focused group. The focused
-    /// group's active tab is the *globally* active tab: keyboard input goes
-    /// there and `terra ls` marks it. Ids are stable across tree reshapes;
-    /// when the focused leaf itself collapses, focus falls to the leaf now at
-    /// its old DFS index (clamped).
-    focused: std::cell::Cell<u64>,
-    /// Next [`Group::id`] to mint. Never reused, like tab ids.
+    windows: RefCell<Vec<Window>>,
+    /// Which window the keyboard is in. *That* window's focused leaf's active
+    /// tab is the globally active tab: keystrokes go there and `terra ls`
+    /// marks it — exactly one tab across every window.
+    focused_window: std::cell::Cell<u64>,
+    /// Next [`Window::id`] to mint. Never reused, like tab and leaf ids.
+    next_window: std::cell::Cell<u64>,
+    /// A window [`Self::hold_window`] is keeping alive while it has no tabs.
+    ///
+    /// One slot, because one drag: a tab dragged out of window A and docked
+    /// into window B leaves A empty, and an empty window is normally gone the
+    /// moment it empties. But A is the window pumping the drag — it owns the
+    /// mouse capture the gesture is riding on — so removing it mid-gesture
+    /// takes the drag down with it. The hold parks that rule until the button
+    /// comes up ([`Self::release_window`]).
+    held: std::cell::Cell<Option<u64>>,
+    /// Next [`Group::id`] to mint. Never reused, like tab ids. Global across
+    /// windows, so a leaf id names a group without also naming its window.
     next_leaf: std::cell::Cell<u64>,
     next_id: u64,
     ctx: egui::Context,
@@ -696,8 +781,14 @@ impl TabManager {
     pub fn new(ctx: egui::Context, pty_events: Sender<(u64, PtyEvent)>) -> Self {
         Self {
             tabs: BTreeMap::new(),
-            tree: RefCell::new(None),
-            focused: std::cell::Cell::new(0),
+            windows: RefCell::new(vec![Window {
+                id: 0,
+                tree: None,
+                focused_leaf: 0,
+            }]),
+            focused_window: std::cell::Cell::new(0),
+            next_window: std::cell::Cell::new(1),
+            held: std::cell::Cell::new(None),
             next_leaf: std::cell::Cell::new(0),
             next_id: 0,
             ctx,
@@ -707,38 +798,187 @@ impl TabManager {
         }
     }
 
-    /// A snapshot of every leaf in DFS order — the order all `group` indices
-    /// in this API refer to. Cloned so no borrow of the tree escapes.
+    /// A snapshot of every leaf of the *focused* window in DFS order — the
+    /// order all `group` indices in this API refer to. Cloned so no borrow of
+    /// the window list escapes.
     fn leaves(&self) -> Vec<Group> {
-        let tree = self.tree.borrow();
-        let mut refs = Vec::new();
-        if let Some(root) = tree.as_ref() {
-            collect_leaves(root, &mut refs);
-        }
-        refs.into_iter().cloned().collect()
+        self.leaves_in(self.focused_window.get())
     }
 
-    /// Restore the tree invariants after a mutation, then make sure focus
-    /// still points at a live leaf: if the focused leaf collapsed, the leaf
-    /// now at its old DFS index (`old_focus`, clamped) takes over — "stay in
-    /// place" from the user's point of view.
+    /// [`Self::leaves`] for a named window; empty for an unknown one.
+    fn leaves_in(&self, win: u64) -> Vec<Group> {
+        let windows = self.windows.borrow();
+        windows
+            .iter()
+            .find(|w| w.id == win)
+            .map(leaves_of)
+            .unwrap_or_default()
+    }
+
+    /// Leaf id of the focused window's focused group.
+    fn focused_leaf(&self) -> u64 {
+        let windows = self.windows.borrow();
+        let focused = self.focused_window.get();
+        windows
+            .iter()
+            .find(|w| w.id == focused)
+            .map(|w| w.focused_leaf)
+            .unwrap_or(0)
+    }
+
+    /// Focus leaf `leaf` *and the window that holds it* — the two are one
+    /// action, because a leaf only ever has the keyboard while its window
+    /// does. A leaf that is in no tree yet (a group being minted) is recorded
+    /// against the currently focused window, which is where `open` and
+    /// `split` always put it.
+    fn set_focused_leaf(&self, leaf: u64) {
+        let owner = {
+            let mut windows = self.windows.borrow_mut();
+            let focused = self.focused_window.get();
+            let idx = windows
+                .iter()
+                .position(|w| {
+                    w.tree
+                        .as_ref()
+                        .is_some_and(|root| contains_leaf(root, leaf))
+                })
+                .or_else(|| windows.iter().position(|w| w.id == focused));
+            idx.map(|i| {
+                windows[i].focused_leaf = leaf;
+                windows[i].id
+            })
+        };
+        if let Some(id) = owner {
+            self.focused_window.set(id);
+        }
+    }
+
+    /// Read the focused window's tree. `None` reaches `f` both for a window
+    /// with no tabs and (defensively) for a focused id naming no window.
+    fn with_tree<R>(&self, f: impl FnOnce(Option<&Node>) -> R) -> R {
+        let windows = self.windows.borrow();
+        let focused = self.focused_window.get();
+        f(windows
+            .iter()
+            .find(|w| w.id == focused)
+            .and_then(|w| w.tree.as_ref()))
+    }
+
+    /// [`Self::with_tree`], mutably. Writes to the `None` stand-in that an
+    /// unknown focused window gets are simply dropped.
+    fn with_tree_mut<R>(&self, f: impl FnOnce(&mut Option<Node>) -> R) -> R {
+        let mut windows = self.windows.borrow_mut();
+        let focused = self.focused_window.get();
+        match windows.iter_mut().find(|w| w.id == focused) {
+            Some(window) => f(&mut window.tree),
+            None => f(&mut None),
+        }
+    }
+
+    /// Restore the tree invariants of *every* window after a mutation (a
+    /// cross-window move touches two of them), drop the windows that emptied
+    /// out, and make sure each window's focus still points at a live leaf.
+    ///
+    /// When a window's focused leaf collapsed, the leaf now at its old DFS
+    /// index takes over — "stay in place" from the user's point of view. That
+    /// index is `old_focus` for the focused window (captured by the caller
+    /// *before* the mutation); for the others it is read off the tree as it
+    /// stands here, which is still pre-collapse: a leaf emptied of tabs is
+    /// only removed below.
+    ///
+    /// The last window is never removed. A terra with no tabs left is one
+    /// empty window, not zero windows — that is the state `is_empty` reports
+    /// and the frame loop quits on.
     fn normalize(&self, old_focus: usize) {
         {
-            let mut tree = self.tree.borrow_mut();
-            if let Some(root) = tree.take() {
-                *tree = normalized(root);
-            }
-            if let Some(root) = tree.as_mut() {
+            let mut windows = self.windows.borrow_mut();
+            let focused_window = self.focused_window.get();
+            for window in windows.iter_mut() {
+                let old_index = if window.id == focused_window {
+                    old_focus
+                } else {
+                    window
+                        .tree
+                        .as_ref()
+                        .map(|root| {
+                            let mut refs = Vec::new();
+                            collect_leaves(root, &mut refs);
+                            refs.iter()
+                                .position(|g| g.id == window.focused_leaf)
+                                .unwrap_or(0)
+                        })
+                        .unwrap_or(0)
+                };
+                if let Some(root) = window.tree.take() {
+                    window.tree = normalized(root);
+                }
+                let Some(root) = window.tree.as_mut() else {
+                    continue;
+                };
                 root.weight = 1.0;
+                let mut refs = Vec::new();
+                collect_leaves(root, &mut refs);
+                if !refs.iter().any(|g| g.id == window.focused_leaf) {
+                    window.focused_leaf = refs[old_index.min(refs.len() - 1)].id;
+                }
+            }
+            // An emptied window is gone — except the last one, which is how a
+            // tabless terra looks, and except one that is being held (a drag
+            // is still pumping its events; see [`Self::hold_window`]).
+            let held = self.held.get();
+            if windows.len() > 1 {
+                if windows.iter().any(|w| w.tree.is_some()) {
+                    windows.retain(|w| w.tree.is_some() || Some(w.id) == held);
+                } else {
+                    // Nothing left anywhere: one empty window survives rather
+                    // than a fresh id being minted for the same window — plus
+                    // the held one, if that is not it.
+                    let first = windows[0].id;
+                    windows.retain(|w| w.id == first || Some(w.id) == held);
+                }
+            }
+            if !windows.iter().any(|w| w.id == focused_window) {
+                // The focused window closed under us: the keyboard goes to the
+                // first survivor, at the leaf that window was last left in.
+                self.focused_window.set(windows[0].id);
             }
         }
-        let leaves = self.leaves();
-        if leaves.is_empty() {
+    }
+
+    /// Keep window `win` alive while it is empty.
+    ///
+    /// A tab dragged out of a window and docked into another one really does
+    /// leave: the model moves it, the source window empties, and an empty
+    /// window normally disappears on the spot. That window is also the one
+    /// running the drag — the OS delivers the whole gesture to whichever
+    /// window saw the button go down — so its viewport closing mid-drag ends
+    /// the drag. The hold keeps it (and only it) around until the gesture is
+    /// over; nothing else about it changes, and with no tabs it is invisible
+    /// to `terra ls` either way.
+    ///
+    /// One slot: there is one pointer, so there is one drag.
+    pub fn hold_window(&self, win: u64) {
+        self.held.set(Some(win));
+    }
+
+    /// The window [`Self::hold_window`] is keeping alive, if any. The one
+    /// window allowed to sit empty while others are open, which is the shape
+    /// the model tests check their invariants against — the app itself only
+    /// ever sets and clears the hold.
+    #[allow(dead_code)]
+    pub fn held_window(&self) -> Option<u64> {
+        self.held.get()
+    }
+
+    /// Drop the hold from [`Self::hold_window`] and settle up: a window that
+    /// only the hold was keeping alive collapses now. Safe to call for a
+    /// window that was never held, and for one that has since been given tabs.
+    pub fn release_window(&mut self, win: u64) {
+        if self.held.get() != Some(win) {
             return;
         }
-        if !leaves.iter().any(|g| g.id == self.focused.get()) {
-            self.focused.set(leaves[old_focus.min(leaves.len() - 1)].id);
-        }
+        self.held.set(None);
+        self.normalize(self.focused_group());
     }
 
     /// Replace the profile table. Called with the config's own copy at startup
@@ -764,12 +1004,18 @@ impl TabManager {
         self.tabs.is_empty()
     }
 
-    /// All tab ids in visual order: the leaves in DFS order, each group's
-    /// tabs in bar order.
+    /// All tab ids in visual order: the windows in creation order, each
+    /// window's leaves in DFS order, each group's tabs in bar order.
+    ///
+    /// Every window, deliberately: `terra ls` and `terra kill` address the
+    /// whole app, and a tab that was torn out into a second window has not
+    /// left it.
     pub fn ids(&self) -> Vec<u64> {
-        self.leaves()
+        let windows = self.windows.borrow();
+        windows
             .iter()
-            .flat_map(|g| g.tab_ids.iter().copied())
+            .flat_map(leaves_of)
+            .flat_map(|g| g.tab_ids)
             .collect()
     }
 
@@ -791,7 +1037,7 @@ impl TabManager {
     /// DFS index of the focused group. Its active tab is the globally active
     /// tab.
     pub fn focused_group(&self) -> usize {
-        let focused = self.focused.get();
+        let focused = self.focused_leaf();
         self.leaves()
             .iter()
             .position(|g| g.id == focused)
@@ -833,28 +1079,53 @@ impl TabManager {
     // this stays for the invariant tests, which assert every leaf's share.
     #[allow(dead_code)]
     pub fn group_weights(&self) -> Vec<f32> {
-        let tree = self.tree.borrow();
-        let mut out = Vec::new();
-        if let Some(root) = tree.as_ref() {
-            leaf_fractions(root, 1.0, &mut out);
-        }
-        out
+        self.with_tree(|tree| {
+            let mut out = Vec::new();
+            if let Some(root) = tree {
+                leaf_fractions(root, 1.0, &mut out);
+            }
+            out
+        })
     }
 
-    /// The split tree for rendering: leaves as DFS indices, weights
-    /// normalised per split. `None` while no tab is open. A lone group comes
-    /// back as `Leaf(0)` — the renderer needs no special case.
+    /// The split tree of the focused window for rendering: leaves as DFS
+    /// indices, weights normalised per split. `None` while the window holds no
+    /// tab. A lone group comes back as `Leaf(0)` — the renderer needs no
+    /// special case.
+    // The renderer names its window explicitly now ([`Self::window_layout`]);
+    // this stays as the "whatever has the keyboard" spelling the tests and the
+    // group API are written in.
+    #[allow(dead_code)]
     pub fn layout(&self) -> Option<LayoutNode> {
-        let tree = self.tree.borrow();
-        let mut next = 0usize;
-        tree.as_ref().map(|root| build_layout(root, &mut next))
+        self.window_layout(self.focused_window.get())
     }
 
-    /// The tree as a string — `h([0,2] v([1] [3]))`, leaves as tab ids — for
-    /// the shape tests (unix-only, like [`shape_of`]).
+    /// [`Self::layout`] for a named window — what the renderer of a *second*
+    /// OS window walks. `None` for an unknown window and for one with no tab
+    /// in it.
+    pub fn window_layout(&self, win: u64) -> Option<LayoutNode> {
+        let windows = self.windows.borrow();
+        let root = windows.iter().find(|w| w.id == win)?.tree.as_ref()?;
+        let mut next = 0usize;
+        Some(build_layout(root, &mut next))
+    }
+
+    /// The focused window's tree as a string — `h([0,2] v([1] [3]))`, leaves
+    /// as tab ids — for the shape tests (unix-only, like [`shape_of`]).
     #[cfg(all(test, unix))]
     pub fn shape(&self) -> String {
-        match self.tree.borrow().as_ref() {
+        self.window_shape(self.focused_window.get())
+    }
+
+    /// [`Self::shape`] for a named window; `-` for an empty or unknown one.
+    #[cfg(all(test, unix))]
+    pub fn window_shape(&self, win: u64) -> String {
+        let windows = self.windows.borrow();
+        match windows
+            .iter()
+            .find(|w| w.id == win)
+            .and_then(|w| w.tree.as_ref())
+        {
             Some(root) => shape_of(root),
             None => "-".to_string(),
         }
@@ -864,55 +1135,57 @@ impl TabManager {
     /// indices from the root, `[]` = root). Empty unless `path` names a
     /// split.
     pub fn split_weights(&self, path: &[usize]) -> Vec<f32> {
-        let tree = self.tree.borrow();
-        let Some(NodeKind::Split { children, .. }) = tree
-            .as_ref()
-            .and_then(|root| node_at(root, path))
-            .map(|n| &n.kind)
-        else {
-            return Vec::new();
-        };
-        let total: f32 = children.iter().map(|c| c.weight).sum();
-        children
-            .iter()
-            .map(|c| {
-                if total > 0.0 {
-                    c.weight / total
-                } else {
-                    1.0 / children.len().max(1) as f32
-                }
-            })
-            .collect()
+        self.with_tree(|tree| {
+            let Some(NodeKind::Split { children, .. }) =
+                tree.and_then(|root| node_at(root, path)).map(|n| &n.kind)
+            else {
+                return Vec::new();
+            };
+            let total: f32 = children.iter().map(|c| c.weight).sum();
+            children
+                .iter()
+                .map(|c| {
+                    if total > 0.0 {
+                        c.weight / total
+                    } else {
+                        1.0 / children.len().max(1) as f32
+                    }
+                })
+                .collect()
+        })
     }
 
     /// Replace the child weights of the split at `path` (the separator
     /// resize drag in `main.rs` writes them back). Rejected unless `path`
     /// names a split and there is one strictly positive weight per child.
     pub fn set_split_weights(&self, path: &[usize], weights: &[f32]) -> bool {
-        let mut tree = self.tree.borrow_mut();
-        let Some(NodeKind::Split { children, .. }) = tree
-            .as_mut()
-            .and_then(|root| node_at_mut(root, path))
-            .map(|n| &mut n.kind)
-        else {
-            return false;
-        };
-        if weights.len() != children.len() || weights.iter().any(|w| !w.is_finite() || *w <= 0.0) {
-            return false;
-        }
-        for (child, weight) in children.iter_mut().zip(weights) {
-            child.weight = *weight;
-        }
-        true
+        self.with_tree_mut(|tree| {
+            let Some(NodeKind::Split { children, .. }) = tree
+                .as_mut()
+                .and_then(|root| node_at_mut(root, path))
+                .map(|n| &mut n.kind)
+            else {
+                return false;
+            };
+            if weights.len() != children.len()
+                || weights.iter().any(|w| !w.is_finite() || *w <= 0.0)
+            {
+                return false;
+            }
+            for (child, weight) in children.iter_mut().zip(weights) {
+                child.weight = *weight;
+            }
+            true
+        })
     }
 
-    /// Focus group `idx` (DFS order); its active tab becomes the globally
-    /// active tab.
+    /// Focus group `idx` (DFS order) of the focused window; its active tab
+    /// becomes the globally active tab.
     pub fn focus_group(&mut self, idx: usize) -> bool {
         let Some(leaf) = self.leaves().get(idx).map(|g| g.id) else {
             return false;
         };
-        self.focused.set(leaf);
+        self.set_focused_leaf(leaf);
         self.sync_visibility();
         true
     }
@@ -935,7 +1208,7 @@ impl TabManager {
         let len = leaves.len() as isize;
         let current = self.focused_group() as isize;
         let next = (current + delta).rem_euclid(len) as usize;
-        self.focused.set(leaves[next].id);
+        self.set_focused_leaf(leaves[next].id);
     }
 
     /// Move `id` out of its group into a *new* group immediately to the right
@@ -965,8 +1238,7 @@ impl TabManager {
     fn split(&mut self, id: u64, axis: Axis, after: bool) -> bool {
         let old_focus = self.focused_group();
         let new_leaf = self.next_leaf.get();
-        {
-            let mut tree = self.tree.borrow_mut();
+        let split = self.with_tree_mut(|tree| {
             let Some(root) = tree.as_mut() else {
                 return false;
             };
@@ -988,12 +1260,16 @@ impl TabManager {
             let mut group = Some(Group::of(new_leaf, id));
             let wrapped = wrap_leaf(root, src_leaf, &mut group, axis, after);
             debug_assert!(wrapped, "the source leaf cannot have vanished");
+            true
+        });
+        if !split {
+            return false;
         }
         self.next_leaf.set(new_leaf + 1);
         // The wrap may have nested a split inside a same-axis parent;
         // normalize splices it in (and the halved weights come out right).
         self.normalize(old_focus);
-        self.focused.set(new_leaf);
+        self.set_focused_leaf(new_leaf);
         self.sync_visibility();
         true
     }
@@ -1004,13 +1280,15 @@ impl TabManager {
     /// empty collapses (its weight folds into a sibling). Unknown ids/groups
     /// and no-op moves return `false`.
     ///
+    /// Both groups are the *focused window's* — dropping a pill into another
+    /// window is [`Self::move_tab_to_window`].
+    ///
     /// `&self` on purpose: the bar reorders mid-drag while holding only an
-    /// immutable borrow (see [`Self::tree`]). Focus does *not* follow the
+    /// immutable borrow (see [`Self::windows`]). Focus does *not* follow the
     /// tab — use [`Self::select`] for that.
     pub fn move_tab(&self, id: u64, target_group: usize, index: usize) -> bool {
         let old_focus = self.focused_group();
-        {
-            let mut tree = self.tree.borrow_mut();
+        let moved = self.with_tree_mut(|tree| {
             let Some(root) = tree.as_mut() else {
                 return false;
             };
@@ -1042,6 +1320,10 @@ impl TabManager {
             let target = leaf_mut(root, target_leaf).expect("leaf just seen");
             target.tab_ids.insert(to, id);
             target.active = Some(id);
+            true
+        });
+        if !moved {
+            return false;
         }
         self.normalize(old_focus);
         self.sync_visibility();
@@ -1064,11 +1346,248 @@ impl TabManager {
         self.move_tab(id, group, to_idx)
     }
 
+    // -- windows -------------------------------------------------------------
+
+    /// Every open window's id, ascending — the render loop's list of viewports.
+    /// Never empty: a terra with no tabs is still one (empty) window, so a
+    /// fresh manager answers `[0]`.
+    pub fn window_ids(&self) -> Vec<u64> {
+        let windows = self.windows.borrow();
+        let mut ids: Vec<u64> = windows.iter().map(|w| w.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The window tab `tab` lives in, if it is open.
+    pub fn window_of_tab(&self, tab: u64) -> Option<u64> {
+        let windows = self.windows.borrow();
+        windows
+            .iter()
+            .find(|w| leaves_of(w).iter().any(|g| g.tab_ids.contains(&tab)))
+            .map(|w| w.id)
+    }
+
+    /// The window holding the leaf (group) with id `leaf_id`.
+    ///
+    /// The counterpart of [`Self::group_leaf_id`] for callers that hold a
+    /// stable leaf id — per-group UI state, an IPC request naming a group —
+    /// and need to know which viewport to draw it in.
+    // Not on the render path (it walks windows outward, so it always knows
+    // which one it is in); this is for the callers that arrive holding only
+    // the leaf id.
+    #[allow(dead_code)]
+    pub fn window_of_group_leaf(&self, leaf_id: u64) -> Option<u64> {
+        let windows = self.windows.borrow();
+        windows
+            .iter()
+            .find(|w| {
+                w.tree
+                    .as_ref()
+                    .is_some_and(|root| contains_leaf(root, leaf_id))
+            })
+            .map(|w| w.id)
+    }
+
+    /// The window the keyboard is in. Every group-index API on this manager
+    /// (`focused_group`, `group_tabs`, `split_*`, `layout`, …) is scoped to it.
+    pub fn focused_window(&self) -> u64 {
+        self.focused_window.get()
+    }
+
+    /// Give window `win` the keyboard, at the leaf it was last left in — the
+    /// per-window focus memory is the point: switching windows must not
+    /// reshuffle which pane you land in. `false` for an unknown window.
+    pub fn focus_window(&mut self, win: u64) -> bool {
+        if !self.windows.borrow().iter().any(|w| w.id == win) {
+            return false;
+        }
+        self.focused_window.set(win);
+        self.sync_visibility();
+        true
+    }
+
+    /// Tear `tab` out into a brand-new window holding one group, which takes
+    /// the keyboard; returns the new window's id.
+    ///
+    /// `None` — a no-op, nothing moved — for an unknown tab and for the sole
+    /// tab of a sole window: there the tab's old window would collapse the
+    /// moment the new one appeared, so the whole operation is the app
+    /// renumbering its only window for nothing.
+    ///
+    /// The source leaf is left the way [`Self::close`] leaves it (the nearest
+    /// tab to the left becomes active) and collapses if it emptied, taking its
+    /// window with it if that emptied too.
+    pub fn move_tab_to_new_window(&mut self, tab: u64) -> Option<u64> {
+        if !self.tabs.contains_key(&tab) {
+            return None;
+        }
+        let old_focus = self.focused_group();
+        let new_leaf = self.next_leaf.get();
+        let new_window = self.next_window.get();
+        {
+            let mut windows = self.windows.borrow_mut();
+            if windows.len() == 1 && self.tabs.len() == 1 {
+                return None;
+            }
+            if !detach_tab(&mut windows, tab) {
+                return None;
+            }
+            windows.push(Window {
+                id: new_window,
+                tree: Some(Node {
+                    weight: 1.0,
+                    kind: NodeKind::Leaf(Group::of(new_leaf, tab)),
+                }),
+                focused_leaf: new_leaf,
+            });
+        }
+        self.next_leaf.set(new_leaf + 1);
+        self.next_window.set(new_window + 1);
+        // Focus moves with the tab: a torn-out tab is one the user is looking
+        // at. Set before `normalize`, so the emptied source window (if it
+        // emptied) is removed without the keyboard ever pointing at it.
+        self.focused_window.set(new_window);
+        self.normalize(old_focus);
+        self.sync_visibility();
+        Some(new_window)
+    }
+
+    /// Move `tab` into window `win`: its focused group, after that group's
+    /// active tab, becoming that group's active tab — the same landing spot
+    /// [`Self::open`] uses, because dropping a pill on a window and opening a
+    /// tab in it should put it in the same place.
+    ///
+    /// Focus does *not* follow (like [`Self::move_tab`]; the drag path decides
+    /// that for itself) — use [`Self::focus_window`] or [`Self::select`].
+    /// `false` for an unknown tab or window, and for a tab that is already the
+    /// only occupant of `win`, where the move has nothing to do but destroy
+    /// and rebuild a window.
+    // The drop-on-another-window half of the drag is the UI's to wire up; the
+    // model side is complete and tested either way.
+    #[allow(dead_code)]
+    pub fn move_tab_to_window(&mut self, tab: u64, win: u64) -> bool {
+        if !self.tabs.contains_key(&tab) {
+            return false;
+        }
+        let old_focus = self.focused_group();
+        let new_leaf = self.next_leaf.get();
+        let minted = {
+            let mut windows = self.windows.borrow_mut();
+            let Some(target) = windows.iter().position(|w| w.id == win) else {
+                return false;
+            };
+            let Some(source) = windows
+                .iter()
+                .position(|w| leaves_of(w).iter().any(|g| g.tab_ids.contains(&tab)))
+            else {
+                return false;
+            };
+            if source == target
+                && leaves_of(&windows[target])
+                    .iter()
+                    .map(|g| g.tab_ids.len())
+                    .sum::<usize>()
+                    == 1
+            {
+                return false;
+            }
+            detach_tab(&mut windows, tab);
+            // Two separate index borrows: the source is written first, then
+            // the target, because both are `&mut` into the same vector.
+            let window = &mut windows[target];
+            match window.tree.as_mut() {
+                Some(root) => {
+                    let leaf = {
+                        let mut refs = Vec::new();
+                        collect_leaves(root, &mut refs);
+                        refs.iter()
+                            .find(|g| g.id == window.focused_leaf)
+                            .or(refs.first())
+                            .map(|g| g.id)
+                            .expect("a tree has leaves")
+                    };
+                    let group = leaf_mut(root, leaf).expect("leaf just seen");
+                    let at = group
+                        .active
+                        .and_then(|a| group.tab_ids.iter().position(|i| *i == a))
+                        .map(|i| i + 1)
+                        .unwrap_or(group.tab_ids.len());
+                    group.tab_ids.insert(at, tab);
+                    group.active = Some(tab);
+                    window.focused_leaf = group.id;
+                    false
+                }
+                None => {
+                    // The target had emptied out (only the last window is ever
+                    // allowed to sit like that): it gets a fresh root leaf.
+                    window.tree = Some(Node {
+                        weight: 1.0,
+                        kind: NodeKind::Leaf(Group::of(new_leaf, tab)),
+                    });
+                    window.focused_leaf = new_leaf;
+                    true
+                }
+            }
+        };
+        if minted {
+            self.next_leaf.set(new_leaf + 1);
+        }
+        self.normalize(old_focus);
+        self.sync_visibility();
+        true
+    }
+
+    /// Close window `win` and every tab in it, returning those tab ids in
+    /// visual order.
+    ///
+    /// The tabs are dropped here — a `Tab` owns its `TerminalBackend`, so
+    /// there is no other way to shut their PTYs down — and the ids come back
+    /// for the caller's own bookkeeping: the confirm-close question it asked
+    /// beforehand, the viewport it now has to tear down, any per-tab UI state
+    /// keyed by id. An unknown window returns an empty vector and changes
+    /// nothing.
+    ///
+    /// Closing the *last* window empties it rather than removing it, which is
+    /// exactly the state a tabless terra is already in (and what the frame
+    /// loop quits on).
+    pub fn close_window(&mut self, win: u64) -> Vec<u64> {
+        let doomed: Vec<u64> = {
+            let windows = self.windows.borrow();
+            let Some(window) = windows.iter().find(|w| w.id == win) else {
+                return Vec::new();
+            };
+            leaves_of(window)
+                .into_iter()
+                .flat_map(|g| g.tab_ids)
+                .collect()
+        };
+        for id in &doomed {
+            self.tabs.remove(id);
+        }
+        {
+            let mut windows = self.windows.borrow_mut();
+            if windows.len() > 1 {
+                windows.retain(|w| w.id != win);
+            } else {
+                windows[0].tree = None;
+            }
+            if !windows.iter().any(|w| w.id == self.focused_window.get()) {
+                self.focused_window.set(windows[0].id);
+            }
+        }
+        // Nothing else was reshaped, so this only re-checks the invariants —
+        // cheap, and the one place they are guaranteed.
+        self.normalize(0);
+        self.sync_visibility();
+        doomed
+    }
+
     // -- the active tab ------------------------------------------------------
 
-    /// The globally active tab: the focused group's active tab.
+    /// The globally active tab: the focused window's focused group's active
+    /// tab — one tab across every window.
     pub fn active_id(&self) -> Option<u64> {
-        let focused = self.focused.get();
+        let focused = self.focused_leaf();
         self.leaves()
             .iter()
             .find(|g| g.id == focused)
@@ -1092,8 +1611,9 @@ impl TabManager {
         self.tabs.get(&id).map(|t| t.effective_title())
     }
 
-    /// Tab descriptions in global visual order. `active` marks the globally
-    /// active tab — the focused group's active one — exactly one per window.
+    /// Tab descriptions in global visual order (see [`Self::ids`]). `active`
+    /// marks the globally active tab — the focused window's focused group's
+    /// active one — exactly one across every window.
     pub fn infos(&self) -> Vec<TabInfo> {
         let active = self.active_id();
         self.ids()
@@ -1177,19 +1697,28 @@ impl TabManager {
             },
         );
         {
-            // New tabs land in the focused group, right after its active tab,
-            // and become that group's — and thus the globally — active tab.
-            let mut tree = self.tree.borrow_mut();
-            match tree.as_mut() {
+            // New tabs land in the focused *window's* focused group, right
+            // after its active tab, and become that group's — and thus the
+            // globally — active tab. A second window opening a tab therefore
+            // keeps it, rather than posting it back to the root window.
+            let mut windows = self.windows.borrow_mut();
+            let focused_window = self.focused_window.get();
+            // The focused id always names a live window; index 0 only covers
+            // a bug.
+            let at = windows
+                .iter()
+                .position(|w| w.id == focused_window)
+                .unwrap_or(0);
+            let window = &mut windows[at];
+            match window.tree.as_mut() {
                 Some(root) => {
                     // The focused id always names a live leaf (`normalize`
                     // guarantees it); the first-leaf fallback only covers a bug.
                     let target = {
                         let mut refs = Vec::new();
                         collect_leaves(root, &mut refs);
-                        let focused = self.focused.get();
                         refs.iter()
-                            .find(|g| g.id == focused)
+                            .find(|g| g.id == window.focused_leaf)
                             .or(refs.first())
                             .map(|g| g.id)
                             .expect("a tree has leaves")
@@ -1202,19 +1731,21 @@ impl TabManager {
                         .unwrap_or(group.tab_ids.len());
                     group.tab_ids.insert(at, id);
                     group.active = Some(id);
-                    self.focused.set(group.id);
+                    window.focused_leaf = group.id;
                 }
                 None => {
-                    // First tab: a fresh root leaf.
+                    // First tab of this window: a fresh root leaf.
                     let leaf = self.next_leaf.get();
                     self.next_leaf.set(leaf + 1);
-                    *tree = Some(Node {
+                    window.tree = Some(Node {
                         weight: 1.0,
                         kind: NodeKind::Leaf(Group::of(leaf, id)),
                     });
-                    self.focused.set(leaf);
+                    window.focused_leaf = leaf;
                 }
             }
+            let id = window.id;
+            self.focused_window.set(id);
         }
         self.sync_visibility();
         Ok(id)
@@ -1231,16 +1762,23 @@ impl TabManager {
     }
 
     /// Remove a tab (dropping its backend shuts the PTY down). A group whose
-    /// last tab closes collapses with it; the app quits when no tab is left
-    /// (`is_empty`, checked by the frame loop).
+    /// last tab closes collapses with it, and a *window* whose last tab closes
+    /// goes with it unless it is the only one left; the app quits when no tab
+    /// is left anywhere (`is_empty`, checked by the frame loop).
+    ///
+    /// Every window is searched, not just the focused one: `terra kill` and a
+    /// `PtyEvent::Exit` name a tab, and a tab is wherever it is.
     pub fn close(&mut self, id: u64) -> bool {
         if self.tabs.remove(&id).is_none() {
             return false;
         }
         let old_focus = self.focused_group();
         {
-            let mut tree = self.tree.borrow_mut();
-            if let Some(root) = tree.as_mut() {
+            let mut windows = self.windows.borrow_mut();
+            for window in windows.iter_mut() {
+                let Some(root) = window.tree.as_mut() else {
+                    continue;
+                };
                 let src_leaf = {
                     let mut refs = Vec::new();
                     collect_leaves(root, &mut refs);
@@ -1254,6 +1792,7 @@ impl TabManager {
                         // Prefer the nearest tab to the left, else the first.
                         reactivate(group, idx);
                     }
+                    break;
                 }
             }
         }
@@ -1266,42 +1805,66 @@ impl TabManager {
     // it can ask the confirm-close question before the close happens — see
     // `App::close_tab`.)
 
+    /// Drop every tab and every window but the root one — the teardown the
+    /// tests use, and the same shape [`Self::new`] hands out.
     pub fn clear(&mut self) {
         self.tabs.clear();
-        *self.tree.borrow_mut() = None;
-        self.focused.set(0);
+        self.held.set(None);
+        *self.windows.borrow_mut() = vec![Window {
+            id: 0,
+            tree: None,
+            focused_leaf: 0,
+        }];
+        self.focused_window.set(0);
     }
 
-    /// Every group's active tab is on screen, so all of them stay "visible"
-    /// to their backends; only the hidden tabs coast.
+    /// Every group's active tab is on screen — in *every* window, since a
+    /// background window is still drawing — so all of them stay "visible" to
+    /// their backends; only the hidden tabs coast.
     fn sync_visibility(&self) {
-        let shown: Vec<u64> = self.leaves().iter().filter_map(|g| g.active).collect();
+        let shown: Vec<u64> = {
+            let windows = self.windows.borrow();
+            windows
+                .iter()
+                .flat_map(leaves_of)
+                .filter_map(|g| g.active)
+                .collect()
+        };
         for (id, tab) in &self.tabs {
             tab.backend.set_visible(shown.contains(id));
         }
     }
 
-    /// Make `id` its group's active tab *and* focus that group, so `id`
-    /// becomes the globally active tab (keyboard input, the IPC active flag).
+    /// Make `id` its group's active tab *and* focus that group — and, when the
+    /// tab lives in another window, that window — so `id` becomes the globally
+    /// active tab (keyboard input, the IPC active flag).
     pub fn select(&mut self, id: u64) -> bool {
-        let leaf = {
-            let mut tree = self.tree.borrow_mut();
-            let Some(root) = tree.as_mut() else {
-                return false;
-            };
-            let src_leaf = {
-                let mut refs = Vec::new();
-                collect_leaves(root, &mut refs);
-                refs.iter().find(|g| g.tab_ids.contains(&id)).map(|g| g.id)
-            };
-            let Some(src_leaf) = src_leaf else {
-                return false;
-            };
-            let group = leaf_mut(root, src_leaf).expect("leaf just seen");
-            group.active = Some(id);
-            group.id
+        let found = {
+            let mut windows = self.windows.borrow_mut();
+            let mut found = None;
+            for window in windows.iter_mut() {
+                let Some(root) = window.tree.as_mut() else {
+                    continue;
+                };
+                let src_leaf = {
+                    let mut refs = Vec::new();
+                    collect_leaves(root, &mut refs);
+                    refs.iter().find(|g| g.tab_ids.contains(&id)).map(|g| g.id)
+                };
+                if let Some(src_leaf) = src_leaf {
+                    let group = leaf_mut(root, src_leaf).expect("leaf just seen");
+                    group.active = Some(id);
+                    window.focused_leaf = src_leaf;
+                    found = Some(window.id);
+                    break;
+                }
+            }
+            found
         };
-        self.focused.set(leaf);
+        let Some(win) = found else {
+            return false;
+        };
+        self.focused_window.set(win);
         self.sync_visibility();
         true
     }

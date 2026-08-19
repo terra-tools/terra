@@ -61,10 +61,15 @@ fn is_shell(command: &str) -> bool {
 
 /// Should closing this window ask first?
 ///
-/// `foreground` is one entry per tab: the lowercased basename of whatever is
-/// running in it, or `None` when terra could not tell (no process table on
-/// this platform, a tab whose shell has not spawned yet, a process that exited
-/// between the walk and the read).
+/// `foreground` is one entry per tab **of the window being closed**: the
+/// lowercased basename of whatever is running in it, or `None` when terra could
+/// not tell (no process table on this platform, a tab whose shell has not
+/// spawned yet, a process that exited between the walk and the read).
+///
+/// Which tabs those are is the caller's to decide, and with several windows
+/// open it is the only thing that keeps the question honest: a build running in
+/// another window is not a reason to warn about closing this one, and skipping
+/// it is not a reason to close this one silently.
 ///
 /// `None` counts as *not* protecting anything. It is the same "no opinion"
 /// that [`crate::procinfo::foreground_command`] documents, and the safe
@@ -85,10 +90,12 @@ pub fn should_confirm(enabled: bool, foreground: &[Option<&str>]) -> bool {
 /// reading of `None`. A tab is a session, and a session with work in it is
 /// worth one question whether or not other tabs happen to survive it.
 ///
-/// The last tab is not a special case here, only a special *wording* one (see
-/// [`Subject`]): closing it tears the window down without ever raising
-/// `close_requested`, so it is the door the red traffic light's dialog would
-/// otherwise never get a say at.
+/// The last tab in a window is not a special case here, only a special
+/// *wording* one (see [`Subject`]): closing it tears that window down without
+/// ever raising `close_requested`, so it is the door the red traffic light's
+/// dialog would otherwise never get a say at. Whether the app goes with the
+/// window is [`Subject::quits_app`]'s business, not this decision's — the
+/// question asked is the same either way.
 pub fn should_confirm_tab_close(enabled: bool, foreground: Option<&str>) -> bool {
     should_confirm(enabled, &[foreground])
 }
@@ -99,32 +106,114 @@ pub fn should_confirm_tab_close(enabled: bool, foreground: Option<&str>) -> bool
 
 /// What the held close would do, if approved — the dialog's wording and the
 /// caller's to-do list in one value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Every variant names the window it happens in, because with a tab torn out
+/// into its own OS window "the window" is no longer a synonym for "terra".
+/// Three nested scopes, and the value has to say which one a close reaches:
+/// the tab, its window, the app. `last_window` is the hinge between the last
+/// two — the same "Close Window?" question ends the process in one case and
+/// leaves terra running in another, and only the caller that counted the
+/// windows can tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subject {
-    /// The window itself: the red traffic light, ⌘Q, the Apple event.
-    #[default]
-    Window,
-    /// One tab, by id. `last` when it is the only tab left in the window
-    /// across every group — closing it empties the window, which is what
-    /// actually shuts terra, so the question is still the window's.
-    Tab { id: u64, last: bool },
+    /// A whole window: its red traffic light, ⌘Q, the Apple event.
+    Window {
+        /// Which window. The root window is `0`.
+        win: u64,
+        /// It is the only window terra has left, so closing it quits.
+        last_window: bool,
+    },
+    /// One tab, by id, in window `win`.
+    Tab {
+        id: u64,
+        win: u64,
+        /// It is the only tab left in *that* window, across every group.
+        /// Closing it empties the window, so the question is the window's —
+        /// whether or not the app survives it.
+        last_in_window: bool,
+        /// Its window is terra's last, so emptying it also quits.
+        last_window: bool,
+    },
 }
 
+/// The root window of a single-window terra: what every close meant before
+/// windows could be torn out, and what `ConfirmClose::default` starts at.
+impl Default for Subject {
+    fn default() -> Self {
+        Subject::Window {
+            win: ROOT_WINDOW,
+            last_window: true,
+        }
+    }
+}
+
+/// The window terra starts with. Mirrors `ipc.rs`'s constant of the same name;
+/// both are the `TabManager`'s root window id.
+pub const ROOT_WINDOW: u64 = 0;
+
+// TEMP STUB for integration — remove: `window`, `window_id`, `quits_app` and
+// `last_window` are the multi-window half of this API, and nothing calls them
+// until `main.rs` learns to close a window without quitting. They are covered
+// by the unit tests below, which is why they are not dead in any real sense.
+#[allow(dead_code)]
 impl Subject {
+    /// A whole-window close.
+    pub fn window(win: u64, last_window: bool) -> Self {
+        Subject::Window { win, last_window }
+    }
+
+    /// A tab close, in the window that holds the tab.
+    pub fn tab(id: u64, win: u64, last_in_window: bool, last_window: bool) -> Self {
+        Subject::Tab {
+            id,
+            win,
+            last_in_window,
+            last_window,
+        }
+    }
+
     /// The tab this close would take, if it is a tab close at all.
     pub fn tab_id(self) -> Option<u64> {
         match self {
-            Subject::Window => None,
+            Subject::Window { .. } => None,
             Subject::Tab { id, .. } => Some(id),
         }
     }
 
-    /// Whether approving this close ends the window rather than a tab in it.
+    /// Which window the close happens in — the one whose tabs the caller
+    /// should be reading foreground processes from, and the one it should tear
+    /// down if this is approved.
+    pub fn window_id(self) -> u64 {
+        match self {
+            Subject::Window { win, .. } | Subject::Tab { win, .. } => win,
+        }
+    }
+
+    /// Whether approving this close ends a window rather than a tab in it.
     /// The dialog's wording follows this, not "is it a tab".
     pub fn closes_window(self) -> bool {
         match self {
-            Subject::Window => true,
-            Subject::Tab { last, .. } => last,
+            Subject::Window { .. } => true,
+            Subject::Tab { last_in_window, .. } => last_in_window,
+        }
+    }
+
+    /// Whether approving this close ends *terra*.
+    ///
+    /// The distinction multi-window adds, and the one the caller must act on:
+    /// emptying a torn-out window closes that window and leaves the app
+    /// running, while emptying the last one is what quits — the ordinary path,
+    /// fade included. The wording does not change between the two, because
+    /// from where the user is standing both close the window in front of them;
+    /// what changes is the work "Close" runs.
+    pub fn quits_app(self) -> bool {
+        self.closes_window() && self.last_window()
+    }
+
+    /// Whether this close's window is terra's last.
+    pub fn last_window(self) -> bool {
+        match self {
+            Subject::Window { last_window, .. } | Subject::Tab { last_window, .. } => last_window,
         }
     }
 
@@ -209,8 +298,19 @@ impl ConfirmClose {
 
     /// [`Self::requested`] for a tab close, which is every in-window door:
     /// the tab's ✕, a middle-click on it, ⌘W, the palette's `tab.close`.
-    pub fn tab_requested(&mut self, id: u64, last: bool, needed: impl FnOnce() -> bool) -> bool {
-        self.requested(Subject::Tab { id, last }, needed)
+    ///
+    /// `win` is the tab's window, `last_in_window` whether it is the only tab
+    /// left in it, and `last_window` whether that window is terra's last. The
+    /// caller has all three to hand; none of them can be inferred here.
+    pub fn tab_requested(
+        &mut self,
+        id: u64,
+        win: u64,
+        last_in_window: bool,
+        last_window: bool,
+        needed: impl FnOnce() -> bool,
+    ) -> bool {
+        self.requested(Subject::tab(id, win, last_in_window, last_window), needed)
     }
 
     /// Whether the dialog should be drawn — and, for the caller, whether the
@@ -594,17 +694,71 @@ mod tests {
     /// gesture happened to be a tab's.
     #[test]
     fn the_last_tab_is_worded_as_the_window_it_closes() {
-        assert_eq!(Subject::Window.title(), TITLE_WINDOW);
+        let sole = Subject::window(ROOT_WINDOW, true);
+        let last_tab = Subject::tab(7, ROOT_WINDOW, true, true);
+        let one_of_many = Subject::tab(7, ROOT_WINDOW, false, true);
+
+        assert_eq!(sole.title(), TITLE_WINDOW);
         assert_eq!(
-            Subject::Tab { id: 7, last: true }.title(),
+            last_tab.title(),
             TITLE_WINDOW,
             "the last tab *is* the window"
         );
-        assert_eq!(Subject::Tab { id: 7, last: false }.title(), TITLE_TAB);
-        assert_eq!(Subject::Tab { id: 7, last: false }.body(), BODY_TAB);
-        assert_eq!(Subject::Tab { id: 7, last: true }.body(), BODY_WINDOW);
-        assert_eq!(Subject::Tab { id: 7, last: false }.tab_id(), Some(7));
-        assert_eq!(Subject::Window.tab_id(), None);
+        assert_eq!(one_of_many.title(), TITLE_TAB);
+        assert_eq!(one_of_many.body(), BODY_TAB);
+        assert_eq!(last_tab.body(), BODY_WINDOW);
+        assert_eq!(one_of_many.tab_id(), Some(7));
+        assert_eq!(sole.tab_id(), None);
+    }
+
+    /// The multi-window question: emptying a torn-out window is still worded
+    /// "Close Window?", because from where the user is standing that is
+    /// exactly what it does. The wording does not know about `last_window`.
+    #[test]
+    fn emptying_a_torn_out_window_is_still_worded_as_a_window_close() {
+        let torn_out = Subject::tab(7, 3, true, false);
+        assert_eq!(torn_out.title(), TITLE_WINDOW);
+        assert_eq!(torn_out.body(), BODY_WINDOW);
+        assert!(torn_out.closes_window());
+        // …and the same for that window's own traffic light.
+        assert_eq!(Subject::window(3, false).title(), TITLE_WINDOW);
+    }
+
+    /// …but the *work* does. This is the whole point of the extra field:
+    /// closing the last tab of a non-last window takes the window down and
+    /// leaves terra running; only emptying the final window quits.
+    #[test]
+    fn only_the_final_window_quits_the_app() {
+        assert!(
+            !Subject::tab(7, 3, true, false).quits_app(),
+            "a torn-out window closes alone"
+        );
+        assert!(Subject::tab(7, ROOT_WINDOW, true, true).quits_app());
+        assert!(!Subject::window(3, false).quits_app());
+        assert!(Subject::window(ROOT_WINDOW, true).quits_app());
+        // A tab the window survives never quits anything, last window or not.
+        assert!(!Subject::tab(7, ROOT_WINDOW, false, true).quits_app());
+        assert!(!Subject::tab(7, 3, false, false).quits_app());
+    }
+
+    /// The caller has to know which window to tear down; a close in window 3
+    /// must not be run against window 0.
+    #[test]
+    fn the_subject_names_its_own_window() {
+        assert_eq!(Subject::tab(7, 3, false, false).window_id(), 3);
+        assert_eq!(Subject::window(3, false).window_id(), 3);
+        assert_eq!(Subject::default().window_id(), ROOT_WINDOW);
+    }
+
+    /// The default is what terra was before windows could be torn out: the
+    /// root window, alone, so approving quits.
+    #[test]
+    fn the_default_subject_is_the_sole_root_window() {
+        let subject = Subject::default();
+        assert_eq!(subject, Subject::window(ROOT_WINDOW, true));
+        assert!(subject.closes_window());
+        assert!(subject.quits_app());
+        assert_eq!(subject.title(), TITLE_WINDOW);
     }
 
     /// A tab close routed through the dialog and approved runs the close
@@ -613,12 +767,15 @@ mod tests {
     #[test]
     fn approving_a_last_tab_close_lets_the_window_close_follow() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.tab_requested(1, true, || true), "the close is held");
-        assert_eq!(confirm.subject(), Subject::Tab { id: 1, last: true });
+        assert!(
+            confirm.tab_requested(1, ROOT_WINDOW, true, true, || true),
+            "the close is held"
+        );
+        assert_eq!(confirm.subject(), Subject::tab(1, ROOT_WINDOW, true, true));
         confirm.answer(Choice::Close);
         // The close itself, then the empty-window close, then the fade's retry.
         for _ in 0..3 {
-            assert!(!confirm.requested(Subject::Window, || panic!("must not re-decide")));
+            assert!(!confirm.requested(Subject::default(), || panic!("must not re-decide")));
         }
     }
 
@@ -628,18 +785,18 @@ mod tests {
     #[test]
     fn approving_a_tab_close_does_not_silence_the_next_one() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.tab_requested(1, false, || true));
+        assert!(confirm.tab_requested(1, ROOT_WINDOW, false, true, || true));
         confirm.answer(Choice::Close);
         // The caller runs the close, sees the window is still there, resets.
         confirm.reset();
 
         let mut asked = 0;
-        assert!(confirm.tab_requested(2, false, || {
+        assert!(confirm.tab_requested(2, ROOT_WINDOW, false, true, || {
             asked += 1;
             true
         }));
         assert_eq!(asked, 1, "the next tab close re-reads the world");
-        assert_eq!(confirm.subject(), Subject::Tab { id: 2, last: false });
+        assert_eq!(confirm.subject(), Subject::tab(2, ROOT_WINDOW, false, true));
     }
 
     /// The happy path: ask, say yes, and the close that follows is not
@@ -648,15 +805,15 @@ mod tests {
     fn approving_lets_this_close_and_its_retry_through() {
         let mut confirm = ConfirmClose::default();
         assert!(
-            confirm.requested(Subject::Window, || true),
+            confirm.requested(Subject::default(), || true),
             "the first request is held"
         );
         assert!(confirm.is_open());
 
         confirm.answer(Choice::Close);
         assert!(!confirm.is_open());
-        assert!(!confirm.requested(Subject::Window, || panic!("must not re-decide")));
-        assert!(!confirm.requested(Subject::Window, || panic!("must not re-decide")));
+        assert!(!confirm.requested(Subject::default(), || panic!("must not re-decide")));
+        assert!(!confirm.requested(Subject::default(), || panic!("must not re-decide")));
     }
 
     /// Cancelling leaves no half-state: the window is not closing, and the
@@ -664,17 +821,17 @@ mod tests {
     #[test]
     fn cancelling_aborts_the_close_and_the_next_one_asks_again() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.requested(Subject::Window, || true));
+        assert!(confirm.requested(Subject::default(), || true));
         confirm.answer(Choice::Cancel);
         assert!(!confirm.is_open());
         assert_eq!(
             confirm.subject(),
-            Subject::Window,
+            Subject::default(),
             "the payload goes with the question"
         );
 
         let mut asked = 0;
-        assert!(confirm.requested(Subject::Window, || {
+        assert!(confirm.requested(Subject::default(), || {
             asked += 1;
             true
         }));
@@ -687,7 +844,7 @@ mod tests {
     #[test]
     fn a_close_that_protects_nothing_is_never_held_back() {
         let mut confirm = ConfirmClose::default();
-        assert!(!confirm.requested(Subject::Window, || false));
+        assert!(!confirm.requested(Subject::default(), || false));
         assert!(!confirm.is_open());
     }
 
@@ -696,8 +853,8 @@ mod tests {
     #[test]
     fn a_second_request_while_asking_keeps_asking() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.requested(Subject::Window, || true));
-        assert!(confirm.requested(Subject::Window, || panic!("must not re-decide")));
+        assert!(confirm.requested(Subject::default(), || true));
+        assert!(confirm.requested(Subject::default(), || panic!("must not re-decide")));
         assert!(confirm.is_open());
     }
 
@@ -706,11 +863,11 @@ mod tests {
     #[test]
     fn a_second_tab_close_while_asking_cannot_rewrite_the_payload() {
         let mut confirm = ConfirmClose::default();
-        assert!(confirm.tab_requested(1, false, || true));
-        assert!(confirm.tab_requested(2, false, || panic!("must not re-decide")));
+        assert!(confirm.tab_requested(1, ROOT_WINDOW, false, true, || true));
+        assert!(confirm.tab_requested(2, ROOT_WINDOW, false, true, || panic!("must not re-decide")));
         assert_eq!(
             confirm.subject(),
-            Subject::Tab { id: 1, last: false },
+            Subject::tab(1, ROOT_WINDOW, false, true),
             "the question on screen is still tab 1's"
         );
     }
