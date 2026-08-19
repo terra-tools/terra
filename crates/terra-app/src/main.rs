@@ -54,6 +54,20 @@ use crate::ui::AppAction;
 
 const RENAME_PROMPT_ID: &str = "rename";
 
+/// The window terra opens with, and the one eframe owns
+/// ([`egui::ViewportId::ROOT`]). Every other window is a deferred viewport
+/// created by tearing a tab out — see [`App::show_extra_windows`].
+const ROOT_WINDOW: u64 = 0;
+
+/// Size a torn-out window opens at. How far its top-left is nudged from the
+/// pointer (so the pointer lands on the tab's pill rather than beside it) is
+/// the drag's business: [`ui::tear_anchor`].
+const NEW_WINDOW_SIZE: [f32; 2] = [900.0, 600.0];
+/// Fallback cascade when there is no pointer to open next to (a torn-out
+/// window from the palette, from IPC): each window steps down-right from the
+/// root's corner, macOS style.
+const NEW_WINDOW_CASCADE: egui::Vec2 = egui::vec2(36.0, 36.0);
+
 /// Width of the hairline between two sibling nodes of the split tree, on
 /// either axis. Its drag hit-area
 /// (`Id::new(("terra_group_separator", split path, boundary))`) is what a
@@ -310,6 +324,76 @@ fn app_icon() -> egui::IconData {
     }
 }
 
+/// The same icon, decoded once and shared. A torn-out window rebuilds its
+/// [`egui::ViewportBuilder`] every frame (that is how a deferred viewport
+/// stays alive), and decoding a PNG per frame per window is not free.
+fn shared_app_icon() -> Arc<egui::IconData> {
+    static ICON: std::sync::OnceLock<Arc<egui::IconData>> = std::sync::OnceLock::new();
+    Arc::clone(ICON.get_or_init(|| Arc::new(app_icon())))
+}
+
+/// The viewport a terra window is drawn in. The root window is eframe's own
+/// ([`egui::ViewportId::ROOT`]); every other one is derived from its window id,
+/// so the same window keeps the same viewport across frames — which is what
+/// tells egui to keep the OS window rather than open a second one.
+fn viewport_id(win: u64) -> egui::ViewportId {
+    if win == ROOT_WINDOW {
+        return egui::ViewportId::ROOT;
+    }
+    egui::ViewportId::from_hash_of(("terra_window", win))
+}
+
+/// Everything the window renderer needs that is *not* the tabs, shared with
+/// the deferred viewport callbacks.
+///
+/// Those callbacks are `Fn(&mut Ui, ViewportClass) + Send + Sync + 'static`, so
+/// they cannot borrow `App` — they capture `Arc`s instead: one for the tabs
+/// (already shared with the IPC threads) and this one for the rest. It is
+/// republished from the root frame, and read by every window's render.
+///
+/// Lock order is **shared, then tabs**, everywhere. The IPC threads only ever
+/// take the tab lock, so they cannot be part of a cycle.
+struct WindowShared {
+    /// This frame's read-only render inputs, refreshed by the root frame.
+    env: RenderEnv,
+    /// One process-table snapshot for every window's bars (see
+    /// [`App::sync_tab_icons`]).
+    icons: tab_icon::IconCache,
+    /// One scrollbar per pane, keyed by `(window, group)` — group indices are
+    /// per window, so the window has to be part of the key or two windows'
+    /// second columns would share one thumb.
+    scrollbars: HashMap<(u64, usize), ScrollbarState>,
+    /// What the windows raised this frame, each tagged with the window it was
+    /// raised in: a tab bar's ＋, a click on a pill, a middle-click close. The
+    /// root frame drains and applies them (with that window focused, so the
+    /// group indices inside them mean what they meant when they were raised).
+    actions: Vec<(u64, AppAction)>,
+    /// Extra windows whose OS close box was hit, drained by the root frame.
+    closed: Vec<u64>,
+    /// Where every window's tab bars are on the desktop: one screen rect per
+    /// group, recorded by that window's own render (only it is told its own
+    /// geometry). A tab drag that has left its window needs all of them at
+    /// once — it attaches the moment the pointer enters one, and no viewport
+    /// can see another's geometry by itself.
+    bars: HashMap<u64, Vec<(egui::Rect, usize)>>,
+    /// The same for every window's terminal areas, in that window's group (DFS)
+    /// order: a torn drag released over one of them splits that group, and the
+    /// window it belongs to has to be able to say which group the pointer is
+    /// in without seeing the pointer.
+    terms: HashMap<u64, Vec<egui::Rect>>,
+    /// The tab currently being carried between windows, as the window driving
+    /// the drag published it on its last frame. Every *other* window reads it
+    /// to paint the half of itself a drop would split into — the pointer is
+    /// reported to the dragging viewport alone, so this is how the news
+    /// travels.
+    carry: Option<ui::CarryState>,
+}
+
+/// [`lock`] for the shared render state. Same poison policy, same reason.
+fn lock_shared(shared: &Mutex<WindowShared>) -> MutexGuard<'_, WindowShared> {
+    shared.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 fn main() -> eframe::Result {
     env_logger::init();
     let mut native_options = eframe::NativeOptions {
@@ -351,9 +435,15 @@ struct App {
     /// the one request they cannot answer alone: the pixels exist only because
     /// this thread drew them (see `screenshot.rs`).
     screenshots: Arc<Screenshots>,
-    /// One scrollbar per group column, keyed by group index — each column
-    /// scrolls (and fades its thumb) independently.
-    scrollbars: HashMap<usize, ScrollbarState>,
+    /// Render state every window shares — scrollbars, tab icons, this frame's
+    /// settings, and the actions the windows raise. Behind an `Arc<Mutex<…>>`
+    /// because a torn-out window draws from a deferred viewport callback,
+    /// which owns its captures (see [`WindowShared`]).
+    shared: Arc<Mutex<WindowShared>>,
+    /// Where a torn-out window opened, kept so its
+    /// [`egui::ViewportBuilder`] — rebuilt every frame — does not yank the
+    /// window back to the pointer on the next one.
+    window_spawn: HashMap<u64, egui::Pos2>,
     config: config::ConfigStore,
     /// `config.generation()` that `cached_font` was built from, so the font
     /// is rebuilt when a setting moves rather than on every frame.
@@ -366,9 +456,6 @@ struct App {
     /// timescales. Polled instead of watched.
     foreground: Option<String>,
     foreground_checked: f64,
-    /// One icon per tab for the tab bar, on its own slower clock — see
-    /// [`tab_icon`].
-    tab_icons: tab_icon::IconCache,
     quitting: bool,
     /// Picks the frame the window fades in on; runs exactly once. (A `terra
     /// select` summon is not an opening and never touches it.)
@@ -443,6 +530,25 @@ impl App {
             config.get().window.confirm_close,
             std::sync::atomic::Ordering::Relaxed,
         );
+        let shared = Arc::new(Mutex::new(WindowShared {
+            env: RenderEnv {
+                modal_open: false,
+                bidi: false,
+                bidi_base: config.get().text.bidi_base,
+                font: cached_font.clone(),
+                focused_group: 0,
+                keyboard: true,
+                bar_with_one_tab: config.get().tabs.bar_with_one_tab,
+                focus_follows_mouse: config.get().input.focus_follows_mouse,
+            },
+            icons: tab_icon::IconCache::default(),
+            scrollbars: HashMap::new(),
+            actions: Vec::new(),
+            closed: Vec::new(),
+            bars: HashMap::new(),
+            terms: HashMap::new(),
+            carry: None,
+        }));
         Self {
             pty_events,
             pty_sender,
@@ -450,12 +556,12 @@ impl App {
             palette: Palette::default(),
             ipc: None,
             screenshots: Arc::default(),
-            scrollbars: HashMap::new(),
+            shared,
+            window_spawn: HashMap::new(),
             cached_config_generation: config.generation(),
             cached_font,
             foreground: None,
             foreground_checked: f64::NEG_INFINITY,
-            tab_icons: tab_icon::IconCache::default(),
             config,
             quitting: false,
             opening: macos::OpenAnimation::default(),
@@ -523,12 +629,25 @@ impl App {
 
     /// Keep the macOS window title — and the titlebar proxy icon that goes with
     /// it — in sync with the active tab (like Ghostty).
+    ///
+    /// The *root* window's active tab, which is the globally active one only
+    /// while the keyboard is in this window: a tab torn out into a window of
+    /// its own must not go on retitling the window it left (each torn-out
+    /// window titles itself — see [`App::show_extra_windows`]).
     fn sync_window_title(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         let title = self
             .tabs
             .as_ref()
-            .and_then(|tabs| lock(tabs).infos().into_iter().find(|i| i.active))
-            .map(|i| i.title)
+            .and_then(|arc| {
+                let tabs = lock(arc);
+                let mut here = tabs
+                    .infos()
+                    .into_iter()
+                    .filter(|i| tabs.window_of_tab(i.id) == Some(ROOT_WINDOW))
+                    .peekable();
+                let first = here.peek().map(|i| i.title.clone());
+                here.find(|i| i.active).map(|i| i.title).or(first)
+            })
             .unwrap_or_else(|| "Terra".to_string());
         if title == self.last_window_title {
             return; // nothing moved — don't stat the disk on every frame
@@ -597,6 +716,9 @@ impl App {
             PaletteAction::new("tab.rename", "Rename Tab…", None)
                 .in_section(TABS)
                 .with_icon(PaletteIcon::Pencil),
+            PaletteAction::new("tab.move-to-new-window", "Move Tab to New Window", None)
+                .in_section(TABS)
+                .with_icon(PaletteIcon::ArrowRight),
             PaletteAction::new("split.right", "Split Tab Right", Some("⌘\\"))
                 .in_section(TABS)
                 .with_icon(PaletteIcon::ArrowRight),
@@ -773,6 +895,13 @@ impl App {
                     "tab.new" => actions.push(AppAction::NewTab),
                     "tab.close" => actions.push(AppAction::CloseActive),
                     "tab.rename" => actions.push(AppAction::RenameActive),
+                    // The palette route acts on the active tab; the drag route
+                    // names the pill that was let go outside the window.
+                    "tab.move-to-new-window" => {
+                        if let Some(id) = self.tabs.as_ref().and_then(|t| lock(t).active_id()) {
+                            actions.push(AppAction::MoveTabToNewWindow { id, pos: None });
+                        }
+                    }
                     "tab.next" => actions.push(AppAction::NextTab),
                     "tab.prev" => actions.push(AppAction::PrevTab),
                     "split.right" => actions.push(AppAction::SplitRight),
@@ -1026,9 +1155,18 @@ impl App {
     ///
     /// With `[tabs] icons = false` the cache is emptied and nothing is polled
     /// at all — the switch buys back the syscall, not just the pixels.
-    fn sync_tab_icons(&mut self, ctx: &egui::Context, tabs: &TabManager) {
-        if !self.config.get().tabs.icons {
-            self.tab_icons.clear();
+    ///
+    /// The cache lives in [`WindowShared`] rather than in `App`: a torn-out
+    /// window's bar is drawn from a viewport callback that cannot reach `App`
+    /// at all, and every bar in every window must read the same snapshot.
+    fn sync_tab_icons(
+        enabled: bool,
+        ctx: &egui::Context,
+        tabs: &TabManager,
+        cache: &mut tab_icon::IconCache,
+    ) {
+        if !enabled {
+            cache.clear();
             return;
         }
         // The fallback text is the title and the spawn command together, so a
@@ -1052,8 +1190,7 @@ impl App {
             })
             .collect();
         let now = ctx.input(|i| i.time);
-        self.tab_icons
-            .poll(now, &facts, procinfo::foreground_commands);
+        cache.poll(now, &facts, procinfo::foreground_commands);
     }
 
     /// A close request arrived: hold it back behind the "Close Window?"
@@ -1068,10 +1205,14 @@ impl App {
         // dialog is already up, and never after the user has approved.
         let enabled = self.config.get().window.confirm_close;
         let tabs = self.tabs.clone();
-        self.confirm_close
-            .requested(confirm_close::Subject::Window, || {
-                close_would_kill_work(enabled, tabs.as_ref())
-            })
+        // The root viewport's close *is* the app's (eframe ends the run loop
+        // with it), so this subject always quits — torn-out windows go down
+        // with it, which is why the work check below walks every window's
+        // tabs, not just the root's.
+        self.confirm_close.requested(
+            confirm_close::Subject::window(confirm_close::ROOT_WINDOW, true),
+            || close_would_kill_work(enabled, tabs.as_ref()),
+        )
     }
 
     /// Close a tab — every in-window door does, so the question is asked in
@@ -1101,17 +1242,201 @@ impl App {
     fn hold_tab_close(&mut self, id: u64) -> bool {
         let enabled = self.config.get().window.confirm_close;
         let tabs = self.tabs.clone();
-        // Every group's tabs, not the focused group's: the window is empty
-        // only when the very last one goes.
-        let last = tabs
+        // Every group's tabs in the tab's *window*, not the focused group's:
+        // that window is empty only when the very last one goes — and only
+        // emptying the last window quits terra, which is what turns the
+        // question from "Close Window?" into one whose approval ends the app.
+        let (win, last_in_window, last_window) = tabs
             .as_ref()
-            .is_some_and(|arc| lock(arc).ids().as_slice() == [id]);
+            .map(|arc| {
+                let t = lock(arc);
+                let win = t.window_of_tab(id).unwrap_or(confirm_close::ROOT_WINDOW);
+                let in_window: Vec<u64> = t
+                    .ids()
+                    .into_iter()
+                    .filter(|i| t.window_of_tab(*i) == Some(win))
+                    .collect();
+                (win, in_window.as_slice() == [id], t.window_ids().len() == 1)
+            })
+            .unwrap_or((confirm_close::ROOT_WINDOW, false, true));
         // A dialog already up owns the pending payload: a tab close arriving
         // mid-question is held (like any second request) but must not rewrite
         // what "Close" will mean. `ConfirmClose` enforces that itself.
-        self.confirm_close.tab_requested(id, last, || {
-            tab_close_would_kill_work(enabled, tabs.as_ref(), id)
-        })
+        self.confirm_close
+            .tab_requested(id, win, last_in_window, last_window, || {
+                tab_close_would_kill_work(enabled, tabs.as_ref(), id)
+            })
+    }
+
+    /// Show every torn-out window as a deferred viewport.
+    ///
+    /// Deferred (not immediate) because the two windows must be able to
+    /// repaint independently: a `top` in a torn-out window animating at 1Hz
+    /// must not drag the root window's frame rate along with it, and a modal
+    /// in the root must not freeze the other window's output. The price is the
+    /// callback's `Send + Sync + 'static`, which is why the render state is
+    /// shared through `Arc`s rather than borrowed off `App`.
+    ///
+    /// This runs every frame: a deferred viewport lives exactly as long as its
+    /// parent keeps showing it, so a window that leaves `window_ids` — its
+    /// last tab closed, its tabs dragged back — closes itself here.
+    fn show_extra_windows(&mut self, ctx: &egui::Context) {
+        let Some(arc) = self.tabs.clone() else {
+            return;
+        };
+        let windows: Vec<u64> = {
+            let tabs = lock(&arc);
+            tabs.window_ids()
+                .into_iter()
+                .filter(|win| *win != ROOT_WINDOW)
+                .collect()
+        };
+        // Positions are minted once, when the window is torn out; anything
+        // else (a window restored by the model, one this frame is seeing for
+        // the first time) cascades off the root window's corner.
+        for win in &windows {
+            if !self.window_spawn.contains_key(win) {
+                let pos = self.cascade_position(ctx);
+                self.window_spawn.insert(*win, pos);
+            }
+        }
+        self.window_spawn.retain(|win, _| windows.contains(win));
+        // Same for the geometry the drag hit-tests against: a dead window must
+        // not keep catching drops. The root window is never in `windows` (it
+        // is not a torn-out one) and always stays.
+        {
+            let mut shared = lock_shared(&self.shared);
+            shared
+                .bars
+                .retain(|win, _| *win == ROOT_WINDOW || windows.contains(win));
+            shared
+                .terms
+                .retain(|win, _| *win == ROOT_WINDOW || windows.contains(win));
+        }
+
+        for win in windows {
+            let title = self.window_title(&arc, win);
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("{title}{}", dev_mark()))
+                .with_inner_size(NEW_WINDOW_SIZE)
+                .with_min_inner_size([480.0, 320.0])
+                .with_icon(shared_app_icon())
+                .with_position(self.window_spawn[&win]);
+            let tabs_cb = Arc::clone(&arc);
+            let shared_cb = Arc::clone(&self.shared);
+            ctx.show_viewport_deferred(viewport_id(win), builder, move |ui, _class| {
+                let ctx = ui.ctx().clone();
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    // TODO(confirm-close per window): the root window's red
+                    // traffic light asks "Close Window?" first; a torn-out
+                    // window's closes its tabs outright. The question is
+                    // asked from `App::ui`, which is the root viewport's
+                    // frame and cannot put a dialog in front of *this*
+                    // window — another agent owns that half.
+                    lock_shared(&shared_cb).closed.push(win);
+                    // The root frame is the one that acts on it, and a parked
+                    // terra would otherwise never paint again.
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+                render_window(ui, win, &tabs_cb, &shared_cb);
+            });
+            // PTY output wakes the *root* viewport (the backends call
+            // `Context::request_repaint` from their reader threads, which off
+            // the UI thread means the root). So every root frame pulls the
+            // other windows along with it: without this a torn-out window
+            // would only repaint on its own input.
+            ctx.request_repaint_of(viewport_id(win));
+        }
+    }
+
+    /// The title bar of window `win`: its first tab's, which for a torn-out
+    /// tab is the tab that was torn out.
+    fn window_title(&self, arc: &Arc<Mutex<TabManager>>, win: u64) -> String {
+        let tabs = lock(arc);
+        tabs.ids()
+            .into_iter()
+            .find(|id| tabs.window_of_tab(*id) == Some(win))
+            .and_then(|id| tabs.title(id))
+            .unwrap_or("Terra")
+            .to_string()
+    }
+
+    /// Where a window with nothing better to go on opens: stepped down-right
+    /// from the root window, one step per window already open.
+    fn cascade_position(&self, ctx: &egui::Context) -> egui::Pos2 {
+        let root = ctx
+            .input(|i| i.viewport().outer_rect)
+            .map(|rect| rect.min)
+            .unwrap_or(egui::pos2(120.0, 120.0));
+        root + NEW_WINDOW_CASCADE * (self.window_spawn.len() as f32 + 1.0)
+    }
+
+    /// Where a *torn-out* window opens for the routes that have no drag to ask
+    /// (the palette, IPC): under the pointer, anchored exactly as a dragged
+    /// tear is ([`ui::tear_anchor`]) — the pointer on the first pill of the new
+    /// bar — so the two arrive at the same place.
+    ///
+    /// The pointer is in this viewport's points; the window's position is in
+    /// the desktop's, so it is measured from the root window's own corner.
+    fn tear_out_position(&self, ctx: &egui::Context) -> egui::Pos2 {
+        let (pointer, outer) = ctx.input(|i| (i.pointer.latest_pos(), i.viewport().outer_rect));
+        match (pointer, outer) {
+            // No drag, so no grab offset inside the pill: its left edge.
+            (Some(pointer), Some(outer)) => {
+                outer.min + pointer.to_vec2() - ui::tear_anchor(0.0, ui::decor_height(ctx))
+            }
+            _ => self.cascade_position(ctx),
+        }
+    }
+
+    /// Close the torn-out windows whose close box was hit since the last
+    /// frame, tabs and all.
+    fn close_extra_windows(&mut self, ctx: &egui::Context) {
+        let closed: Vec<u64> = std::mem::take(&mut lock_shared(&self.shared).closed);
+        if closed.is_empty() {
+            return;
+        }
+        let Some(arc) = self.tabs.clone() else {
+            return;
+        };
+        let mut tabs = lock(&arc);
+        for win in closed {
+            // TODO(confirm-close per window): closed outright, without the
+            // "Close Window?" question — see `show_extra_windows`.
+            let doomed: Vec<u64> = tabs
+                .ids()
+                .into_iter()
+                .filter(|id| tabs.window_of_tab(*id) == Some(win))
+                .collect();
+            for id in doomed {
+                tabs.close(id);
+            }
+            // …and drop the (now empty) window itself. Anything it still holds
+            // comes back here and goes the same way; `close` is idempotent, so
+            // the two lists overlapping is harmless.
+            let left = tabs.close_window(win);
+            for id in left {
+                tabs.close(id);
+            }
+        }
+        drop(tabs);
+        ctx.request_repaint();
+    }
+
+    /// Apply what the windows raised this frame, each with its own window
+    /// focused: `FocusGroup(2)` means *that* window's third group.
+    ///
+    /// Focusing is not a loan here, unlike the render: an action was raised by
+    /// a click or a key in that window, which is the same gesture that gives
+    /// it the keyboard.
+    fn apply_window_actions(&mut self, ctx: &egui::Context) {
+        let raised: Vec<(u64, AppAction)> = std::mem::take(&mut lock_shared(&self.shared).actions);
+        for (win, action) in raised {
+            if let Some(arc) = self.tabs.clone() {
+                lock(&arc).focus_window(win);
+            }
+            self.apply(ctx, action);
+        }
     }
 
     /// Rebuild anything derived from the config, but only when it moved.
@@ -1221,6 +1546,128 @@ impl App {
                     ui::SplitDir::Up => tabs.split_up(id),
                 };
             }
+            AppAction::MoveTabToNewWindow { id, pos } => {
+                let win = lock(&arc).move_tab_to_new_window(id);
+                let Some(win) = win else {
+                    return;
+                };
+                // The window opens under the pointer that tore the tab out,
+                // and takes the keyboard with it — the tab the user is
+                // carrying is the tab they mean to type in. A drag names the
+                // spot itself (it is mid-gesture, in a window that may not be
+                // the root); the palette and IPC have no pointer to ask about
+                // and fall back to this viewport's.
+                let pos = pos.unwrap_or_else(|| self.tear_out_position(ctx));
+                self.window_spawn.insert(win, pos);
+                lock(&arc).focus_window(win);
+                // `show_extra_windows` runs on the root frame, so the new
+                // viewport appears on the next one.
+                ctx.request_repaint();
+            }
+            AppAction::DockTab {
+                id,
+                host,
+                win,
+                group,
+                index,
+            } => {
+                // A tab carried into another window's bar, mid-gesture. The
+                // hold comes first: the move is about to empty `host`, and an
+                // emptied window normally closes — taking with it the viewport
+                // the OS is delivering this very drag to.
+                {
+                    let mut tabs = lock(&arc);
+                    tabs.hold_window(host);
+                    if !tabs.move_tab_to_window(id, win) {
+                        return;
+                    }
+                    // Group indices are the focused window's, so the target
+                    // takes focus before `group` and `index` name anything.
+                    tabs.focus_window(win);
+                    tabs.move_tab(id, group, index);
+                    tabs.select(id);
+                }
+                // The window the tab is now in is the one the user is working
+                // in, so it takes the keyboard — the mouse stays with `host`,
+                // which is what keeps the drag running.
+                ctx.send_viewport_cmd_to(viewport_id(win), egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            }
+            AppAction::ReorderDocked {
+                id,
+                win,
+                group,
+                index,
+            } => {
+                let mut tabs = lock(&arc);
+                tabs.focus_window(win);
+                tabs.move_tab(id, group, index);
+                drop(tabs);
+                ctx.request_repaint();
+            }
+            AppAction::UndockTab { id, host } => {
+                // Pulled back out of the bar: the tab goes home to the window
+                // that has been held empty waiting for it.
+                {
+                    let mut tabs = lock(&arc);
+                    if tabs.move_tab_to_window(id, host) {
+                        tabs.select(id);
+                    }
+                }
+                ctx.request_repaint();
+            }
+            AppAction::ReleaseDragHold { host } => {
+                // The gesture is over: if the tab ended up elsewhere, `host` is
+                // empty and goes now; if it came home, this changes nothing.
+                lock(&arc).release_window(host);
+                ctx.request_repaint();
+            }
+            AppAction::SplitTabInWindow {
+                id,
+                win,
+                group,
+                dir,
+            } => {
+                // The cross-window twin of `SplitTab`, and the order matters:
+                // group indices are the *focused* window's, so the tab moves
+                // house and the window takes focus before `group` names
+                // anything. The move lands it in whichever group had focus
+                // there, so it may still have to walk to the one the pointer
+                // was over.
+                {
+                    let mut tabs = lock(&arc);
+                    tabs.move_tab_to_window(id, win);
+                    tabs.focus_window(win);
+                    if tabs.group_of(id) != Some(group) && !tabs.move_tab(id, group, usize::MAX) {
+                        return;
+                    }
+                    match dir {
+                        ui::SplitDir::Right => tabs.split_right(id),
+                        ui::SplitDir::Left => tabs.split_left(id),
+                        ui::SplitDir::Down => tabs.split_down(id),
+                        ui::SplitDir::Up => tabs.split_up(id),
+                    };
+                    tabs.select(id);
+                }
+                // The window the user dropped into is the one they are now
+                // working in, so it takes the keyboard.
+                ctx.send_viewport_cmd_to(viewport_id(win), egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            }
+            AppAction::DragWindowTo { win, pos } => {
+                // One frame of a torn drag. `viewport_id(ROOT_WINDOW)` is the
+                // root viewport, so carrying the original window off works
+                // through this same arm.
+                ctx.send_viewport_cmd_to(
+                    viewport_id(win),
+                    egui::ViewportCommand::OuterPosition(pos),
+                );
+                // `show_extra_windows` rebuilds every torn window's builder
+                // each frame, `with_position` included; leaving the remembered
+                // spawn position behind would fight the drag.
+                self.window_spawn.insert(win, pos);
+                ctx.request_repaint_of(viewport_id(win));
+            }
             AppAction::OpenPalette => {
                 let actions = self.palette_actions(ctx);
                 self.palette.open(actions);
@@ -1253,6 +1700,7 @@ impl App {
 }
 
 /// Everything one frame's split-tree walk reads but does not mutate.
+#[derive(Clone)]
 struct RenderEnv {
     /// The command palette or the close-confirmation dialog is up, so the
     /// terminal must not hold focus (see `TerminalView::set_focus`).
@@ -1260,9 +1708,14 @@ struct RenderEnv {
     bidi: bool,
     bidi_base: egui_term::BidiBase,
     font: egui_term::TerminalFont,
-    /// DFS index of the focused group, read once — the walk itself never
-    /// changes focus.
+    /// DFS index of the focused group *within the window being drawn*, read
+    /// once — the walk itself never changes focus.
     focused_group: usize,
+    /// Whether this window is the one the keyboard belongs to
+    /// (`TabManager::focused_window`). Only its focused leaf takes keystrokes;
+    /// the other windows draw their focused pill exactly the same, so the
+    /// window you left looks the way you left it.
+    keyboard: bool,
     /// `[tabs] bar_with_one_tab`, read once a frame like the rest of this
     /// struct, so a config reload lands on the very next frame.
     bar_with_one_tab: bool,
@@ -1311,11 +1764,14 @@ fn hover_focus(
 /// geometry — what the cross-group drag overlay routes drops with.
 struct TreeFrame<'a> {
     env: RenderEnv,
+    /// The window this walk is drawing. Every `group` index below is that
+    /// window's, and every egui id is salted with it.
+    window: u64,
     tabs: &'a mut TabManager,
     /// App-level, filled once a frame by [`App::sync_tab_icons`]: one process
     /// snapshot answers every group's bar.
     icons: &'a tab_icon::IconCache,
-    scrollbars: &'a mut HashMap<usize, ScrollbarState>,
+    scrollbars: &'a mut HashMap<(u64, usize), ScrollbarState>,
     geoms: Vec<ui::GroupGeometry>,
     actions: &'a mut Vec<AppAction>,
 }
@@ -1401,7 +1857,7 @@ impl TreeFrame<'_> {
                 let response = ui
                     .interact(
                         grip,
-                        egui::Id::new(("terra_group_separator", path.clone(), i)),
+                        egui::Id::new(("terra_group_separator", self.window, path.clone(), i)),
                         egui::Sense::drag(),
                     )
                     .on_hover_cursor(icon);
@@ -1458,11 +1914,11 @@ impl TreeFrame<'_> {
         // this ui (scroll fades, terminal view state) would jump to a
         // neighbour's column.
         let leaf = self.tabs.group_leaf_id(group).unwrap_or(u64::MAX);
-        let mut col_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(column)
-                .id_salt(("terra_group_column", leaf)),
-        );
+        let mut col_ui = ui.new_child(egui::UiBuilder::new().max_rect(column).id_salt((
+            "terra_group_column",
+            self.window,
+            leaf,
+        )));
         col_ui.set_clip_rect(column);
         ui::tab_bar(
             &mut col_ui,
@@ -1511,7 +1967,14 @@ impl TreeFrame<'_> {
                     area,
                 )
             });
-        if (pressed_here || moved_here) && !focused {
+        // `env.keyboard` gates both: a window that does not have OS focus must
+        // not take the model's focus off the window the user is typing in.
+        // macOS hands a background window the pointer's moves — so
+        // focus-follows-mouse over a window you are not in would otherwise
+        // move the keyboard to a window that cannot receive it. A *click*
+        // there is fine: the OS focuses the window before the press arrives,
+        // so `render_window` has already made this window the keyboard's.
+        if (pressed_here || moved_here) && !focused && self.env.keyboard {
             self.actions.push(AppAction::FocusGroup(group));
         }
 
@@ -1538,14 +2001,14 @@ impl TreeFrame<'_> {
                 // selecting text.
                 let exclusion = self
                     .scrollbars
-                    .get(&group)
+                    .get(&(self.window, group))
                     .is_some_and(scrollbar::ScrollbarState::interactive)
                     .then(|| scrollbar::hit_area(grid));
                 // Only the focused group's view takes the keyboard; the
                 // palette beats them all.
                 let view = TerminalView::new(&mut term_ui, &mut tab.backend)
                     .set_pointer_exclusion(exclusion)
-                    .set_focus(!self.env.modal_open && focused)
+                    .set_focus(!self.env.modal_open && focused && self.env.keyboard)
                     .set_theme(terminal_theme())
                     .set_font(self.env.font.clone())
                     .set_bidi(self.env.bidi)
@@ -1557,11 +2020,205 @@ impl TreeFrame<'_> {
                     &mut term_ui,
                     rect,
                     &mut tab.backend,
-                    self.scrollbars.entry(group).or_default(),
+                    self.scrollbars.entry((self.window, group)).or_default(),
                 );
             }
         }
     }
+}
+
+/// Draw one terra window — its split tree, every leaf's tab bar and terminal,
+/// and the cross-group drag overlay on top.
+///
+/// The root window and every torn-out window run this same function; the only
+/// difference between them is which `ui` it is handed (eframe's, or a deferred
+/// viewport's) and the window id. It is a free function rather than a method
+/// for exactly that reason: the viewport callback has no `App` to call a
+/// method on, only the two `Arc`s it captured.
+///
+/// Two things happen around the walk itself:
+///
+/// * **OS focus becomes model focus.** The window whose OS window has the
+///   keyboard is the window `TabManager` calls focused, so typing lands in the
+///   leaf the user is looking at rather than in the last window they clicked.
+/// * **The model is focused on the window being drawn.** Every `group` index
+///   in the tab API is the *focused* window's, so a background window is drawn
+///   with focus lent to it and the real focus put straight back — inside one
+///   lock, so nothing (an IPC thread included) can observe the loan.
+fn render_window(
+    ui: &mut egui::Ui,
+    win: u64,
+    tabs_arc: &Arc<Mutex<TabManager>>,
+    shared_arc: &Arc<Mutex<WindowShared>>,
+) {
+    let mut shared_guard = lock_shared(shared_arc);
+    let shared = &mut *shared_guard;
+    let mut tabs = lock(tabs_arc);
+
+    let os_focused = ui.ctx().input(|i| i.viewport().focused).unwrap_or(false);
+    if os_focused && tabs.focused_window() != win {
+        tabs.focus_window(win);
+    }
+    let keyboard_window = tabs.focused_window();
+    if keyboard_window != win {
+        tabs.focus_window(win);
+    }
+
+    let mut env = shared.env.clone();
+    env.focused_group = tabs.focused_group();
+    env.keyboard = keyboard_window == win;
+
+    // Actions are collected per window: a ＋ or a pill click means a group in
+    // *this* window, and the root frame re-focuses the window before applying
+    // them so the index still names what it named here.
+    let mut raised: Vec<AppAction> = Vec::new();
+    // What this pass learns about a tab in flight, published below for the
+    // windows it is being carried over.
+    let mut report = ui::CarryReport::NotMine;
+    // Where the *other* windows' tab bars and terminals are on the desktop, as
+    // they stood at the end of their own last frame: the OS tells each viewport
+    // its own rect and no other's, so the shared tables are built one window at
+    // a time and read whole by whoever needs the desktop (today: a torn tab
+    // drag, which docks on entering a bar and splits on a drop into a
+    // terminal). This window's own geometry is only known once the columns
+    // below have been laid out, so it is added there.
+    let inner = ui.ctx().input(|i| i.viewport().inner_rect);
+    let mut bars: Vec<ui::BarStrip> = shared
+        .bars
+        .iter()
+        .filter(|(other, _)| **other != win)
+        .flat_map(|(other, strips)| {
+            strips
+                .iter()
+                .enumerate()
+                .map(|(group, (rect, tabs))| ui::BarStrip {
+                    win: *other,
+                    group,
+                    rect: *rect,
+                    tabs: *tabs,
+                })
+        })
+        .collect();
+    let mut terms: Vec<(u64, usize, egui::Rect)> = shared
+        .terms
+        .iter()
+        .filter(|(other, _)| **other != win)
+        .flat_map(|(other, rects)| {
+            rects
+                .iter()
+                .enumerate()
+                .map(|(group, rect)| (*other, group, *rect))
+        })
+        .collect();
+    let carry = shared.carry;
+    let mut own_bars: Vec<(egui::Rect, usize)> = Vec::new();
+    let mut own_terms: Vec<egui::Rect> = Vec::new();
+    let icons = &shared.icons;
+    let scrollbars = &mut shared.scrollbars;
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x1e, 0x1e, 0x1e)))
+        .show(ui, |ui| {
+            // One guard for the whole window render: `TerminalView` wants a
+            // `&mut Tab` that lives inside the manager, and nothing in here
+            // reaches for the lock a second time.
+            //
+            // A window with no layout has no tabs — the tabless root, or a
+            // window held alive while its only tab is docked in another one
+            // ([`TabManager::hold_window`]). It draws nothing, but the pass
+            // still runs to the end: a held window is usually the one pumping
+            // the drag, and skipping the overlay would strand the gesture.
+            let full = ui.available_rect_before_wrap();
+            let geoms = match tabs.window_layout(win) {
+                Some(root) => {
+                    let mut frame = TreeFrame {
+                        env,
+                        window: win,
+                        tabs: &mut tabs,
+                        icons,
+                        scrollbars,
+                        geoms: Vec::new(),
+                        actions: &mut raised,
+                    };
+                    frame.node(ui, &root, &mut Vec::new(), full);
+                    frame.geoms
+                }
+                None => Vec::new(),
+            };
+
+            // This window's own bar strips and terminals, in screen points,
+            // joining the other windows' from the shared tables. A hidden bar
+            // still offers the band it would occupy, so a bare window can be
+            // dropped into; the terminals keep their group order, which is what
+            // a split action names.
+            if let Some(inner) = inner {
+                let offset = inner.min.to_vec2();
+                own_bars.extend(geoms.iter().enumerate().map(|(group, geom)| {
+                    (
+                        ui::attach_strip(geom).translate(offset),
+                        tabs.group_tabs(group).len(),
+                    )
+                }));
+                own_terms.extend(geoms.iter().map(|geom| geom.terminal.translate(offset)));
+                bars.extend(own_bars.iter().enumerate().map(|(group, (rect, count))| {
+                    ui::BarStrip {
+                        win,
+                        group,
+                        rect: *rect,
+                        tabs: *count,
+                    }
+                }));
+                terms.extend(
+                    own_terms
+                        .iter()
+                        .enumerate()
+                        .map(|(group, rect)| (win, group, *rect)),
+                );
+            }
+
+            // The cross-group half of a tab drag: floating ghost, drop zones,
+            // and the drop itself (as actions applied below). Every window
+            // runs this over the one global drag; the overlay works out whose
+            // it is. `local` has to be this panel's rect rather than
+            // `ctx.viewport_rect()`, which inside a deferred viewport is not
+            // this window's at all.
+            let windows = ui::DragWindows {
+                win,
+                local: full,
+                origin: inner.map(|rect| rect.min),
+                bars: std::mem::take(&mut bars),
+                terms: std::mem::take(&mut terms),
+                carry,
+            };
+            report = ui::tab_drag_overlay(ui, &tabs, icons, &geoms, &windows, &mut raised);
+        });
+
+    if keyboard_window != win {
+        tabs.focus_window(keyboard_window);
+    }
+    drop(tabs);
+    if inner.is_some() {
+        // Published for the other windows' next frames; a window whose OS rect
+        // is not known yet keeps whatever it last published rather than
+        // dropping off the desktop for a frame.
+        shared.bars.insert(win, own_bars);
+        shared.terms.insert(win, own_terms);
+    }
+    match report {
+        // Only the window driving the drag knows where the tab is; a bystander
+        // saying nothing is what keeps it from clearing the news every frame.
+        ui::CarryReport::NotMine => {}
+        ui::CarryReport::Carrying(state) => shared.carry = Some(state),
+        ui::CarryReport::Idle => shared.carry = None,
+    }
+    if !raised.is_empty() {
+        // The root frame is the one that applies these; a parked root would
+        // sit on them forever. It matters most for a torn drag, which feeds
+        // it a fresh window position every frame.
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+    }
+    shared
+        .actions
+        .extend(raised.into_iter().map(|action| (win, action)));
 }
 
 impl eframe::App for App {
@@ -1639,6 +2296,9 @@ impl eframe::App for App {
         }
 
         self.drain_pty_events(&ctx);
+        // A torn-out window's close box was hit between frames; its tabs go
+        // now, before anything is drawn from them.
+        self.close_extra_windows(&ctx);
         self.sync_window_title(&ctx, frame);
         self.sync_config_cache();
 
@@ -1690,11 +2350,15 @@ impl eframe::App for App {
             self.apply(&ctx, action);
         }
 
-        // One process-table snapshot for the whole window: every group's bar
-        // reads the same cache, so the cost is per frame, not per group.
+        // One process-table snapshot for every window: every group's bar in
+        // every window reads the same cache, so the cost is per frame, not per
+        // group and not per window.
         if let Some(arc) = self.tabs.clone() {
+            let enabled = self.config.get().tabs.icons;
+            // Shared before tabs, the one lock order in this file.
+            let mut shared = lock_shared(&self.shared);
             let tabs = lock(&arc);
-            self.sync_tab_icons(&ctx, &tabs);
+            Self::sync_tab_icons(enabled, &ctx, &tabs, &mut shared.icons);
         }
 
         // Re-read after the actions above, so a toggle applied this frame is
@@ -1707,50 +2371,33 @@ impl eframe::App for App {
         let bar_with_one_tab = self.config.get().tabs.bar_with_one_tab;
         let focus_follows_mouse = self.config.get().input.focus_follows_mouse;
         let font = self.cached_font.clone();
-        let tabs_arc = self.tabs.clone();
-        let icons = &self.tab_icons;
-        let scrollbars = &mut self.scrollbars;
-        let panel_actions = &mut actions;
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x1e, 0x1e, 0x1e)))
-            .show(ui, |ui| {
-                let Some(arc) = tabs_arc else {
-                    return;
-                };
-                // One guard for the whole window render: `TerminalView` wants
-                // a `&mut Tab` that lives inside the manager, and nothing in
-                // here reaches for the lock a second time.
-                let mut tabs = lock(&arc);
-                let Some(root) = tabs.layout() else {
-                    return;
-                };
-                let full = ui.available_rect_before_wrap();
-                let mut frame = TreeFrame {
-                    env: RenderEnv {
-                        modal_open,
-                        bidi,
-                        bidi_base,
-                        font: font.clone(),
-                        focused_group: tabs.focused_group(),
-                        bar_with_one_tab,
-                        focus_follows_mouse,
-                    },
-                    tabs: &mut tabs,
-                    icons,
-                    scrollbars: &mut *scrollbars,
-                    geoms: Vec::new(),
-                    actions: &mut *panel_actions,
-                };
-                frame.node(ui, &root, &mut Vec::new(), full);
-                let geoms = frame.geoms;
-
-                // The cross-group half of a tab drag: floating ghost, drop
-                // zones, and the drop itself (as actions applied below).
-                ui::tab_drag_overlay(ui, &tabs, icons, &geoms, panel_actions);
-            });
+        // Publish this frame's render inputs before anything draws: the
+        // torn-out windows read them from their own viewport callbacks, which
+        // run outside this function entirely.
+        {
+            let mut shared = lock_shared(&self.shared);
+            shared.env = RenderEnv {
+                modal_open,
+                bidi,
+                bidi_base,
+                font,
+                // Per window, filled in by `render_window`.
+                focused_group: 0,
+                keyboard: false,
+                bar_with_one_tab,
+                focus_follows_mouse,
+            };
+        }
+        if let Some(arc) = self.tabs.clone() {
+            render_window(ui, ROOT_WINDOW, &arc, &self.shared);
+        }
+        // Every other window, each in an OS window of its own.
+        self.show_extra_windows(&ctx);
         for action in std::mem::take(&mut actions) {
             self.apply(&ctx, action);
         }
+        // …and what the windows themselves raised, this one included.
+        self.apply_window_actions(&ctx);
 
         // Last tab gone (or Quit chosen) -> the app is done. Not while the
         // window is already fading out, though: re-asking every frame would

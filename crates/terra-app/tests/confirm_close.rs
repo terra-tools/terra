@@ -93,8 +93,11 @@ fn frame(
 }
 
 /// The window's own question, which is what most of the on-screen tests are
-/// about — the wording is the only thing a tab close changes.
-const WINDOW: Option<Subject> = Some(Subject::Window);
+/// about — the wording is the only thing a tab close changes. The sole root
+/// window, which is what this harness has: nothing here tears a tab out.
+fn window_subject() -> Option<Subject> {
+    Some(Subject::window(confirm_close::ROOT_WINDOW, true))
+}
 
 fn click(pos: Pos2, pressed: bool) -> Event {
     Event::PointerButton {
@@ -170,14 +173,14 @@ fn context() -> egui::Context {
 fn escape_cancels_and_never_reaches_the_terminal() {
     let ctx = context();
     let (mut backend, _events) = cat(&ctx);
-    frame(&ctx, &mut backend, Vec::new(), WINDOW);
+    frame(&ctx, &mut backend, Vec::new(), window_subject());
 
-    let choice = frame(&ctx, &mut backend, vec![key(Key::Escape)], WINDOW);
+    let choice = frame(&ctx, &mut backend, vec![key(Key::Escape)], window_subject());
     assert_eq!(choice, Some(Choice::Cancel));
 
     // The key was consumed, so a frame that still had the dialog up would see
     // nothing left of it.
-    let again = frame(&ctx, &mut backend, Vec::new(), WINDOW);
+    let again = frame(&ctx, &mut backend, Vec::new(), window_subject());
     assert_eq!(again, None);
 }
 
@@ -186,9 +189,9 @@ fn escape_cancels_and_never_reaches_the_terminal() {
 fn return_confirms_the_close() {
     let ctx = context();
     let (mut backend, _events) = cat(&ctx);
-    frame(&ctx, &mut backend, Vec::new(), WINDOW);
+    frame(&ctx, &mut backend, Vec::new(), window_subject());
 
-    let choice = frame(&ctx, &mut backend, vec![key(Key::Enter)], WINDOW);
+    let choice = frame(&ctx, &mut backend, vec![key(Key::Enter)], window_subject());
     assert_eq!(choice, Some(Choice::Close));
 }
 
@@ -213,11 +216,11 @@ fn the_dialog_keeps_the_keyboard_and_gives_it_back() {
             &ctx,
             &mut backend,
             vec![Event::Text("stolen".to_string())],
-            WINDOW,
+            window_subject(),
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    frame(&ctx, &mut backend, Vec::new(), WINDOW);
+    frame(&ctx, &mut backend, Vec::new(), window_subject());
     assert!(
         !screen_text(&mut backend).contains("stolen"),
         "the dialog lost keystrokes to the terminal below"
@@ -241,7 +244,7 @@ fn clicking_close_confirms() {
     // A few frames first: an anchored `Area` only knows its own size once it
     // has been laid out, so the panel settles on the second frame.
     for _ in 0..3 {
-        frame(&ctx, &mut backend, Vec::new(), WINDOW);
+        frame(&ctx, &mut backend, Vec::new(), window_subject());
     }
 
     let button = ctx
@@ -253,7 +256,7 @@ fn clicking_close_confirms() {
         &ctx,
         &mut backend,
         vec![Event::PointerMoved(at), click(at, true), click(at, false)],
-        WINDOW,
+        window_subject(),
     );
     assert_eq!(choice, Some(Choice::Close));
 }
@@ -266,7 +269,7 @@ fn clicking_outside_the_panel_cancels() {
     // A few frames first: an anchored `Area` only knows its own size once it
     // has been laid out, so the panel settles on the second frame.
     for _ in 0..3 {
-        frame(&ctx, &mut backend, Vec::new(), WINDOW);
+        frame(&ctx, &mut backend, Vec::new(), window_subject());
     }
 
     let panel = ctx
@@ -284,7 +287,7 @@ fn clicking_outside_the_panel_cancels() {
             click(outside, true),
             click(outside, false),
         ],
-        WINDOW,
+        window_subject(),
     );
     assert_eq!(choice, Some(Choice::Cancel));
 }
@@ -353,8 +356,12 @@ fn busy_tab(tabs: &mut TabManager) -> u64 {
 /// in-window close goes through — the tab's ✕, a middle-click on the pill, ⌘W,
 /// the palette's `tab.close`. Returns whether the close was *held*.
 fn close_tab(gate: &mut ConfirmClose, tabs: &mut TabManager, id: u64, enabled: bool) -> bool {
-    let last = tabs.ids().as_slice() == [id];
-    let held = gate.tab_requested(id, last, || {
+    // This harness runs a single, root window — `TabManager` here has no torn
+    // out ones — so "last tab in the window" is "last tab" and the window is
+    // always terra's last. The multi-window shapes of the same decision are
+    // unit-tested in `confirm_close.rs`, where they need no PTYs.
+    let last_in_window = tabs.ids().as_slice() == [id];
+    let held = gate.tab_requested(id, confirm_close::ROOT_WINDOW, last_in_window, true, || {
         confirm_close::should_confirm_tab_close(enabled, foreground(tabs, id).as_deref())
     });
     if !held {
@@ -395,10 +402,7 @@ fn closing_a_busy_tab_asks_and_cancelling_keeps_it() {
     assert!(gate.is_open(), "the dialog is up");
     assert_eq!(
         gate.subject(),
-        Subject::Tab {
-            id: busy,
-            last: false
-        }
+        Subject::tab(busy, confirm_close::ROOT_WINDOW, false, true)
     );
     assert_eq!(
         gate.subject().title(),
@@ -482,15 +486,52 @@ fn the_last_busy_tab_still_asks_as_the_window() {
     assert!(close_tab(&mut gate, &mut tabs, busy, true));
     assert_eq!(
         gate.subject(),
-        Subject::Tab {
-            id: busy,
-            last: true
-        }
+        Subject::tab(busy, confirm_close::ROOT_WINDOW, true, true)
+    );
+    assert!(
+        gate.subject().quits_app(),
+        "the last tab of the last window is what quits terra"
     );
     assert_eq!(gate.subject().title(), confirm_close::TITLE_WINDOW);
 
     answer(&mut gate, &mut tabs, Choice::Close);
     assert!(tabs.is_empty(), "the window is empty, so terra quits");
+}
+
+/// A tab torn out into its own window: emptying that window asks the window's
+/// question, and approving it takes the window down — but *not* terra, which
+/// still has the window the tab came from. Same real busy tab, same gate; the
+/// only difference is that the caller knows this is not the last window.
+#[test]
+fn emptying_a_torn_out_window_closes_it_without_quitting() {
+    let ctx = context();
+    let mut tabs = manager(&ctx);
+    let busy = busy_tab(&mut tabs);
+    let mut gate = ConfirmClose::default();
+
+    // Window 3, sole tab in it, and terra has other windows open.
+    let torn_out = Subject::tab(busy, 3, true, false);
+    assert!(gate.requested(torn_out, || {
+        confirm_close::should_confirm_tab_close(true, foreground(&tabs, busy).as_deref())
+    }));
+    assert_eq!(
+        gate.subject().title(),
+        confirm_close::TITLE_WINDOW,
+        "emptying a window is worded as the window's close"
+    );
+    assert_eq!(
+        gate.subject().window_id(),
+        3,
+        "window 3's close, not the root's"
+    );
+    assert!(
+        !gate.subject().quits_app(),
+        "a torn-out window closing must not take terra with it"
+    );
+
+    gate.answer(Choice::Close);
+    tabs.close(busy);
+    assert!(tabs.is_empty(), "that window's tab is gone");
 }
 
 /// `[window] confirm_close = false` is the whole switch: no door asks.
