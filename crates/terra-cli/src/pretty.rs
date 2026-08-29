@@ -175,7 +175,9 @@ pub fn decode(png: &[u8]) -> Result<Image> {
     let pixels = match (info.color_type, info.bit_depth) {
         (png::ColorType::Rgba, png::BitDepth::Eight) => buf[..info.buffer_size()].to_vec(),
         (png::ColorType::Rgb, png::BitDepth::Eight) => buf[..info.buffer_size()]
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 0xff])
             .collect(),
         (color, depth) => bail!("unsupported PNG format: {color:?} at {depth:?} bits"),

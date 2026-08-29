@@ -693,7 +693,7 @@ fn master(icon: TabIcon) -> Option<Vec<u8>> {
     }
     let generic = icon.is_generic();
     let mut out = Vec::with_capacity(image.rgba.len());
-    for pixel in image.rgba.chunks_exact(4) {
+    for pixel in image.rgba.as_chunks::<4>().0.iter() {
         let alpha = u32::from(pixel[3]);
         let rgb = if generic {
             [255, 255, 255]
@@ -723,7 +723,9 @@ fn texture(ctx: &Context, icon: TabIcon, px: usize) -> Option<TextureHandle> {
     let image = ColorImage::new(
         [px, px],
         pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
             .collect(),
     );
@@ -1097,7 +1099,12 @@ mod tests {
         for icon in TabIcon::ALL {
             let pixels = master(*icon).unwrap_or_else(|| panic!("{} did not decode", icon.key()));
             assert_eq!(pixels.len(), MASTER * MASTER * 4, "{}", icon.key());
-            let covered = pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+            let covered = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] > 0)
+                .count();
             assert!(covered > MASTER, "{} is blank", icon.key());
         }
     }
@@ -1107,13 +1114,15 @@ mod tests {
     #[test]
     fn only_the_generic_glyph_is_reduced_to_a_mask() {
         let generic = master(TabIcon::Terminal).expect("decode");
-        for p in generic.chunks_exact(4).filter(|p| p[3] == 255) {
+        for p in generic.as_chunks::<4>().0.iter().filter(|p| p[3] == 255) {
             assert_eq!([p[0], p[1], p[2]], [255, 255, 255]);
         }
         let claude = master(TabIcon::Claude).expect("decode");
         assert!(
             claude
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[3] == 255 && [p[0], p[1], p[2]] != [255, 255, 255]),
             "the brand colour was thrown away"
         );
