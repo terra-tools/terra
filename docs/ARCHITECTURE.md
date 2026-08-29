@@ -145,7 +145,7 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   key the terminal stops receiving.
 - `TERRA_NO_ACTIVATE=1` starts the window without stealing focus (winit's
   `with_activate_ignoring_other_apps(false)`; the activation policy stays
-  `Regular`, since an `Accessory` app owns no menu bar). `just run`/`just
+  `Regular`, since an `Accessory` app owns no menu bar). `chore run`/`chore
   restart` set it — a dev instance opening on top of what you were typing in
   is the single most disruptive thing about working on terra.
 - Selecting and copying: Shift or Option hands a drag back to terra's own

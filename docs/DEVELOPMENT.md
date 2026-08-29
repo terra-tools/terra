@@ -1,24 +1,24 @@
 # Developing terra
 
-## Everyday tasks (justfile)
+## Everyday tasks (chorefile)
 
 ```sh
-just run / restart   # debug build on the dev socket, beside your daily terra
-just t <args>        # CLI against the dev app, e.g. `just t ls`
-just pre-commit      # fmt + clippy + tests
-just log             # tail /tmp/terra-app.log
-just bundle          # release build + cargo-packager (.app / .dmg)
-just upgrade         # replace /Applications/Terra.app and relaunch it
+chore run / restart  # debug build on the dev socket, beside your daily terra
+chore t <args>       # CLI against the dev app, e.g. `chore t ls`
+chore pre-commit     # fmt + clippy + tests
+chore log            # tail /tmp/terra-app.log
+chore bundle         # release build + cargo-packager (.app / .dmg)
+chore upgrade        # replace /Applications/Terra.app and relaunch it
 ```
 
 ## Dev instance vs daily instance
 
-The control socket is the single-instance claim, so `just run`/`restart`/`t`
+The control socket is the single-instance claim, so `chore run`/`restart`/`t`
 export `TERRA_SOCKET=~/.terra/terra-dev.sock` and the debug build opens beside
 the terra you are working in. The dev window is titled `… (dev)` (`TERRA_DEV=1/0`
-forces the mark); plain `terra` still drives the installed app. `just restart`
+forces the mark); plain `terra` still drives the installed app. `chore restart`
 pkills only `target/debug/terra-app` — it can never hit the installed bundle.
-`just upgrade` is the one command that intentionally closes the daily instance.
+`chore upgrade` is the one command that intentionally closes the daily instance.
 
 Note: `cargo packager` does not build; run `cargo build --release` first when
 invoking it by hand.

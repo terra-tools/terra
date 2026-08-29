@@ -487,7 +487,7 @@ fn explain(error: &str) -> String {
         format!(
             "{error}\n\
              the running terra app does not know this command — it is older than \
-             this CLI. Upgrade it with `just upgrade` (or restart it from a build \
+             this CLI. Upgrade it with `chore upgrade` (or restart it from a build \
              of this checkout)."
         )
     } else {
@@ -977,7 +977,7 @@ mod tests {
     fn an_unknown_verb_error_says_what_to_do_about_it() {
         let explained = explain("bad request: unknown variant `screenshot`, expected one of …");
         assert!(explained.contains("older than this CLI"), "{explained}");
-        assert!(explained.contains("just upgrade"), "{explained}");
+        assert!(explained.contains("chore upgrade"), "{explained}");
         // Everything else is passed through untouched.
         assert_eq!(explain("no such tab: 7"), "no such tab: 7");
     }

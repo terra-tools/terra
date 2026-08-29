@@ -5,7 +5,7 @@
 Every release, in this order — each line has burned us once:
 
 1. **Start the Windows signing server first** (skip only for an unsigned
-   release). On the Mac with the YubiKey plugged in: `just sign-server`, and
+   release). On the Mac with the YubiKey plugged in: `chore sign-server`, and
    keep the machine awake for the whole run — the v1.3.2 Windows job failed
    with Cloudflare 530/1033 because the tunnel's host was asleep. Smoke-test
    from outside: `curl -s -o /dev/null -w '%{http_code}' -A
@@ -102,7 +102,7 @@ behaviour and the signing hooks were verified against exactly that one. CI
 caches the installed binary, keyed on that version, rather than rebuilding it
 each run.
 
-`cargo packager -p terra-app --release` on its own (the `just bundle` path)
+`cargo packager -p terra-app --release` on its own (the `chore bundle` path)
 produces an ad-hoc signed `.app` and `.dmg` with no notarisation, which is what
 a release with no secrets configured produces too.
 

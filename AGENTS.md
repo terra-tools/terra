@@ -1,8 +1,8 @@
 # AGENTS.md
 
 terra — GUI terminal (Rust, egui); tabs remote-controllable via the `terra`
-CLI over a unix socket. `docs/ARCHITECTURE.md` is the contract; `just` lists
-tasks (`just pre-commit` before committing).
+CLI over a unix socket. `docs/ARCHITECTURE.md` is the contract; `chore` lists
+tasks (`chore pre-commit` before committing).
 
 ## Working style
 
@@ -16,10 +16,10 @@ tasks (`just pre-commit` before committing).
 ## Two instances
 
 - NEVER kill `/Applications/Terra.app` or test against its socket — it is
-  the user's daily terminal. Only `just upgrade` replaces it; only the user
+  the user's daily terminal. Only `chore upgrade` replaces it; only the user
   runs that.
-- Develop against the dev instance: `just run` / `just restart` — own socket,
-  `(dev)` window title, safe to kill. Drive it with `just t ls|new|send|capture`.
+- Develop against the dev instance: `chore run` / `chore restart` — own socket,
+  `(dev)` window title, safe to kill. Drive it with `chore t ls|new|send|capture`.
 - Launch it with `TERRA_NO_ACTIVATE=1` (both recipes already do). macOS
   activates a launching app, so without it every restart yanks focus out of
   whatever the user is typing in. Never take focus another way either — no
@@ -50,7 +50,7 @@ tasks (`just pre-commit` before committing).
 - No `cargo fmt --all` — vendor/egui_term and terra-protocol carry drift;
   fmt only the crates you touched (match CI's gate).
 - Every `vendor/egui_term` change gets an entry in its `PATCHES.md`.
-- `just` recipes stay one-liners that call something. A recipe growing a
+- `chore` tasks stay one-liners that call something. A task growing a
   `#!/usr/bin/env bash` body with parsing and branching is a script — put it in
   `scripts/` if it is worth keeping, and if it is only a curl, leave it in the
   docs as a curl.

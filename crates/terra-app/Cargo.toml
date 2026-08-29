@@ -96,7 +96,7 @@ icons = [
   "assets/icon/terra-256.png",
   "assets/icon/terra-512.png",
 ]
-# The default formats for a bare `cargo packager` run (i.e. `just bundle` on a
+# The default formats for a bare `cargo packager` run (i.e. `chore bundle` on a
 # Mac). CI overrides per platform with `--formats` — nsis on Windows, deb on
 # Linux (see .github/workflows/release.yml).
 formats = ["app", "dmg"]
