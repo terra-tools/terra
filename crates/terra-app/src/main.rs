@@ -25,6 +25,7 @@
 
 mod config;
 mod confirm_close;
+mod drop;
 mod edit_tools;
 mod fonts;
 mod ghostty_theme;
@@ -42,7 +43,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use egui_term::{PtyEvent, TerminalView};
+use egui_term::{BackendCommand, PtyEvent, TerminalMode, TerminalView};
 use terra_palette::{Palette, PaletteAction, PaletteEvent, PaletteIcon};
 
 use crate::edit_tools::EditTool;
@@ -64,6 +65,10 @@ const GROUP_SEPARATOR_WIDTH: f32 = 1.0;
 const GROUP_SEPARATOR_GRIP: f32 = 3.0;
 /// Same tone as the tab bar's underline, so the seams read as one system.
 const GROUP_SEPARATOR_COLOR: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x2a, 0x2e);
+/// The ring drawn round the pane a file drop would land in, while a drag from
+/// the file manager is over the window. The selection blue, so it reads as
+/// terra's own highlight rather than as an error.
+const DROP_TARGET_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0x63, 0x8b);
 /// No group can be resized below this fraction of the window — a column
 /// narrower than this is unusable, and collapsing-by-drag would be too easy.
 const MIN_GROUP_FRACTION: f32 = 0.15;
@@ -1250,6 +1255,43 @@ impl App {
             AppAction::Quit => self.quitting = true,
         }
     }
+
+    /// Files dropped on the window from the OS file manager, typed into the
+    /// focused tab as a command line.
+    ///
+    /// The mapping — quoting, the single spaces, the trailing space — is
+    /// [`drop::dropped_text`], and the bytes go out through egui_term's own
+    /// `paste_bytes`, the same function a ⌘V goes through: a drop into a shell
+    /// that asked for bracketed paste (DECSET 2004) arrives bracketed, and the
+    /// line endings are normalised the one way terra normalises them. Doing it
+    /// here rather than inside a pane's `TerminalView` is deliberate: winit
+    /// reports a drop against the *window*, with no position egui can route
+    /// with, so the destination is the tab the keyboard is already talking to.
+    fn paste_dropped_files(&mut self, ctx: &egui::Context) {
+        let files = ctx.input(|i| i.raw.dropped_files.clone());
+        if files.is_empty() {
+            return;
+        }
+        let Some(text) = drop::dropped_text(&files, drop::Style::native()) else {
+            return;
+        };
+        let Some(arc) = self.tabs.clone() else {
+            return;
+        };
+        let mut tabs = lock(&arc);
+        let Some(tab) = tabs.active_mut() else {
+            return;
+        };
+        let bracketed = tab
+            .backend
+            .last_content()
+            .terminal_mode
+            .contains(TerminalMode::BRACKETED_PASTE);
+        tab.backend
+            .process_command(BackendCommand::Write(egui_term::paste_bytes(
+                &text, bracketed,
+            )));
+    }
 }
 
 /// Everything one frame's split-tree walk reads but does not mutate.
@@ -1561,6 +1603,20 @@ impl TreeFrame<'_> {
                 );
             }
         }
+
+        // A drag from the file manager is over the window: ring the pane its
+        // paths would be typed into. winit reports a drop against the window,
+        // with no position to route by, so that pane is the focused one —
+        // which is worth *showing*, since with several panes open the user's
+        // pointer is not what decides it.
+        if focused && col_ui.input(|i| !i.raw.hovered_files.is_empty()) {
+            col_ui.painter().rect_stroke(
+                area.shrink(1.0),
+                6.0,
+                egui::Stroke::new(1.5, DROP_TARGET_COLOR),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
 }
 
@@ -1702,6 +1758,12 @@ impl eframe::App for App {
         self.sync_config_cache();
         // Either modal takes the keyboard away from the terminal.
         let modal_open = self.palette.is_open() || self.confirm_close.is_open();
+        // A drop from the file manager types its paths into the focused tab.
+        // Not while a modal is up: the dialog owns the keyboard, and the text
+        // would land in a terminal the user cannot see.
+        if !modal_open {
+            self.paste_dropped_files(&ctx);
+        }
         let bidi = self.active_bidi(&ctx);
         let bidi_base = self.config.get().text.bidi_base;
         let bar_with_one_tab = self.config.get().tabs.bar_with_one_tab;
