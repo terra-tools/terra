@@ -477,6 +477,52 @@
 
     Guarded by `crates/terra-app/tests/scrollbar_selection.rs`.
 
+19. backend/mod.rs `process_link_action` / `open_link` (+ the new
+    `hyperlink_at`, `RenderableContent::hovered_hyperlink_uri`, and `LinkAction`
+    re-exported from lib.rs): **OSC 8 hyperlinks are hoverable and openable**.
+    Upstream resolved a hover with the URL regex alone, so the only links terra
+    could open were the ones whose target was spelled out on screen. `ESC ] 8 ;
+    ; URI ST` exists precisely so it need not be: `ls --hyperlink`, `gh`, and
+    cargo's diagnostics print a word and hide the URL behind it, and every one
+    of those was dead text.
+
+    alacritty's parser already stores the link per cell (`Cell::hyperlink()`,
+    either terminator), so the hover now asks the cell first and falls back to
+    the regex only when the cell carries nothing. The hovered run is the
+    maximal neighbourhood of the point whose cells carry the same link id,
+    walked with `GridIterator`'s `prev`/`next` — which crosses row boundaries
+    on its own, so a link that soft-wraps underlines as one thing, and clamps
+    to the viewport the way alacritty's `hyperlink_at` does. Identity is the
+    id, not the URI, which keeps two adjacent links distinct and one wrapped
+    link whole. The spacer half of a double-width glyph is written from the
+    same cursor template as the glyph, so it inherits the link and hovering
+    either half resolves — no special case needed.
+
+    The resolved URI is stored beside the range rather than folded into it, so
+    `view.rs`'s underline test stays a plain `range.contains(point)` and the
+    regex path keeps reading its URL off the screen. `open_link` opens the
+    stored URI when there is one.
+
+    Also here: `open::that` was `unwrap_or_else(|_| panic!(...))`. A URI with a
+    scheme the OS has no handler for took the whole terminal down, losing every
+    other tab's session; it now logs to stderr (the crate pulls in no logging
+    facade) and carries on.
+
+    Guarded by `crates/terra-app/tests/osc8_hyperlinks.rs`.
+
+20. view.rs `paste_bytes` + lib.rs: **the paste path is public**, so the
+    embedder can put text on the PTY *as a paste* instead of writing bytes
+    raw. terra's drag-and-drop needs exactly that: a file dragged out of
+    Finder onto the window is typed into the focused tab as shell-quoted
+    paths (`terra-app/src/drop.rs`), and a drop is a paste — a shell that set
+    DECSET 2004 has to see `ESC[200~` … `ESC[201~` round it, or it takes the
+    path as typing and a name with a newline in it runs. Re-exporting the
+    function item 11 already wrote is the whole change: the alternative was a
+    second copy of the bracketing, the marker-stripping and the CR
+    normalisation living in the app, drifting from this one.
+
+    Guarded by `crates/terra-app/tests/drop_paths.rs`.
+
 ## The cursor beam under BiDi
 
 The beam marks an *insertion point*, not a cell, so under reordering it has to

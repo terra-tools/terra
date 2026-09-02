@@ -887,7 +887,13 @@ fn clipboard_key_is_passthrough(modifiers: Modifiers) -> bool {
 /// Alacritty instead deletes every `\x1b` and `\x03` from a bracketed payload.
 /// That is blunter — it silently eats the SGR colours in a snippet copied out
 /// of another terminal — and the narrower rule closes the same hole.
-fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+///
+/// terra patch: public, so the embedder can put text on the PTY *as a paste*
+/// without inventing a second set of these rules. Files dropped on the window
+/// from the file manager take this route (`terra-app/src/drop.rs`), which is
+/// what makes a drop into a shell that asked for DECSET 2004 arrive bracketed,
+/// like every other paste.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let text = text.replace("\r\n", "\r").replace('\n', "\r");
     if !bracketed {
         return text.into_bytes();

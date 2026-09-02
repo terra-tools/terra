@@ -8,7 +8,9 @@ use alacritty_terminal::event::{
     Event, EventListener, Notify, OnResize, WindowSize,
 };
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+// terra patch: `BidirectionalIterator` is what lets the OSC 8 run walk left
+// from the hovered cell (see `hyperlink_at`).
+use alacritty_terminal::grid::{BidirectionalIterator, Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{
     Selection, SelectionRange, SelectionType as AlacrittySelectionType,
@@ -235,6 +237,7 @@ impl TerminalBackend {
             terminal_size,
             cursor: term.grid_mut().cursor_cell().clone(),
             hovered_hyperlink: None,
+            hovered_hyperlink_uri: None,
             bidi: Vec::new(),
         };
         let term = Arc::new(FairMutex::new(term));
@@ -601,14 +604,29 @@ impl TerminalBackend {
     ) {
         match link_action {
             LinkAction::Hover => {
-                self.last_content.hovered_hyperlink = self.regex_match_at(
-                    terminal,
-                    point,
-                    &mut self.url_regex.clone(),
-                );
+                // terra patch: an OSC 8 hyperlink wins over the URL regex.
+                // The cell already carries the target, so the label the user
+                // sees ("Docs") need not look like a URL at all — and when it
+                // does, the explicit target is still the authoritative one.
+                match hyperlink_at(terminal, point) {
+                    Some((range, uri)) => {
+                        self.last_content.hovered_hyperlink = Some(range);
+                        self.last_content.hovered_hyperlink_uri = Some(uri);
+                    }
+                    None => {
+                        self.last_content.hovered_hyperlink = self
+                            .regex_match_at(
+                                terminal,
+                                point,
+                                &mut self.url_regex.clone(),
+                            );
+                        self.last_content.hovered_hyperlink_uri = None;
+                    }
+                }
             }
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
+                self.last_content.hovered_hyperlink_uri = None;
             }
             LinkAction::Open => {
                 self.open_link();
@@ -617,21 +635,36 @@ impl TerminalBackend {
     }
 
     fn open_link(&self) {
-        if let Some(range) = &self.last_content.hovered_hyperlink {
-            let start = range.start();
-            let end = range.end();
+        let Some(range) = &self.last_content.hovered_hyperlink else {
+            return;
+        };
 
-            let mut url = String::from(self.last_content.grid.index(*start).c);
-            for indexed in self.last_content.grid.iter_from(*start) {
-                url.push(indexed.c);
-                if indexed.point == *end {
-                    break;
+        // terra patch: an OSC 8 hover resolved its target from the cell, and
+        // that target is what opens. Only a regex match has to be read back
+        // off the screen.
+        let url = match &self.last_content.hovered_hyperlink_uri {
+            Some(uri) => uri.clone(),
+            None => {
+                let start = range.start();
+                let end = range.end();
+
+                let mut url =
+                    String::from(self.last_content.grid.index(*start).c);
+                for indexed in self.last_content.grid.iter_from(*start) {
+                    url.push(indexed.c);
+                    if indexed.point == *end {
+                        break;
+                    }
                 }
+                url
             }
+        };
 
-            open::that(url).unwrap_or_else(|_| {
-                panic!("link opening is failed");
-            })
+        // terra patch: never panic here. Upstream unwrapped, so a URI with a
+        // scheme the OS has no handler for — or any transient launch failure
+        // — took the whole terminal down, losing every other tab's session.
+        if let Err(err) = open::that(&url) {
+            eprintln!("egui_term: could not open link {url:?}: {err}");
         }
     }
 
@@ -845,6 +878,59 @@ impl TerminalBackend {
     }
 }
 
+/// terra patch: the OSC 8 hyperlink under `point`, as a range of cells plus
+/// the URI it points at.
+///
+/// Based on alacritty/src/display/hint.rs > `hyperlink_at`. A cell written
+/// while an OSC 8 was open carries the link in its `extra`, so the hovered run
+/// is simply the maximal neighbourhood of `point` whose cells carry the *same*
+/// link — walking the grid iterator, which crosses row boundaries on its own,
+/// so a link that soft-wraps underlines as one thing.
+///
+/// Two properties fall out of the cell being the source of truth, and both are
+/// why this cannot be done with a regex:
+///
+/// * the label need not resemble a URL (`\e]8;;https://…\e\\Docs\e]8;;\e\\`);
+/// * the spacer half of a double-width glyph is written from the same cursor
+///   template as the glyph, so it carries the same link and hovering either
+///   half resolves.
+///
+/// Identity is the link's id — the auto-generated one when the program sent
+/// none — which is what makes two adjacent but distinct links stay distinct,
+/// and one link split across rows stay one.
+fn hyperlink_at(
+    terminal: &Term<EventProxy>,
+    point: Point,
+) -> Option<(RangeInclusive<Point>, String)> {
+    let grid = terminal.grid();
+    let hyperlink = grid.index(point).hyperlink()?;
+
+    let viewport_start = Line(-(grid.display_offset() as i32));
+    let viewport_end = viewport_start + terminal.bottommost_line();
+
+    let same_link = |cell: &Cell| cell.hyperlink().as_ref() == Some(&hyperlink);
+
+    let mut start = point;
+    let mut iter = grid.iter_from(point);
+    while let Some(indexed) = iter.prev() {
+        if indexed.point.line < viewport_start || !same_link(indexed.cell) {
+            break;
+        }
+        start = indexed.point;
+    }
+
+    let mut end = point;
+    let mut iter = grid.iter_from(point);
+    for indexed in &mut iter {
+        if indexed.point.line > viewport_end || !same_link(indexed.cell) {
+            break;
+        }
+        end = indexed.point;
+    }
+
+    Some((start..=end, hyperlink.uri().to_owned()))
+}
+
 /// Copied from alacritty/src/display/hint.rs:
 /// Iterate over all visible regex matches.
 fn visible_regex_match_iter<'a>(
@@ -884,6 +970,12 @@ fn focus_report(
 pub struct RenderableContent {
     pub grid: Grid<Cell>,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
+    /// terra patch: the target of the hovered link when it came from an OSC 8
+    /// escape, which the cells carry out of band. `None` means the hover came
+    /// from the URL regex, and the on-screen text under `hovered_hyperlink`
+    /// *is* the URL. Kept beside the range rather than folded into it so the
+    /// renderer's underline test stays a plain `contains`.
+    pub hovered_hyperlink_uri: Option<String>,
     pub selectable_range: Option<SelectionRange>,
     pub cursor: Cell,
     pub terminal_mode: TermMode,
@@ -904,6 +996,7 @@ impl Default for RenderableContent {
         Self {
             grid: Grid::new(0, 0, 0),
             hovered_hyperlink: None,
+            hovered_hyperlink_uri: None,
             selectable_range: None,
             bidi: Vec::new(),
             cursor: Cell::default(),

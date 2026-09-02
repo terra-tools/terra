@@ -78,6 +78,15 @@ The wheel always scrolls the pane you are pointing at, whether or not it holds
 the keyboard — including inside a full-screen program that handles its own
 scrolling.
 
+## Links and files
+
+Hold **⌘** and a URL underlines; click it to open in your browser. Programs
+that print real hyperlinks (OSC 8 — `ls --hyperlink`, gcc, cargo, Claude Code)
+get the same treatment, and the link's target opens rather than its label.
+
+Drag a file or folder from Finder onto the window and its path is typed into
+the active tab, quoted if it needs to be — several at once come space-separated.
+
 ## Docs
 
 - [Using Terra with agents](docs/AGENTS.md) — the block to paste into your CLAUDE.md or AGENTS.md

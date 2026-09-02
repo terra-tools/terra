@@ -169,6 +169,18 @@ alacritty_terminal 0.26; iterate `grid.display_iter()` for capture),
   translucent half-overlay. Dragging the hairline divider between two
   siblings resizes them (rewrites the two weights in their split; the other
   children keep their share).
+  Files and folders dragged in from the OS land as a *paste* into the active
+  tab: `drop.rs` shell-quotes each path (single quotes, POSIX style; double
+  quotes on Windows), joins them with spaces and hands the text to
+  egui_term's `paste_bytes`, so a shell in bracketed-paste mode sees the
+  `ESC[200~` … `ESC[201~` wrapper like any other paste (PATCHES 20). The
+  focused pane is ringed while a drag hovers, since winit reports the drop
+  against the window, not a position.
+- Links: Cmd+hover underlines, Cmd+click opens in the default browser. An
+  OSC 8 hyperlink (either terminator) is read off the cell — the hovered run
+  is every adjacent cell carrying the same link id, and its URI is what opens,
+  not the label. Only text with no OSC 8 falls back to the URL regex, where the
+  on-screen text is the URL (PATCHES 19).
 - IPC server (`ipc.rs`): thread with an `interprocess::local_socket::Listener`
   on `terra_protocol::socket_address()` — a unix socket on Unix, a named pipe
   on Windows (create parent dir 0700 where there is one; reclaim a stale
